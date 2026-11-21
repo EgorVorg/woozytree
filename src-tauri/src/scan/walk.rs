@@ -7,7 +7,7 @@ use std::ffi::c_void;
 use std::fs;
 use std::io;
 use std::mem::size_of;
-use std::os::windows::fs::MetadataExt;
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,12 +15,12 @@ use std::time::Instant;
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_STANDARD_INFO, FileStandardInfo,
-    GetFileInformationByHandle, GetFileInformationByHandleEx,
+    BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+    FILE_STANDARD_INFO, FileStandardInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
 };
 
 use crate::model::{FileKey, FileMeta, FolderId, ScanError, ScanProgress};
-use crate::scan::index::ScanIndex;
+use crate::scan::index::{AddOutcome, ScanIndex};
 
 /// Прогресс сообщается примерно раз в столько файлов.
 const PROGRESS_EVERY_FILES: u64 = 1000;
@@ -32,6 +32,8 @@ pub struct WalkStats {
     pub skipped: u32,
     /// Reparse-точки (junction, симлинки), в которые обход намеренно не заходил.
     pub reparse_skipped: u32,
+    /// Жёсткие ссылки, чьи байты не задвоены (второе и последующие имена файла).
+    pub hard_link_duplicates: u32,
 }
 
 /// Обойти папку `root` и сложить найденное в `index`.
@@ -134,7 +136,7 @@ pub fn walk(
                 }
             };
 
-            index.add_file(
+            let outcome = index.add_file(
                 dir_id,
                 FileMeta {
                     name,
@@ -144,6 +146,11 @@ pub fn walk(
                     file_key,
                 },
             );
+            // Повторный FileKey — жёсткая ссылка: индекс не задваивает байты,
+            // а обход сообщает, сколько таких имён встретилось.
+            if matches!(outcome, AddOutcome::HardLinkDuplicate) {
+                stats.hard_link_duplicates += 1;
+            }
             files += 1;
             bytes += size_on_disk;
 
@@ -183,8 +190,13 @@ fn report(
 /// жёсткие ссылки. Занятое место — `AllocationSize` из `GetFileInformationByHandleEx`
 /// (учитывает сжатие и разреженность); если файловая система такой запрос не
 /// поддерживает, остаётся логический размер.
+///
+/// Хэндл открывается только с правом `FILE_READ_ATTRIBUTES`: данных не читаем, поэтому
+/// учитываются и файлы, закрытые на чтение (занятые системные, с запрещающей DACL).
 fn file_info(path: &Path) -> io::Result<(FileKey, u64)> {
-    let file = fs::File::open(path)?;
+    let file = fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES.0)
+        .open(path)?;
     let handle = HANDLE(file.as_raw_handle());
 
     let mut info = BY_HANDLE_FILE_INFORMATION::default();
@@ -202,7 +214,9 @@ fn file_info(path: &Path) -> io::Result<(FileKey, u64)> {
             size_of::<FILE_STANDARD_INFO>() as u32,
         )
     };
-    if standard_ok.is_ok() && standard.AllocationSize > 0 {
+    if standard_ok.is_ok() {
+        // 0 — законный размер для полностью разреженного/сжатого файла,
+        // поэтому успешный запрос используем даже с нулём.
         size_on_disk = standard.AllocationSize as u64;
     }
 
@@ -372,10 +386,11 @@ mod tests {
         std::fs::write(&first, [7u8; 100]).unwrap();
         std::fs::hard_link(&first, &second).unwrap();
 
-        let (index, _) = walk_index(dir.path());
+        let (index, stats) = walk_index(dir.path());
         let totals = index.folder_totals(index.root());
 
-        // Вторая ссылка — отдельное имя на диске, её байты не задваиваются.
+        // Вторая ссылка — отдельное имя на диске, её байты не задваиваются,
+        // а сам факт дубликата виден в статистике обхода.
         let single_disk_size = file_info(&first).unwrap().1;
         assert!(single_disk_size > 0);
         assert_eq!(totals.file_count, 2);
@@ -384,6 +399,85 @@ mod tests {
             totals.size_on_disk, single_disk_size,
             "размер файла должен быть учтён ровно один раз"
         );
+        assert_eq!(stats.hard_link_duplicates, 1);
+    }
+
+    #[test]
+    fn test_walk_counts_data_locked_file() {
+        let dir = test_dir();
+        let locked = dir.path().join("locked.bin");
+        std::fs::write(&locked, [3u8; 64]).unwrap();
+
+        // Запрещаем чтение данных (RD): метаданные и размеры остаются доступны,
+        // как у занятых системных файлов и файлов с запрещающей DACL.
+        let output = std::process::Command::new("cmd")
+            .arg("/c")
+            .arg("icacls")
+            .arg(&locked)
+            .arg("/deny")
+            .arg("Everyone:(RD)")
+            .output()
+            .expect("не удалось запустить icacls");
+        assert!(
+            output.status.success(),
+            "icacls не сработал: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let (index, stats) = walk_index(dir.path());
+
+        // Снимаем запрет, чтобы временная папка штатно удалилась.
+        let _ = std::process::Command::new("cmd")
+            .arg("/c")
+            .arg("icacls")
+            .arg(&locked)
+            .arg("/remove:d")
+            .arg("Everyone")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+
+        let totals = index.folder_totals(index.root());
+        assert_eq!(totals.file_count, 1, "файл с закрытыми данными должен быть учтён");
+        assert_eq!(totals.size_logical, 64);
+        assert!(totals.size_on_disk >= 64);
+        assert_eq!(stats.skipped, 0, "пропусков быть не должно: {:?}", stats);
+    }
+
+    fn make_sparse_file(path: &Path, len: u64) {
+        use windows::Win32::System::IO::DeviceIoControl;
+        use windows::Win32::System::Ioctl::FSCTL_SET_SPARSE;
+
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .unwrap();
+        let handle = HANDLE(file.as_raw_handle());
+        unsafe { DeviceIoControl(handle, FSCTL_SET_SPARSE, None, 0, None, 0, None, None) }
+            .expect("FSCTL_SET_SPARSE не сработал");
+        // Разреженный файл: увеличение длины не выделяет кластеры на диске.
+        file.set_len(len).unwrap();
+    }
+
+    #[test]
+    fn test_walk_reports_zero_allocation_sparse_file() {
+        let dir = test_dir();
+        let sparse = dir.path().join("sparse.bin");
+        let logical = 1024 * 1024;
+        make_sparse_file(&sparse, logical);
+
+        let (index, stats) = walk_index(dir.path());
+        let totals = index.folder_totals(index.root());
+
+        assert_eq!(totals.file_count, 1);
+        assert_eq!(totals.size_logical, logical);
+        assert_eq!(
+            totals.size_on_disk, 0,
+            "полностью разреженный файл занимает 0 байт (AllocationSize == 0)"
+        );
+        assert_eq!(stats.skipped, 0);
     }
 
     #[test]
