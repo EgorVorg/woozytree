@@ -1043,7 +1043,12 @@ mod tests {
         assert_eq!(totals.folders, SAMPLE_FOLDER_COUNT, "папки фикстуры");
         assert_eq!(totals.size_on_disk, SAMPLE_SIZE_ON_DISK, "занятое место");
         assert_eq!(totals.size_logical, SAMPLE_SIZE_LOGICAL, "логический размер");
-        assert_eq!(totals.skipped, SAMPLE_SKIPPED, "пропуски по всем причинам");
+        // В фикстуре есть родитель вне таблицы (сирота), запись с
+        // $ATTRIBUTE_LIST и extension-запись с именем — это и есть пропуски.
+        assert_eq!(
+            totals.skipped, SAMPLE_SKIPPED,
+            "неразрешимые родители и неполные записи честно попадают в skipped"
+        );
 
         // Все разобранные имена дошли до индекса: итоги сканера совпадают с
         // итогами корня индекса, то есть у каждой записи нашёлся родитель-папка
@@ -1075,13 +1080,6 @@ mod tests {
                 child
             );
         }
-
-        // В фикстуре есть родитель вне таблицы (сирота), запись с
-        // $ATTRIBUTE_LIST и extension-запись с именем — это и есть пропуски.
-        assert_eq!(
-            totals.skipped, SAMPLE_SKIPPED,
-            "неразрешимые родители и неполные записи честно попадают в skipped"
-        );
     }
 
     #[test]

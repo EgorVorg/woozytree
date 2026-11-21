@@ -44,9 +44,9 @@ npm run tauri dev
 cargo test --manifest-path src-tauri/Cargo.toml --lib
 ```
 
-Флаг `--lib` обязателен: у бинарных целей в манифесте стоит
-`requireAdministrator`, и тестовый харнесс не может их запустить без повышения
-прав (падает с `os error 740`). Библиотека тестируется обычным пользователем.
+Флаг `--lib` гоняет только юнит-тесты библиотеки. У bin-целей тестов нет, а
+тестовый харнесс главного бина унаследовал бы манифест `requireAdministrator` и
+без прав падал с `os error 740` — поэтому у него стоит `test = false`.
 
 Тестовые фикстуры MFT генерируются синтетически и автоматически при первом
 обращении: реальные слепки диска в репозитории не хранятся (каталог
@@ -56,22 +56,25 @@ cargo test --manifest-path src-tauri/Cargo.toml --lib
 
 ## Утилиты
 
-Обе запускаются из терминала с правами администратора.
+`dump_mft` и `scan_bench C:` запускаются от администратора; режим
+`scan_bench --fixture` работает без прав.
 
 ### dump_mft
 
 Снимает сырые записи MFT с живого тома для локального анализа или отладки:
 
 ```powershell
-cargo run --manifest-path src-tauri/Cargo.toml --bin dump_mft -- C: sample.mft --records 2000 --boot --corrupt
+cargo run --manifest-path src-tauri/Cargo.toml --bin dump_mft -- C: C:\Temp\mft\sample.mft --records 2000 --boot --corrupt
 ```
 
 - `--records N` — записать только первые N записей;
 - `--boot` — сохранить загрузочный сектор в `boot.bin` рядом с файлом;
 - `--corrupt` — испортить последнюю запись (проверка устойчивости парсера).
 
-Такие слепки содержат настоящие имена файлов. Снимайте их только для себя и не
-коммитьте: каталог `src-tauri/tests/fixtures/` специально исключён из git.
+Такие слепки содержат настоящие имена файлов: снимайте их вне рабочей копии
+(например, в `C:\Temp`) и не коммитьте. Каталог `src-tauri/tests/fixtures/`
+исключён из git как удобное место для синтетических файлов, которые тесты
+создают сами, а не как безопасное хранилище реальных данных.
 
 ### scan_bench
 
@@ -82,7 +85,11 @@ cargo run --manifest-path src-tauri/Cargo.toml --bin dump_mft -- C: sample.mft -
 cargo run --manifest-path src-tauri/Cargo.toml --bin scan_bench -- C:
 ```
 
-Для проверки на слепке: `scan_bench --fixture <путь к файлу MFT>`.
+Для проверки на слепке:
+
+```powershell
+cargo run --manifest-path src-tauri/Cargo.toml --bin scan_bench -- --fixture C:\Temp\mft\sample.mft
+```
 
 ## Границы точности
 
@@ -90,9 +97,10 @@ cargo run --manifest-path src-tauri/Cargo.toml --bin scan_bench -- C:
 
 - Размер папки складывается из файлов; сами каталоги (их записи в MFT и
   индексные буферы) в сумму не входят.
-- `$ATTRIBUTE_LIST` не разбирается: часть имён и размеров крупных файлов лежит
-  в extension-записях. Такие записи попадают в счётчик «пропущено»; разбивку по
-  причинам печатает `scan_bench`.
+- `$ATTRIBUTE_LIST` не разбирается: имена из extension-записей теряются
+  (счётчик `extension_with_names`), но размеры `$DATA` движок подставляет из
+  extension-записей по ссылке `base_record`. Потерянные имена попадают в
+  «пропущено»; разбивку по причинам печатает `scan_bench`.
 - Поэтому итоговый размер может отличаться от «Занято» в Windows на доли
   процента — это ожидаемо, а не ошибка чтения диска.
 
@@ -105,11 +113,12 @@ cargo run --manifest-path src-tauri/Cargo.toml --bin scan_bench -- C:
 
 ```text
 src-tauri/src/          ядро сканирования (Rust)
+  lib.rs                команды Tauri и состояние приложения
   scan/volume.rs        загрузочный сектор и сырое чтение $MFT
   scan/mft.rs           разбор записей MFT и построение дерева
   scan/walk.rs          запасной обход папок (не-NTFS, сетевые диски, папка)
   scan/index.rs         индекс в памяти и агрегированные итоги
-  scan/mod.rs           выбор движка, сервис сканирования, команды Tauri
+  scan/mod.rs           выбор движка и сервис сканирования
   bin/dump_mft.rs       утилита снятия слепков MFT
   bin/scan_bench.rs     утилита замера скорости
 src/                    интерфейс (React + TypeScript)

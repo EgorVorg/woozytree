@@ -25,17 +25,28 @@ const ROOT_RECORD: u64 = 5;
 pub const SAMPLE_RECORD_COUNT: u64 = 2000;
 
 /// Итоги сканирования `sample.mft`: их проверяют тесты сканера.
+///
+/// 9 имён: exe, readme, две у жёсткой ссылки, юникод-файл, ADS-файл,
+/// сирота, `большой.bin` и `last.bin`.
 pub const SAMPLE_FILE_COUNT: u64 = 9;
 /// Папок шесть: `Program Files` и её DOS-алиас `PROGRA~1` сканер создаёт
 /// отдельными узлами (дети при этом крепятся к длинному имени).
 pub const SAMPLE_FOLDER_COUNT: u64 = 6;
+/// Сумма нерезидентных `$DATA`: 8192 (exe) + 4096 (жёсткая ссылка) + 8192
+/// (юникод) + 4096 (ADS) + 8192 (`большой.bin` из extension-записи) + 4096
+/// (`last.bin`).
 pub const SAMPLE_SIZE_ON_DISK: u64 = 36_864;
+/// Сумма логических размеров: 5000 (exe) + 37 (readme) + 1000 (жёсткая
+/// ссылка) + 5000 (юникод) + 10 (ADS-файл) + 15 (сирота) + 5000
+/// (`большой.bin`) + 1000 (`last.bin`).
 pub const SAMPLE_SIZE_LOGICAL: u64 = 17_062;
-/// Битая запись — нет; причины: имя-сирота, `$ATTRIBUTE_LIST` и имя из
+/// 3 события: имя-сирота, `$ATTRIBUTE_LIST` у `большого.bin` и имя из
 /// extension-записи.
 pub const SAMPLE_SKIPPED: u32 = 3;
 
-/// Константы синтетического загрузочного сектора NTFS.
+/// Константы синтетического загрузочного сектора NTFS: 512-байтный сектор,
+/// 8 секторов в кластере, том 1 ГиБ (2 097 152 сектора), `$MFT` с LCN 4096,
+/// запись 1024 байта и произвольный серийный номер.
 pub const BOOT_BYTES_PER_SECTOR: u16 = 512;
 pub const BOOT_SECTORS_PER_CLUSTER: u8 = 8;
 pub const BOOT_TOTAL_SECTORS: u64 = 2_097_152;
@@ -47,8 +58,8 @@ pub const BOOT_VOLUME_SERIAL: u64 = 0x5A5A_1234_DEAD_BEEF;
 /// зависели от часов машины.
 const SAMPLE_MODIFIED_MS: i64 = 1_700_000_000_000;
 
-// Раскладка записи MFT (см. `scan::mft`): генератору нужны те же номера
-// атрибутов и размеры заголовков.
+// Номера и размеры заголовков атрибутов NTFS: зеркалят приватные константы
+// `scan::mft`, чтобы не расширять их видимость ради тестового генератора.
 const ATTR_STANDARD_INFORMATION: u32 = 0x10;
 const ATTR_ATTRIBUTE_LIST: u32 = 0x20;
 const ATTR_FILE_NAME: u32 = 0x30;
