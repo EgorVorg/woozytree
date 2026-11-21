@@ -3,13 +3,17 @@
 //! Пример: `scan_bench C:` (нужны права администратора) или
 //! `scan_bench --fixture <путь к слепку MFT>` для проверки без тома.
 //! Печатает итоги сканирования, верхние папки, время по фазам и разбивку
-//! пропусков по причинам.
+//! пропусков по причинам. `scan_bench --files 100000` мерит время выдачи
+//! страницы таблицы файлов на синтетической папке.
 
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
-use woozytree_lib::model::{FolderSummary, ScanError, ScanProgress, ScanTotals, TreemapRect};
+use woozytree_lib::model::{
+    FileKey, FileMeta, FileSort, FolderId, FolderSummary, ScanError, ScanProgress, ScanTotals,
+    TreemapRect,
+};
 use woozytree_lib::scan::index::ScanIndex;
 use woozytree_lib::scan::mft::{ScanDiag, scan_ntfs_reader_diag};
 use woozytree_lib::scan::volume::VolumeReader;
@@ -25,6 +29,117 @@ fn describe(error: ScanError) -> String {
 
 fn gib(bytes: u64) -> f64 {
     bytes as f64 / (1u64 << 30) as f64
+}
+
+/// Папка с наибольшим числом файлов непосредственно в ней — худший случай для
+/// таблицы файлов. Обходим всё дерево: нужно реальное место, где файлов больше
+/// всего, а не первая крупная папка.
+fn biggest_files_folder(index: &ScanIndex, root_name: &str) -> (u32, String, u32) {
+    let mut best = (
+        index.root(),
+        root_name.to_string(),
+        index.file_count(index.root()),
+    );
+    let mut stack = vec![(index.root(), root_name.to_string())];
+    while let Some((id, name)) = stack.pop() {
+        let count = index.file_count(id);
+        if count > best.2 {
+            best = (id, name, count);
+        }
+        for child in index.child_folders(id) {
+            stack.push((child.id, child.name));
+        }
+    }
+    best
+}
+
+/// Время выдачи страницы (100 строк) по каждой колонке — лучшее из трёх замеров,
+/// плюс самая невыгодная последняя страница.
+fn time_pages(index: &ScanIndex, folder: FolderId, count: u32) {
+    for (sort, label) in [
+        (FileSort::Name, "имя"),
+        (FileSort::SizeOnDisk, "размер на диске"),
+        (FileSort::SizeLogical, "логический размер"),
+        (FileSort::Modified, "изменён"),
+    ] {
+        let mut best = Duration::MAX;
+        let mut rows = 0;
+        for _ in 0..3 {
+            let started = Instant::now();
+            rows = index.child_files(folder, sort, true, 0, 100).len();
+            best = best.min(started.elapsed());
+        }
+        println!(
+            "[files] child_files({label}, desc, 0..100): {best:?} (лучшее из 3), строк {rows}"
+        );
+    }
+
+    // Последняя страница — самый невыгодный offset: до неё всё равно сортируется
+    // весь список папки.
+    let offset = (count as usize).saturating_sub(100);
+    let started = Instant::now();
+    let rows = index.child_files(folder, FileSort::SizeOnDisk, true, offset, 100);
+    let elapsed = started.elapsed();
+    let sum: u64 = rows.iter().map(|row| row.size_on_disk).sum();
+    println!(
+        "[files] последняя страница offset {offset}: {elapsed:?}, строк {}, сумма {} байт",
+        rows.len(),
+        sum
+    );
+}
+
+/// Замер выдачи файлов на реальной папке — самой большой по числу файлов.
+///
+/// Сортировка идёт при выдаче, поэтому каждый вызов — это копия списка папки и
+/// полная сортировка; замер показывает цену одной страницы таблицы.
+fn bench_files(index: &ScanIndex, root_name: &str) {
+    let started = Instant::now();
+    let (folder, name, count) = biggest_files_folder(index, root_name);
+    println!(
+        "[files] поиск папки с максимумом файлов: {:?}",
+        started.elapsed()
+    );
+    println!("[files] папка {name}: файлов в ней {count}");
+    if count > 0 {
+        time_pages(index, folder, count);
+    }
+}
+
+/// Синтетическая папка на N файлов: цена выдачи не зависит от того, есть ли на
+/// диске папка нужного размера. `scan_bench --files 100000`.
+fn run_files_bench(count: usize) {
+    let started = Instant::now();
+    let mut index = ScanIndex::new("synthetic");
+    let root = index.root();
+    let folder = index.folder(root, "many");
+    for position in 0..count {
+        let number = position as u64;
+        // Порядок «перемешан» умножением на нечётную константу (взаимно простую с
+        // 1e6): имена, размеры и время не монотонны по вставке, как и на диске.
+        // Длинный общий префикс — как у имён WinSxS: сравнение имён не вырождается
+        // в сравнение первых байт.
+        let scrambled = number.wrapping_mul(2_654_435_761) % 1_000_000;
+        let size_on_disk = scrambled + 1;
+        index.add_file(
+            folder,
+            FileMeta {
+                name: format!("amd64_microsoft_windows_component_{scrambled:07}.bin"),
+                size_on_disk,
+                size_logical: size_on_disk / 2,
+                modified: scrambled as i64 * 1000,
+                file_key: FileKey {
+                    volume_serial: 1,
+                    file_index: number,
+                },
+            },
+        );
+    }
+    println!(
+        "[files] синтетическая папка: файлов загружено {}, загрузка индекса {:?}",
+        index.file_count(folder),
+        started.elapsed()
+    );
+    time_pages(&index, folder, index.file_count(folder));
 }
 
 /// Приёмник живого сканирования: печатает прогресс, топ и карту с отметками
@@ -184,6 +299,8 @@ fn run_live(drive: &str) {
         root_totals.file_count, root_totals.folder_count, root_totals.size_on_disk,
         root_totals.size_logical
     );
+
+    bench_files(&index, drive);
 }
 
 fn main() {
@@ -192,6 +309,16 @@ fn main() {
     // Живой режим: скан через run_scan с таймером событий (топ и карта).
     if args.first().map(String::as_str) == Some("--live") {
         run_live(args.get(1).map(String::as_str).unwrap_or("C"));
+        return;
+    }
+
+    // Синтетический замер выдачи страницы: `scan_bench --files 100000`.
+    if args.first().map(String::as_str) == Some("--files") {
+        let count = args
+            .get(1)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(100_000);
+        run_files_bench(count);
         return;
     }
 
@@ -348,4 +475,6 @@ fn main() {
             child.folder_count
         );
     }
+
+    bench_files(&index, &target);
 }

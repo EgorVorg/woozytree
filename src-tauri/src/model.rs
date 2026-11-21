@@ -37,6 +37,26 @@ pub struct FolderSummary {
     pub percent_of_parent: f32, // доля от размера родителя, 0.0..=1.0
 }
 
+/// DTO для фронтенда: одна строка таблицы файлов папки.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FileRow {
+    pub name: String,
+    pub size_on_disk: u64,
+    pub size_logical: u64,
+    pub modified: i64,          // Unix мс
+    pub percent_of_parent: f32, // доля от размера родителя, 0.0..=1.0
+    pub hard_linked: bool,      // true у повторных ссылок (в итоги не входят)
+}
+
+/// Колонка, по которой сортируется таблица файлов.
+#[derive(Debug, Clone, Copy)]
+pub enum FileSort {
+    Name,
+    SizeOnDisk,
+    SizeLogical,
+    Modified,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ScanProgress {
     pub files: u64,

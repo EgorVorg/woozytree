@@ -1,8 +1,10 @@
-//! Индекс сканирования: дерево папок в памяти с агрегированными итогами.
+//! Индекс сканирования: дерево папок с агрегированными итогами и плоский список
+//! файлов — основа таблицы файлов и живой карты.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use crate::model::{FileKey, FileMeta, FolderId, FolderSummary, FolderTotals};
+use crate::model::{FileKey, FileMeta, FileRow, FileSort, FolderId, FolderSummary, FolderTotals};
 
 /// Результат добавления файла в индекс.
 pub enum AddOutcome {
@@ -10,11 +12,30 @@ pub enum AddOutcome {
     HardLinkDuplicate,
 }
 
+/// Один файл (одно имя на диске) в плоском списке индекса.
+///
+/// Запись занимает 56 байт: на C: таких больше миллиона, поэтому лишние байты
+/// на запись — это десятки мегабайт. Имя — единственная аллокация на файл.
+/// Порядок и размеры папки здесь не дублируются: к записи всегда приходят через
+/// `Node::files`, а итоги живут в узлах дерева.
+struct FileRecord {
+    name: String,
+    size_on_disk: u64,
+    size_logical: u64,
+    modified: i64,
+    /// Папка, в которой лежит имя; нужна для проверки целостности плоского
+    /// списка и списков папок (в отладочных сборках).
+    parent: FolderId,
+    hard_linked: bool,
+}
+
 struct Node {
     name: String,
     parent: Option<FolderId>,
     totals: FolderTotals,
     children: Vec<FolderId>,
+    /// Индексы файлов этой папки в `ScanIndex::files` в порядке вставки.
+    files: Vec<u32>,
 }
 
 fn zero_totals() -> FolderTotals {
@@ -26,12 +47,53 @@ fn zero_totals() -> FolderTotals {
     }
 }
 
+/// Сравнение имён без учёта регистра (как в проводнике), без аллокаций.
+///
+/// При полном совпадении без регистра сравниваем байты: порядок должен быть
+/// однозначным (`a.txt` и `A.txt` — разные файлы).
+fn compare_names(left: &str, right: &str) -> Ordering {
+    let (left, right) = (left.as_bytes(), right.as_bytes());
+    let shared = left.len().min(right.len());
+    for index in 0..shared {
+        let (a, b) = (
+            left[index].to_ascii_lowercase(),
+            right[index].to_ascii_lowercase(),
+        );
+        if a != b {
+            return a.cmp(&b);
+        }
+    }
+    left.len().cmp(&right.len()).then_with(|| left.cmp(right))
+}
+
+/// Порядок с учётом направления сортировки.
+fn ordered(order: Ordering, desc: bool) -> Ordering {
+    if desc { order.reverse() } else { order }
+}
+
+/// Порядок строк таблицы файлов.
+///
+/// `desc` разворачивает только основную колонку; равные значения всегда идут по
+/// возрастанию имени, чтобы порядок не зависел от направления сортировки.
+fn compare_files(left: &FileRecord, right: &FileRecord, sort: FileSort, desc: bool) -> Ordering {
+    let primary = match sort {
+        // Имя — сама колонка сортировки, поэтому desc разворачивает и его.
+        FileSort::Name => return ordered(compare_names(&left.name, &right.name), desc),
+        FileSort::SizeOnDisk => left.size_on_disk.cmp(&right.size_on_disk),
+        FileSort::SizeLogical => left.size_logical.cmp(&right.size_logical),
+        FileSort::Modified => left.modified.cmp(&right.modified),
+    };
+    ordered(primary, desc).then_with(|| compare_names(&left.name, &right.name))
+}
+
 pub struct ScanIndex {
     nodes: Vec<Node>,
     // (родитель, имя) -> id, чтобы folder() не создавал дубликат папки
     folders_by_name: HashMap<(FolderId, String), FolderId>,
     // Ключи уже учтённых файлов: по ним распознаются жёсткие ссылки.
     seen_files: HashMap<FileKey, ()>,
+    // Плоский список файлов: одно имя на диске — одна запись.
+    files: Vec<FileRecord>,
 }
 
 impl ScanIndex {
@@ -41,11 +103,13 @@ impl ScanIndex {
             parent: None,
             totals: zero_totals(),
             children: Vec::new(),
+            files: Vec::new(),
         };
         ScanIndex {
             nodes: vec![root],
             folders_by_name: HashMap::new(),
             seen_files: HashMap::new(),
+            files: Vec::new(),
         }
     }
 
@@ -66,6 +130,7 @@ impl ScanIndex {
             parent: Some(parent),
             totals: zero_totals(),
             children: Vec::new(),
+            files: Vec::new(),
         });
         self.folders_by_name.insert(key, id);
         self.nodes[parent as usize].children.push(id);
@@ -83,20 +148,40 @@ impl ScanIndex {
     pub fn add_file(&mut self, parent: FolderId, meta: FileMeta) -> AddOutcome {
         // Жёсткие ссылки не задваивают размер: байты засчитываются только первой
         // ссылке на файл, а счётчик файлов растёт у каждой (это разные имена на диске).
-        let outcome = if self.seen_files.insert(meta.file_key.clone(), ()).is_some() {
+        let FileMeta {
+            name,
+            size_on_disk,
+            size_logical,
+            modified,
+            file_key,
+        } = meta;
+        let outcome = if self.seen_files.insert(file_key, ()).is_some() {
             AddOutcome::HardLinkDuplicate
         } else {
             AddOutcome::Counted
         };
         let counted = matches!(outcome, AddOutcome::Counted);
 
+        // Запись помним всегда: повторная ссылка видна в таблице с фактическим
+        // размером и пометкой `hard_linked`, но в итоги папки не входит.
+        let position = self.files.len() as u32;
+        self.files.push(FileRecord {
+            name,
+            size_on_disk,
+            size_logical,
+            modified,
+            parent,
+            hard_linked: !counted,
+        });
+        self.nodes[parent as usize].files.push(position);
+
         let mut cursor = Some(parent);
         while let Some(current) = cursor {
             let totals = &mut self.nodes[current as usize].totals;
             totals.file_count += 1;
             if counted {
-                totals.size_on_disk += meta.size_on_disk;
-                totals.size_logical += meta.size_logical;
+                totals.size_on_disk += size_on_disk;
+                totals.size_logical += size_logical;
             }
             cursor = self.nodes[current as usize].parent;
         }
@@ -106,6 +191,69 @@ impl ScanIndex {
 
     pub fn folder_totals(&self, id: FolderId) -> FolderTotals {
         self.nodes[id as usize].totals.clone()
+    }
+
+    /// Число файлов-ссылок непосредственно в папке — для пагинации таблицы.
+    pub fn file_count(&self, folder: FolderId) -> u32 {
+        self.nodes[folder as usize].files.len() as u32
+    }
+
+    /// Страница файлов папки: сортировка при выдаче, затем срез `offset..offset+limit`.
+    ///
+    /// Сортируем весь список папки на каждый запрос: папка одного уровня, а её
+    /// список — плоские индексы по 4 байта (100 тыс. файлов — 400 КБ копии).
+    /// Кэш отсортированных порядков не держим, чтобы не платить памятью за все
+    /// папки сразу и не ломать инварианты при живом сканировании.
+    pub fn child_files(
+        &self,
+        folder: FolderId,
+        sort: FileSort,
+        desc: bool,
+        offset: usize,
+        limit: usize,
+    ) -> Vec<FileRow> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let node = &self.nodes[folder as usize];
+        if offset >= node.files.len() {
+            return Vec::new();
+        }
+
+        let mut order = node.files.clone();
+        order.sort_by(|&left, &right| {
+            let left = &self.files[left as usize];
+            let right = &self.files[right as usize];
+            compare_files(left, right, sort, desc)
+        });
+
+        let end = offset.saturating_add(limit).min(order.len());
+        let parent_size = node.totals.size_on_disk;
+        order[offset..end]
+            .iter()
+            .map(|&position| {
+                let file = &self.files[position as usize];
+                // Плоский список и список папки обязаны совпадать: расхождение
+                // означало бы, что страница показывает чужой файл.
+                debug_assert_eq!(file.parent, folder);
+                // У дубликата жёсткой ссылки, чья первая копия лежит в другой
+                // папке, размер не входит в итог этой папки — отношение могло бы
+                // превысить 1.0. Контракт DTO — 0.0..=1.0, его и держим.
+                let percent_of_parent = if parent_size == 0 {
+                    0.0
+                } else {
+                    (file.size_on_disk as f32 / parent_size as f32).min(1.0)
+                };
+                FileRow {
+                    name: file.name.clone(),
+                    size_on_disk: file.size_on_disk,
+                    size_logical: file.size_logical,
+                    modified: file.modified,
+                    percent_of_parent,
+                    hard_linked: file.hard_linked,
+                }
+            })
+            .collect()
     }
 
     /// Дочерние папки для фронтенда, по убыванию занятого места.
@@ -142,19 +290,30 @@ impl ScanIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{FileKey, FileMeta};
+    use crate::model::{FileKey, FileMeta, FileSort};
 
-    fn meta(name: &str, size: u64, file_index: u64) -> FileMeta {
+    /// Файл с полным набором полей: размер на диске, логический размер и время.
+    fn meta_full(
+        name: &str,
+        size_on_disk: u64,
+        size_logical: u64,
+        modified: i64,
+        file_index: u64,
+    ) -> FileMeta {
         FileMeta {
             name: name.to_string(),
-            size_on_disk: size,
-            size_logical: size,
-            modified: 0,
+            size_on_disk,
+            size_logical,
+            modified,
             file_key: FileKey {
                 volume_serial: 1,
                 file_index,
             },
         }
+    }
+
+    fn meta(name: &str, size: u64, file_index: u64) -> FileMeta {
+        meta_full(name, size, size, 0, file_index)
     }
 
     #[test]
@@ -260,5 +419,200 @@ mod tests {
         assert_eq!(first_totals.size_on_disk, 175);
         assert_eq!(first_totals.file_count, 3);
         assert_eq!(first_totals.folder_count, 2);
+    }
+
+    #[test]
+    fn get_files_returns_paged_rows() {
+        let mut index = ScanIndex::new("C:");
+        let root = index.root();
+        let folder = index.folder(root, "many");
+        for i in 0..25u64 {
+            // Размер растёт вместе с номером: порядок по размеру противоположен
+            // порядку по имени, поэтому срез однозначно доказывает, что
+            // сортировка применена до выборки страницы.
+            index.add_file(
+                folder,
+                meta_full(&format!("file{i:02}"), i + 1, 25 - i, i as i64, i),
+            );
+        }
+
+        assert_eq!(index.file_count(folder), 25);
+        let rows = index.child_files(folder, FileSort::SizeOnDisk, true, 10, 10);
+        let names: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "file14", "file13", "file12", "file11", "file10", "file09", "file08", "file07",
+                "file06", "file05"
+            ],
+            "страница — срез списка, отсортированного по размеру на диске"
+        );
+
+        // Доля считается от размера папки: сумма размеров файлов 1..=25 = 325.
+        let first = &rows[0];
+        assert_eq!(first.size_on_disk, 15);
+        assert_eq!(first.percent_of_parent, 15.0_f32 / 325.0_f32);
+    }
+
+    #[test]
+    fn get_files_respects_limit_offset() {
+        let mut index = ScanIndex::new("C:");
+        let root = index.root();
+        let folder = index.folder(root, "few");
+        for i in 0..5u64 {
+            index.add_file(folder, meta_full(&format!("f{i}"), 10, 10, 0, i));
+        }
+
+        // offset за пределами папки — страницы нет.
+        assert!(
+            index
+                .child_files(folder, FileSort::Name, false, 10, 10)
+                .is_empty()
+        );
+        // limit = 0 — пусто даже при корректном offset.
+        assert!(
+            index
+                .child_files(folder, FileSort::Name, false, 0, 0)
+                .is_empty()
+        );
+        // limit больше числа файлов — отдаём всё, что есть.
+        assert_eq!(
+            index.child_files(folder, FileSort::Name, false, 0, 100).len(),
+            5
+        );
+        // Хвост страницы: offset 3 при большом limit — только две последние строки.
+        let tail = index.child_files(folder, FileSort::Name, false, 3, 100);
+        let names: Vec<&str> = tail.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, ["f3", "f4"]);
+
+        // Пустая папка: ноль файлов и пустая страница.
+        let empty = index.folder(root, "empty");
+        assert_eq!(index.file_count(empty), 0);
+        assert!(
+            index
+                .child_files(empty, FileSort::Name, false, 0, 10)
+                .is_empty()
+        );
+
+        // Нулевой родитель (файлы нулевого размера): доля 0.0, а не NaN.
+        let zeros = index.folder(root, "zeros");
+        index.add_file(zeros, meta_full("empty.bin", 0, 0, 0, 100));
+        let zero_rows = index.child_files(zeros, FileSort::Name, false, 0, 10);
+        assert_eq!(zero_rows.len(), 1);
+        assert_eq!(zero_rows[0].percent_of_parent, 0.0);
+        assert!(!zero_rows[0].percent_of_parent.is_nan());
+    }
+
+    #[test]
+    fn child_files_sorts_stably() {
+        let mut index = ScanIndex::new("C:");
+        let root = index.root();
+        let folder = index.folder(root, "mixed");
+        // Три файла одного размера на диске и один меньше — так проверяются и
+        // основной ключ, и tie-break по имени при равных значениях.
+        for (name, disk, logical, modified, key) in [
+            ("b.txt", 100, 300, 200, 1),
+            ("a.txt", 100, 100, 100, 2),
+            ("c.txt", 100, 200, 300, 3),
+            ("d.txt", 50, 400, 400, 4),
+        ] {
+            index.add_file(folder, meta_full(name, disk, logical, modified, key));
+        }
+
+        let names = |sort: FileSort, desc: bool| -> Vec<String> {
+            index
+                .child_files(folder, sort, desc, 0, 100)
+                .iter()
+                .map(|row| row.name.clone())
+                .collect()
+        };
+
+        // Равные размеры — по имени (вставка была в порядке b, a, c, d).
+        assert_eq!(names(FileSort::SizeOnDisk, false), ["d.txt", "a.txt", "b.txt", "c.txt"]);
+        assert_eq!(names(FileSort::SizeOnDisk, true), ["a.txt", "b.txt", "c.txt", "d.txt"]);
+        // Имя — самостоятельный ключ: desc разворачивает его.
+        assert_eq!(names(FileSort::Name, false), ["a.txt", "b.txt", "c.txt", "d.txt"]);
+        assert_eq!(names(FileSort::Name, true), ["d.txt", "c.txt", "b.txt", "a.txt"]);
+        // Логический размер и время изменения — тоже с tie-break по имени.
+        assert_eq!(names(FileSort::SizeLogical, false), ["a.txt", "c.txt", "b.txt", "d.txt"]);
+        assert_eq!(names(FileSort::SizeLogical, true), ["d.txt", "b.txt", "c.txt", "a.txt"]);
+        assert_eq!(names(FileSort::Modified, false), ["a.txt", "b.txt", "c.txt", "d.txt"]);
+        assert_eq!(names(FileSort::Modified, true), ["d.txt", "c.txt", "b.txt", "a.txt"]);
+    }
+
+    #[test]
+    fn hard_linked_row_is_visible_but_not_counted() {
+        let mut index = ScanIndex::new("C:");
+        let root = index.root();
+        let folder = index.folder(root, "links");
+
+        assert!(matches!(
+            index.add_file(folder, meta("first.txt", 4096, 7)),
+            AddOutcome::Counted
+        ));
+        assert!(matches!(
+            index.add_file(folder, meta("second.txt", 4096, 7)),
+            AddOutcome::HardLinkDuplicate
+        ));
+
+        let rows = index.child_files(folder, FileSort::Name, false, 0, 10);
+        let names: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
+        assert_eq!(names, ["first.txt", "second.txt"]);
+        assert!(!rows[0].hard_linked, "первая ссылка считается обычным файлом");
+        assert!(rows[1].hard_linked, "у повторной ссылки должна быть пометка");
+        // Фактический размер виден у обеих строк...
+        assert_eq!(rows[0].size_on_disk, 4096);
+        assert_eq!(rows[1].size_on_disk, 4096);
+
+        // ...но в итог папки входит только первая ссылка.
+        let totals = index.folder_totals(folder);
+        assert_eq!(totals.size_on_disk, 4096);
+        assert_eq!(totals.file_count, 2);
+        assert_eq!(index.file_count(folder), 2);
+
+        let rows_sum: u64 = rows.iter().map(|row| row.size_on_disk).sum();
+        assert_eq!(
+            rows_sum - totals.size_on_disk,
+            4096,
+            "сумма по строкам больше итога папки ровно на размер дубликата"
+        );
+    }
+
+    /// Раскладка записи — часть бюджета памяти: на C: файлов больше миллиона,
+    /// поэтому рост записи на 8 байт — это +10 МБ на индексе.
+    #[test]
+    fn file_record_stays_compact() {
+        assert_eq!(std::mem::size_of::<FileRecord>(), 56);
+    }
+
+    /// Дубликат жёсткой ссылки, чья первая копия лежит в другой папке: размер
+    /// второй ссылки не входит в итог этой папки, поэтому доля от родителя
+    /// арифметически превысила бы 1.0. Инвариант DTO — 0.0..=1.0, его держим.
+    #[test]
+    fn hard_linked_percent_stays_within_one() {
+        let mut index = ScanIndex::new("C:");
+        let root = index.root();
+        let first = index.folder(root, "first");
+        let second = index.folder(root, "second");
+
+        // Первая копия учтена в другой папке...
+        index.add_file(first, meta("shared.bin", 4096, 7));
+        // ...а вторая папка содержит свои файлы и ссылку-дубликат.
+        index.add_file(second, meta("small.bin", 100, 8));
+        index.add_file(second, meta("other.bin", 900, 9));
+        index.add_file(second, meta("alias.bin", 4096, 7));
+
+        let totals = index.folder_totals(second);
+        assert_eq!(totals.size_on_disk, 1000, "дубликат в итог папки не входит");
+
+        let rows = index.child_files(second, FileSort::Name, false, 0, 10);
+        let alias = rows.iter().find(|row| row.name == "alias.bin").unwrap();
+        assert!(alias.hard_linked);
+        assert_eq!(
+            alias.percent_of_parent, 1.0,
+            "доля ограничена единицей: иначе полоска в UI вылезет за строку"
+        );
+        let small = rows.iter().find(|row| row.name == "small.bin").unwrap();
+        assert_eq!(small.percent_of_parent, 0.1);
     }
 }
