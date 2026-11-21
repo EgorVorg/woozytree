@@ -1,6 +1,72 @@
+import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { formatCount, formatSeconds, formatSize } from "@/lib/format";
 import type { ScanProgress } from "@/lib/types";
+
+/** Звено пути от корня сканирования до открытой папки. */
+export interface Crumb {
+  id: number;
+  name: string;
+}
+
+interface BreadcrumbsProps {
+  /** Путь от корня: первый элемент — корень сканирования. */
+  path: Crumb[];
+  /** Перейти к звену пути (щелчок по крошке). */
+  onNavigate: (id: number) => void;
+  /** Подняться на уровень вверх; на корне кнопка отключена. */
+  onUp: () => void;
+}
+
+/** Хлебные крошки «C:\ > Users > …» и кнопка «Вверх» (дублируется Alt+↑). */
+export function Breadcrumbs({ path, onNavigate, onUp }: BreadcrumbsProps) {
+  const atRoot = path.length <= 1;
+  return (
+    <nav
+      aria-label="Путь по папкам"
+      className="flex flex-wrap items-center gap-3 rounded-lg border border-border bg-card px-4 py-2 text-sm"
+    >
+      <Button
+        variant="outline"
+        size="xs"
+        onClick={onUp}
+        disabled={atRoot}
+        title="На уровень вверх (Alt+↑)"
+      >
+        Вверх
+      </Button>
+
+      <ol className="flex min-w-0 flex-wrap items-center gap-1">
+        {path.map((crumb, index) => {
+          const last = index === path.length - 1;
+          return (
+            <li key={crumb.id} className="flex min-w-0 items-center gap-1">
+              {index > 0 ? (
+                <span aria-hidden="true" className="text-muted-foreground/50">
+                  &gt;
+                </span>
+              ) : null}
+              <button
+                type="button"
+                onClick={() => onNavigate(crumb.id)}
+                disabled={last}
+                aria-current={last ? "location" : undefined}
+                title={crumb.name}
+                className={
+                  last
+                    ? "max-w-[24rem] truncate font-medium text-foreground"
+                    : "max-w-[24rem] truncate text-muted-foreground hover:text-foreground"
+                }
+              >
+                {crumb.name}
+              </button>
+            </li>
+          );
+        })}
+      </ol>
+    </nav>
+  );
+}
 
 interface ScanStatusProps {
   progress: ScanProgress | null;

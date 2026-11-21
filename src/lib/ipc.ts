@@ -8,6 +8,7 @@ import type {
   ScanProgress,
   ScanTarget,
   ScanTotals,
+  TreemapRect,
 } from "./types";
 
 /** Логические диски с меткой, ФС и свободным местом. */
@@ -35,12 +36,30 @@ export function getScanTotals(): Promise<ScanTotals> {
   return invoke<ScanTotals>("get_scan_totals");
 }
 
+/**
+ * Прямоугольники карты для папки (нормированные 0..1). `maxRects` — бюджет
+ * раскладки, ядро клампит его 20 000.
+ */
+export function getTreemap(
+  folderId: number,
+  maxRects: number,
+): Promise<TreemapRect[]> {
+  return invoke<TreemapRect[]>("get_treemap", { folderId, maxRects });
+}
+
 export function onProgress(cb: (p: ScanProgress) => void): Promise<UnlistenFn> {
   return listen<ScanProgress>("scan://progress", (event) => cb(event.payload));
 }
 
 export function onTop(cb: (rows: FolderSummary[]) => void): Promise<UnlistenFn> {
   return listen<FolderSummary[]>("scan://top", (event) => cb(event.payload));
+}
+
+/** Живая карта корня сканирования: срез `scan://treemap` раз в секунду. */
+export function onTreemap(
+  cb: (rects: TreemapRect[]) => void,
+): Promise<UnlistenFn> {
+  return listen<TreemapRect[]>("scan://treemap", (event) => cb(event.payload));
 }
 
 export function onDone(cb: (totals: ScanTotals) => void): Promise<UnlistenFn> {

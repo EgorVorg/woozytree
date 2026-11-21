@@ -27,6 +27,10 @@ pub struct TreemapItem {
 /// Элементы меньше 1/100 контейнера считаются мелочью и собираются в «прочее».
 const SMALL_SHARE: u64 = 100;
 
+/// Сколько детей показывать отдельными плитками, если в «прочее» уходит больше
+/// половины родителя: иначе зум в такую папку упирается в одну серую плитку.
+const FALLBACK_TILES: usize = 100;
+
 /// Имя прямоугольника, в который собрана мелочь.
 const OTHER_NAME: &str = "прочее";
 
@@ -242,7 +246,10 @@ fn worst_aspect(areas: &[f64], sum: f64, side: f64) -> f64 {
 /// Раскладывает детей папки (папки и файлы, убыв. размера) в квадрат 0..1.
 /// Крупные папки рекурсивно раскладываются внутри себя, пока хватает бюджета
 /// `max_rects` и пока их дети не мельче ~1 % родителя; остаток мелочи — один
-/// прямоугольник «прочее» (id = 0, is_dir = false). Файлы получают id = 0.
+/// прямоугольник «прочее» (id = 0, is_dir = false). Если в «прочее» уходит больше
+/// половины родителя (все дети мелкие или один крупный и сотни мелких),
+/// отдельными плитками показываются крупнейшие дети (до `FALLBACK_TILES`), чтобы
+/// зум не упирался в одну серую плитку. Файлы получают id = 0.
 pub fn treemap_for_folder(
     index: &ScanIndex,
     folder: FolderId,
@@ -301,6 +308,20 @@ fn expand_folder(
         .count();
     let mut shown = visible;
     let mut collapses = shown < total_items;
+    // «Прочее» не должно быть главной плиткой папки: если в нём остаётся больше
+    // половины родителя (например, у папки один крупный ребёнок, а сотни мелких),
+    // показываем крупнейших детей отдельными плитками до FALLBACK_TILES.
+    if collapses {
+        let shown_size: u64 = items.iter().take(shown).map(|item| item.size).sum();
+        let other_size = parent_size.saturating_sub(shown_size);
+        if other_size.saturating_mul(2) > parent_size {
+            shown = total_items.min(FALLBACK_TILES).max(shown);
+        }
+    }
+    if shown == 0 {
+        shown = total_items.min(FALLBACK_TILES);
+    }
+    collapses = shown < total_items;
     if shown + usize::from(collapses) > *budget {
         shown = budget.saturating_sub(1).min(shown);
         collapses = true;
@@ -689,6 +710,104 @@ mod tests {
                 "координаты обязаны быть нормированы 0..1: {rect:?}"
             );
         }
+    }
+
+    /// Папка из одних мелких детей (все < 1 % родителя): зум внутрь не должен
+    /// упираться в единственную серую плитку «прочее» — показываем топ-N детей,
+    /// остальное по-прежнему собираем в «прочее».
+    #[test]
+    fn fallback_shows_top_children_when_all_are_small() {
+        let mut index = ScanIndex::new("C:");
+        let root = index.root();
+        let folder = index.folder(root, "Мелкая");
+        // 150 файлов одного размера: каждый — ~0.67 % родителя, порог 1 % не пройден.
+        for position in 0..150u64 {
+            index.add_file(
+                folder,
+                meta(&format!("file-{position:03}.bin"), 4096, position + 1),
+            );
+        }
+
+        let rects = treemap_for_folder(&index, folder, 200);
+        let files: Vec<&TreemapRect> = rects
+            .iter()
+            .filter(|rect| !rect.is_dir && rect.name != "прочее")
+            .collect();
+
+        assert_eq!(
+            files.len(),
+            FALLBACK_TILES,
+            "должны показываться топ-{FALLBACK_TILES} файлов, а не одна серая плитка: {rects:?}"
+        );
+        assert!(files.iter().all(|rect| rect.size == 4096));
+        assert!(
+            files.iter().all(|rect| rect.w > 0.0 && rect.h > 0.0),
+            "у показанных файлов обязана быть площадь"
+        );
+
+        let other = rects
+            .iter()
+            .find(|rect| rect.name == "прочее")
+            .expect("остаток файлов обязан собраться в «прочее»");
+        assert_eq!(other.size, (150 - FALLBACK_TILES as u64) * 4096);
+        assert_eq!(rects.len(), FALLBACK_TILES + 1);
+
+        // Тот же случай с тесным бюджетом: «прочее» резервируется, файлов — на 1 меньше.
+        let tight = treemap_for_folder(&index, folder, 10);
+        assert_eq!(tight.len(), 10, "бюджет 10 превышен: {tight:?}");
+        assert_eq!(
+            tight
+                .iter()
+                .filter(|rect| !rect.is_dir && rect.name != "прочее")
+                .count(),
+            9
+        );
+    }
+
+    /// Один крупный ребёнок и сотни мелких: «прочее» не должно покрывать больше
+    /// половины родителя — крупнейшие мелкие дети показываются отдельными плитками.
+    #[test]
+    fn fallback_breaks_up_dominant_other() {
+        let mut index = ScanIndex::new("C:");
+        let root = index.root();
+        let folder = index.folder(root, "Смешанная");
+        index.add_file(folder, meta("big.bin", 100_000, 1));
+        for position in 0..150u64 {
+            index.add_file(
+                folder,
+                meta(&format!("small-{position:03}.bin"), 2_000, position + 2),
+            );
+        }
+
+        // 100 000 + 150 * 2 000 = 400 000 Б: крупный файл — 25 % (видим), мелочь —
+        // 75 %, и без fallback она стала бы одной плиткой «прочее» на 3/4 карты.
+        let rects = treemap_for_folder(&index, folder, 300);
+        let files: Vec<&TreemapRect> = rects
+            .iter()
+            .filter(|rect| !rect.is_dir && rect.name != "прочее")
+            .collect();
+        assert_eq!(
+            files.len(),
+            FALLBACK_TILES,
+            "должны показываться топ-{FALLBACK_TILES} детей (крупный + мелкие)"
+        );
+        assert_eq!(files[0].name, "big.bin");
+
+        let other = rects
+            .iter()
+            .find(|rect| rect.name == "прочее")
+            .expect("остаток мелочи обязан собраться в «прочее»");
+        assert_eq!(
+            other.size,
+            (150 - (FALLBACK_TILES as u64 - 1)) * 2_000,
+            "в «прочее» остаются только дети за пределами топ-N"
+        );
+        assert!(
+            other.size * 2 < 400_000,
+            "«прочее» больше не покрывает половину родителя: {} байт",
+            other.size
+        );
+        assert_eq!(rects.len(), FALLBACK_TILES + 1);
     }
 
     /// Дубликат жёсткой ссылки не входит в итоги папки, поэтому и на карте его

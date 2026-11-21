@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 
-import ScanStatus from "@/components/ScanStatus";
+import ScanStatus, { Breadcrumbs, type Crumb } from "@/components/ScanStatus";
 import Toolbar from "@/components/Toolbar";
 import TopFolders from "@/components/TopFolders";
+import Treemap from "@/components/Treemap";
 import {
   cancelScan,
   listDrives,
@@ -36,6 +37,40 @@ function App() {
   const [totals, setTotals] = useState<ScanTotals | null>(null);
   const [top, setTop] = useState<FolderSummary[]>([]);
   const [error, setError] = useState<string | null>(null);
+  // Путь от корня сканирования до открытой папки; последний элемент — текущая.
+  const [path, setPath] = useState<Crumb[]>([]);
+  // Номер запуска сканирования: смена ключа сбрасывает карту к новому скану.
+  const [scanRun, setScanRun] = useState(0);
+
+  const handleUp = useCallback(() => {
+    setPath((current) =>
+      current.length > 1 ? current.slice(0, -1) : current,
+    );
+  }, []);
+
+  // Крошка: отрезать всё, что глубже выбранного звена пути.
+  const handleCrumb = useCallback((id: number) => {
+    setPath((current) => {
+      const index = current.findIndex((crumb) => crumb.id === id);
+      return index >= 0 ? current.slice(0, index + 1) : current;
+    });
+  }, []);
+
+  // Клик по папке на карте: имя нужно для хлебных крошек.
+  const handleMapNavigate = useCallback((id: number, name?: string) => {
+    setPath((current) => [...current, { id, name: name ?? `Папка ${id}` }]);
+  }, []);
+
+  // Alt+↑ — на уровень вверх (дублирует кнопку «Вверх»).
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!event.altKey || event.key !== "ArrowUp") return;
+      event.preventDefault();
+      handleUp();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [handleUp]);
 
   // Список дисков — один раз при открытии окна.
   useEffect(() => {
@@ -127,6 +162,9 @@ function App() {
     setCancelled(false);
     setScanning(true);
     setStopping(false);
+    // Новая карта начинается с корня выбранного диска.
+    setPath([{ id: 0, name: `${selected}:\\` }]);
+    setScanRun((run) => run + 1);
     startScan({ drive: selected }).catch((err: unknown) => {
       setError(String(err));
       setScanning(false);
@@ -171,6 +209,26 @@ function App() {
             {error}
           </div>
         ) : null}
+
+        {path.length === 0 ? (
+          <section className="rounded-lg border border-border bg-card px-4 py-6 text-sm text-muted-foreground">
+            Карта занятости появится здесь сразу после начала сканирования.
+          </section>
+        ) : (
+          <>
+            <Breadcrumbs
+              path={path}
+              onNavigate={handleCrumb}
+              onUp={handleUp}
+            />
+            <Treemap
+              key={scanRun}
+              folderId={path[path.length - 1].id}
+              onNavigate={handleMapNavigate}
+              scanning={scanning}
+            />
+          </>
+        )}
 
         <ScanStatus
           progress={progress}

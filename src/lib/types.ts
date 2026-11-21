@@ -42,3 +42,22 @@ export interface DriveInfo {
 
 /** Что сканировать: `{"drive": "C:"}` или `{"folder": "C:\\Temp"}`. */
 export type ScanTarget = { drive: string } | { folder: string };
+
+/**
+ * Прямоугольник карты (результат `get_treemap` и событие `scan://treemap`).
+ *
+ * Координаты нормированы в 0..1 относительно контейнера. Прямоугольники
+ * вложенные: родитель идёт в списке раньше своих детей, дети рисуются поверх.
+ */
+export interface TreemapRect {
+  /** У папок — FolderId; у файлов и сводной плитки «прочее» — 0. */
+  id: number;
+  name: string;
+  /** Занято на диске, байт. */
+  size: number;
+  is_dir: boolean;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}

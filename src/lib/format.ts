@@ -1,17 +1,22 @@
-// Единое форматирование чисел для интерфейса: размеры — в ГиБ/МиБ с одним знаком.
+// Единое форматирование чисел для интерфейса: размеры — в ГиБ/МиБ/КиБ с одним
+// знаком.
 
 const GIB = 1024 ** 3;
 const MIB = 1024 ** 2;
+const KIB = 1024;
 
-/** Размер на диске: «12.3 ГиБ» или «456.7 МиБ», всегда с одним знаком. */
+/** Размер на диске: «12.3 ГиБ», «456.7 МиБ» или «0.5 КиБ», всегда с одним знаком. */
 export function formatSize(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) {
-    return "0.0 МиБ";
+    return "0.0 КиБ";
   }
   if (bytes >= GIB) {
     return `${(bytes / GIB).toFixed(1)} ГиБ`;
   }
-  return `${(bytes / MIB).toFixed(1)} МиБ`;
+  if (bytes >= MIB) {
+    return `${(bytes / MIB).toFixed(1)} МиБ`;
+  }
+  return `${(bytes / KIB).toFixed(1)} КиБ`;
 }
 
 /** Время сканирования: «1.4 с». */
