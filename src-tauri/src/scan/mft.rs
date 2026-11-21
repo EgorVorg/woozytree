@@ -91,6 +91,38 @@ pub struct MftFileInfo {
     pub is_directory: bool,
 }
 
+/// Разбивка [`ScanTotals::skipped`] по причинам.
+///
+/// `skipped` — это не «сколько файлов легло в корень», а число событий «запись
+/// или имя разобрано неполностью». Причины считаются независимо, поэтому одно
+/// имя или одна запись может дать несколько событий (например, базовая запись с
+/// `$ATTRIBUTE_LIST` и потерянное имя её extension-записи). Сумма полей равна
+/// `ScanTotals::skipped`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanDiag {
+    /// Битые записи: чужая подпись, сломанный fixup, обрыв цепочки атрибутов.
+    pub broken: u64,
+    /// Базовые записи с `$ATTRIBUTE_LIST`: часть атрибутов вынесена в другие записи.
+    pub partial: u64,
+    /// Extension-записи, в которых были имена: имена не разбираются.
+    pub extension_with_names: u64,
+    /// Имена файлов, чей родитель не найден: файл положен в корень.
+    pub orphan: u64,
+    /// Папки, чей родитель так и не разрешился: папка положена в корень.
+    pub unresolved_folder: u64,
+}
+
+impl ScanDiag {
+    /// Сумма событий по всем причинам; равна `ScanTotals::skipped`.
+    pub fn total(&self) -> u64 {
+        self.broken
+            + self.partial
+            + self.extension_with_names
+            + self.orphan
+            + self.unresolved_folder
+    }
+}
+
 /// Чем закончился разбор записи. Нужно сканеру, чтобы отличить нормальную
 /// запись от мусора и от фрагмента файла, но наружу отдать только данные.
 enum RecordParse {
@@ -444,8 +476,9 @@ fn attribute_name(record: &[u8], attr_off: usize, name_len: u8) -> Option<String
 /// Разобрать значение резидентного `$FILE_NAME`.
 ///
 /// Раскладка значения: `0x00` ссылка на родителя (младшие 48 бит — номер записи),
-/// `0x08` время изменения `0x08`, `0x28`/`0x30` — устаревшие размеры, `0x40` длина
-/// имени в символах UTF-16, `0x42` — само имя.
+/// `0x08` время создания, `0x10` время изменения, `0x18` изменение MFT,
+/// `0x20` время доступа, `0x28`/`0x30` — устаревшие размеры, `0x40` длина имени
+/// в символах UTF-16, `0x42` — само имя.
 fn parse_file_name_value(record: &[u8], attr_off: usize, attr_len: usize) -> Option<FileNameValue> {
     let value_len = u32_at(record, attr_off + 0x10)? as usize;
     let value_off = usize::from(u16_at(record, attr_off + 0x14)?);
@@ -459,7 +492,8 @@ fn parse_file_name_value(record: &[u8], attr_off: usize, attr_len: usize) -> Opt
     }
 
     let parent_ref = u64_at(record, value_start)? & REF_RECORD_MASK;
-    let modified = filetime_to_unix_ms(u64_at(record, value_start + 0x08)?);
+    // 0x10 — время изменения; 0x08 — создание, его брать нельзя.
+    let modified = filetime_to_unix_ms(u64_at(record, value_start + 0x10)?);
     let units_len = usize::from(*record.get(value_start + 0x40)?);
     let namespace = *record.get(value_start + 0x41)?;
     let name_start = value_start + 0x42;
@@ -491,12 +525,29 @@ fn parse_file_name_value(record: &[u8], attr_off: usize, attr_len: usize) -> Opt
 /// имена в память, второй — создаёт папки и файлы в индексе. Иначе нельзя:
 /// родитель по номеру записи может встретиться в `$MFT` и позже ребёнка, а
 /// `FolderId` выдаётся только при создании папки.
+///
+/// Тонкая обёртка над [`scan_ntfs_reader_diag`]: отдаёт только итоги.
 pub fn scan_ntfs_reader(
     reader: &VolumeReader,
     index: &mut ScanIndex,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(&ScanProgress),
 ) -> Result<ScanTotals, ScanError> {
+    scan_ntfs_reader_diag(reader, index, cancel, progress).map(|(totals, _)| totals)
+}
+
+/// То же, что [`scan_ntfs_reader`], но вместе с разбивкой `skipped` по причинам.
+///
+/// `ScanTotals::skipped` — составной счётчик: без разбивки нельзя сказать,
+/// сколько пропусков дали битые записи, сколько — `$ATTRIBUTE_LIST`, а сколько —
+/// потерянные родители. Разбивка нужна бенчмарку и отчётам; на логику
+/// сканирования она не влияет.
+pub fn scan_ntfs_reader_diag(
+    reader: &VolumeReader,
+    index: &mut ScanIndex,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(&ScanProgress),
+) -> Result<(ScanTotals, ScanDiag), ScanError> {
     let started = Instant::now();
     // Шаг fixup у живого тома равен размеру сектора из загрузочного сектора
     // (4Kn-диски), у файла-слепка берём классические 512 байт.
@@ -518,7 +569,8 @@ pub fn scan_ntfs_reader(
     let mut stream_bytes: HashMap<(u64, String), u64> = HashMap::new();
     let mut buffer: Vec<u8> = Vec::new();
     let mut record_index: u64 = 0;
-    let mut skipped: u32 = 0;
+    // Пропуски считаем по причинам: `ScanTotals::skipped` — их сумма (см. `ScanDiag`).
+    let mut diag = ScanDiag::default();
     let mut parsed_on_disk: u64 = 0;
 
     reader.read_records(&mut |record| {
@@ -534,7 +586,8 @@ pub fn scan_ntfs_reader(
                 streams,
             } => {
                 if partial {
-                    skipped += 1;
+                    // $ATTRIBUTE_LIST не разбирается — запись неполная.
+                    diag.partial += 1;
                 }
                 for mut info in infos {
                     info.file_key.volume_serial = volume_serial;
@@ -559,10 +612,10 @@ pub fn scan_ntfs_reader(
                 if has_names {
                     // Имена из extension-записей не разбираются: $ATTRIBUTE_LIST
                     // не поддерживается — значит, часть имён файла потеряна.
-                    skipped += 1;
+                    diag.extension_with_names += 1;
                 }
             }
-            RecordParse::Broken => skipped += 1,
+            RecordParse::Broken => diag.broken += 1,
             RecordParse::Unused => {}
         }
 
@@ -657,7 +710,8 @@ pub fn scan_ntfs_reader(
             folders += 1;
         }
         dirs.entry(entry.file_key.file_index).or_insert(id);
-        skipped += 1;
+        // Родитель папки так и не нашёлся — она положена в корень.
+        diag.unresolved_folder += 1;
     }
 
     // Файлы: каждое имя — отдельная запись индекса, но байты жёсткой ссылки
@@ -670,7 +724,7 @@ pub fn scan_ntfs_reader(
             Some(parent) => parent,
             None => {
                 // Родителя нет в таблице — файл не теряем, кладём в корень.
-                skipped += 1;
+                diag.orphan += 1;
                 index.root()
             }
         };
@@ -696,14 +750,18 @@ pub fn scan_ntfs_reader(
         elapsed_ms,
     });
 
-    Ok(ScanTotals {
-        files,
-        folders,
-        size_on_disk,
-        size_logical,
-        skipped,
-        elapsed_ms,
-    })
+    let skipped = u32::try_from(diag.total()).unwrap_or(u32::MAX);
+    Ok((
+        ScanTotals {
+            files,
+            folders,
+            size_on_disk,
+            size_logical,
+            skipped,
+            elapsed_ms,
+        },
+        diag,
+    ))
 }
 
 /// Просканировать NTFS-том: открыть его и делегировать в [`scan_ntfs_reader`].
@@ -760,6 +818,12 @@ mod tests {
         parent_ref: u64,
         /// Пространство имён: 3 — Win32 и DOS (обычный случай), 2 — DOS-алиас.
         namespace: u8,
+        /// Время создания в `$FILE_NAME` (смещение 0x08), Unix-мс.
+        /// `None` — взять `RecordSpec::modified_ms` (как раньше).
+        creation_ms: Option<i64>,
+        /// Время изменения в `$FILE_NAME` (смещение 0x10), Unix-мс.
+        /// `None` — взять `RecordSpec::modified_ms`.
+        modification_ms: Option<i64>,
     }
 
     /// Какие данные записать в `$DATA` синтетической записи.
@@ -814,6 +878,8 @@ mod tests {
                 name,
                 parent_ref,
                 namespace: 3,
+                creation_ms: None,
+                modification_ms: None,
             });
             self
         }
@@ -824,7 +890,22 @@ mod tests {
                 name,
                 parent_ref,
                 namespace,
+                creation_ms: None,
+                modification_ms: None,
             });
+            self
+        }
+
+        /// Задать последнему добавленному `$FILE_NAME` отдельные времена создания
+        /// и изменения. В `$FILE_NAME` создание лежит по 0x08, изменение — по
+        /// 0x10; разные значения позволяют поймать чтение не того поля.
+        fn name_times(mut self, creation_ms: i64, modification_ms: i64) -> RecordSpec<'a> {
+            let last = self
+                .names
+                .last_mut()
+                .expect("name_times вызывается после name");
+            last.creation_ms = Some(creation_ms);
+            last.modification_ms = Some(modification_ms);
             self
         }
 
@@ -949,9 +1030,18 @@ mod tests {
             let value = off + ATTR_HEADER_LEN;
             // Старшие 16 бит ссылки — номер последовательности записи родителя.
             write_u64(&mut record, value, name_spec.parent_ref | (1u64 << 48));
-            if let Some(modified_ms) = spec.modified_ms {
-                let time = unix_ms_to_filetime(modified_ms);
-                write_u64(&mut record, value + 0x08, time);
+            // $FILE_NAME: 0x08 — время создания, 0x10 — время изменения. По
+            // умолчанию оба равны `RecordSpec::modified_ms`, но тест может
+            // задать их разными, чтобы поймать чтение не того поля.
+            if let Some(creation_ms) = name_spec.creation_ms.or(spec.modified_ms) {
+                write_u64(&mut record, value + 0x08, unix_ms_to_filetime(creation_ms));
+            }
+            if let Some(modification_ms) = name_spec.modification_ms.or(spec.modified_ms) {
+                write_u64(
+                    &mut record,
+                    value + 0x10,
+                    unix_ms_to_filetime(modification_ms),
+                );
             }
             write_u64(&mut record, value + 0x28, 0); // allocated (устаревшее)
             write_u64(&mut record, value + 0x30, 0); // real (устаревшее)
@@ -1078,6 +1168,28 @@ mod tests {
         assert_eq!(info.modified, 1_700_000_000_000);
         assert_eq!(info.file_key.file_index, 42);
         assert!(!info.is_directory);
+    }
+
+    #[test]
+    fn test_parse_record_falls_back_to_file_name_modification_time() {
+        // $STANDARD_INFORMATION нет — время берётся из $FILE_NAME. Там 0x08 —
+        // это создание, а 0x10 — изменение; ждём именно изменение.
+        const CREATED_MS: i64 = 1_600_000_000_000;
+        const MODIFIED_MS: i64 = 1_650_000_000_000;
+
+        let record = make_record(
+            RecordSpec::new(11, RECORD_FLAG_IN_USE)
+                .name("без-si.txt", ROOT_RECORD)
+                .name_times(CREATED_MS, MODIFIED_MS)
+                .data(DataSpec::Resident(10)),
+        );
+
+        let infos = parse_record(&record);
+        assert_eq!(infos.len(), 1);
+        assert_eq!(
+            infos[0].modified, MODIFIED_MS,
+            "из $FILE_NAME берётся время изменения (0x10), а не создания (0x08)"
+        );
     }
 
     #[test]
@@ -1434,6 +1546,74 @@ mod tests {
         let root_totals = index.folder_totals(index.root());
         assert_eq!(root_totals.file_count, 1);
         assert_eq!(root_totals.size_logical, 15);
+    }
+
+    #[test]
+    fn test_scan_counts_skip_causes_separately() {
+        // В одном слепке — все пять причин пропуска: битая запись, базовая
+        // запись с $ATTRIBUTE_LIST, extension-запись с именем, имя-сирота и
+        // неразрешённая папка. Проверяем, что счётчики не смешаны, а
+        // ScanTotals::skipped — их сумма.
+        let dir = test_dir();
+        let fixture_path = dir.path().join("skip-causes.mft");
+        let mut bytes: Vec<u8> = Vec::new();
+        for _ in 0..ROOT_RECORD {
+            bytes.extend_from_slice(&[0u8; 1024]);
+        }
+        bytes.extend_from_slice(&make_record(
+            RecordSpec::new(5, RECORD_FLAG_IN_USE | RECORD_FLAG_DIRECTORY)
+                .name(".", ROOT_RECORD)
+                .modified_ms(1_700_000_000_000),
+        ));
+        // 6: имя-сирота (родитель 4242 в слепке отсутствует).
+        bytes.extend_from_slice(&make_record(
+            RecordSpec::new(6, RECORD_FLAG_IN_USE)
+                .name("сирота.bin", 4242)
+                .data(DataSpec::Resident(15)),
+        ));
+        // 7: битая запись — чужая подпись вместо FILE.
+        let mut broken = vec![0u8; 1024];
+        broken[0..4].copy_from_slice(b"BAD!");
+        bytes.extend_from_slice(&broken);
+        // 8: неполная базовая запись с $ATTRIBUTE_LIST.
+        bytes.extend_from_slice(&make_record(
+            RecordSpec::new(8, RECORD_FLAG_IN_USE)
+                .name("неполный.bin", ROOT_RECORD)
+                .data(DataSpec::Resident(10))
+                .with_attribute_list(),
+        ));
+        // 9: extension-запись с именем — имя потеряно.
+        bytes.extend_from_slice(&make_record(
+            RecordSpec::new(9, RECORD_FLAG_IN_USE)
+                .base_record(6)
+                .name("потерянное-имя.bin", ROOT_RECORD),
+        ));
+        // 10: папка с несуществующим родителем.
+        bytes.extend_from_slice(&make_record(
+            RecordSpec::new(10, RECORD_FLAG_IN_USE | RECORD_FLAG_DIRECTORY).name("висячая", 4242),
+        ));
+        std::fs::write(&fixture_path, &bytes).expect("не удалось записать слепок");
+
+        let reader = VolumeReader::from_fixture(&fixture_path, 1024)
+            .expect("слепок с пропусками должен открываться");
+        let mut index = ScanIndex::new("C:");
+        let cancel = AtomicBool::new(false);
+        let (totals, diag) = scan_ntfs_reader_diag(&reader, &mut index, &cancel, &mut |_| {})
+            .expect("сканирование слепка не должно падать");
+
+        assert_eq!(diag.broken, 1, "битая запись");
+        assert_eq!(diag.partial, 1, "базовая запись с $ATTRIBUTE_LIST");
+        assert_eq!(diag.extension_with_names, 1, "имя из extension-записи");
+        assert_eq!(diag.orphan, 1, "имя-сирота");
+        assert_eq!(diag.unresolved_folder, 1, "неразрешённая папка");
+        assert_eq!(diag.total(), 5, "сумма причин");
+        assert_eq!(
+            totals.skipped,
+            diag.total() as u32,
+            "skipped — сумма причин, а не отдельная величина"
+        );
+        assert_eq!(totals.files, 2, "сирота и неполный файл");
+        assert_eq!(totals.folders, 1, "неразрешённая папка легла в корень");
     }
 
     #[test]

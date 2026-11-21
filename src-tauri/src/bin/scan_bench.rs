@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use woozytree_lib::model::{ScanError, ScanProgress};
 use woozytree_lib::scan::index::ScanIndex;
-use woozytree_lib::scan::mft::{scan_ntfs, scan_ntfs_reader};
+use woozytree_lib::scan::mft::{scan_ntfs_reader_diag, ScanDiag};
 use woozytree_lib::scan::volume::VolumeReader;
 
 fn describe(error: ScanError) -> String {
@@ -65,6 +65,7 @@ fn main() {
     };
 
     let started = Instant::now();
+    let mut diag: Option<ScanDiag> = None;
     let result = if target == "--fixture" {
         let path = match args.get(1) {
             Some(path) => path,
@@ -76,34 +77,44 @@ fn main() {
         VolumeReader::from_fixture(Path::new(path), 1024)
             .map_err(describe)
             .and_then(|reader| {
-                scan_ntfs_reader(&reader, &mut index, &cancel, &mut |progress| {
-                    progress_calls += 1;
-                    last_progress = progress.clone();
-                })
-                .map_err(describe)
+                let scanned =
+                    scan_ntfs_reader_diag(&reader, &mut index, &cancel, &mut |progress| {
+                        progress_calls += 1;
+                        last_progress = progress.clone();
+                    })
+                    .map_err(describe);
+                if let Ok((_, breakdown)) = &scanned {
+                    diag = Some(*breakdown);
+                }
+                scanned.map(|(totals, _)| totals)
             })
     } else {
         // Диагностика тома до сканирования: сколько записей и как разложен $MFT.
-        match VolumeReader::open(&target) {
-            Ok(reader) => {
-                println!(
-                    "[bench] $MFT: записей {}, запись {} байт, экстентов {}, серийный номер {:08x}",
-                    reader.record_count(),
-                    reader.record_size(),
-                    reader.mft_extents().len(),
-                    reader.boot_sector().map_or(0, |boot| boot.volume_serial as u32)
-                );
-            }
+        let reader = match VolumeReader::open(&target) {
+            Ok(reader) => reader,
             Err(message) => {
                 eprintln!("scan_bench: {}", describe(message));
                 std::process::exit(1);
             }
-        }
-        scan_ntfs(&target, &mut index, &cancel, &mut |progress| {
+        };
+        println!(
+            "[bench] $MFT: записей {}, запись {} байт, экстентов {}, серийный номер {:08x}",
+            reader.record_count(),
+            reader.record_size(),
+            reader.mft_extents().len(),
+            reader
+                .boot_sector()
+                .map_or(0, |boot| boot.volume_serial as u32)
+        );
+        let scanned = scan_ntfs_reader_diag(&reader, &mut index, &cancel, &mut |progress| {
             progress_calls += 1;
             last_progress = progress.clone();
         })
-        .map_err(describe)
+        .map_err(describe);
+        if let Ok((_, breakdown)) = &scanned {
+            diag = Some(*breakdown);
+        }
+        scanned.map(|(totals, _)| totals)
     };
     let wall = started.elapsed();
 
@@ -133,6 +144,22 @@ fn main() {
         progress_calls,
         last_progress
     );
+
+    // Пропуски — составной счётчик: печатаем разбивку по причинам, чтобы число
+    // из totals.skipped можно было интерпретировать.
+    if let Some(diag) = diag {
+        println!(
+            "[bench] пропуски по причинам: битых записей {}, неполных базовых \
+             ($ATTRIBUTE_LIST) {}, extension-имён {}, имён-сирот {}, неразрешённых \
+             папок {}; сумма {}",
+            diag.broken,
+            diag.partial,
+            diag.extension_with_names,
+            diag.orphan,
+            diag.unresolved_folder,
+            diag.total()
+        );
+    }
 
     let root_totals = index.folder_totals(index.root());
     println!(
