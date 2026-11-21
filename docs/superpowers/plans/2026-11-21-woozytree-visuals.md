@@ -270,7 +270,7 @@ Canvas 2D с учётом devicePixelRatio; плитки — прямоугол�
 
 - [ ] **Step 2: Проверка hit-test**
 
-Логика hit-test выносится в чистые функции `src/lib/treemap.ts` (`hit_test(rects: TreemapRect[], x: number, y: number) -> TreemapRect | null`). Добавить dev-зависимость `vitest`; тесты: `hit_test_finds_tile_under_point` (точка внутри плитки → эта плитка; на границе — приоритет первой), `hit_test_returns_null_in_gaps` (пустая область → null). Запуск: `npx vitest run` — Expected: PASS.
+Логика hit-test выносится в чистые функции `src/lib/treemap.ts` (`hit_test(rects: TreemapRect[], x: number, y: number) -> TreemapRect | null`). Добавить dev-зависимость `vitest`; тесты: `hit_test_finds_tile_under_point` (точка внутри плитки → эта плитка; на границе — приоритет верхнего элемента, т.к. дети рисуются поверх родителей), `hit_test_returns_null_in_gaps` (пустая область → null). Запуск: `npx vitest run` — Expected: PASS.
 
 - [ ] **Step 3: Ручная проверка + скриншот**
 
