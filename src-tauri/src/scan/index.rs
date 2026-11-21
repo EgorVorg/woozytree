@@ -50,14 +50,19 @@ fn zero_totals() -> FolderTotals {
 /// Сравнение имён для сортировки — по-русски, как в проводнике: регистр не
 /// различается (включая кириллицу), «ё» стоит наравне с «е». Порядок символов —
 /// по коду Unicode: латиница раньше кириллицы, а после снятия регистра строчные
-/// «а»…«я» идут по алфавиту.
+/// «а»…«я» идут по алфавиту. Различие только в регистре сравнение не решает:
+/// «apple.txt» раньше «Apricot.txt», «a» раньше «AB», «readme.md» раньше
+/// «RELEASE.txt».
 ///
-/// ASCII-имена (типичный случай) сравниваются побайтово, без аллокаций: быстрый
-/// путь включается, пока различающиеся байты ASCII. На не-ASCII (кириллица)
-/// регистр снимается посимвольно через `char::to_lowercase` — тоже без аллокаций.
+/// ASCII-имена (типичный случай) сравниваются побайтово, без аллокаций: пока
+/// различие приходится на ASCII-байты, ответ берётся из них; байты, различающиеся
+/// только регистром, пропускаются (`continue`), а не решают сравнение. На
+/// не-ASCII (кириллица) регистр снимается посимвольно через `char::to_lowercase`
+/// — тоже без аллокаций.
 ///
-/// При полном совпадении без учёта регистра сравниваем исходные байты: порядок
-/// однозначен («A.txt» раньше «a.txt», «еж.txt» раньше «ёж.txt»).
+/// Tie-break по исходным байтам срабатывает только тогда, когда имена совпали
+/// целиком без учёта регистра (и с «ё» ≈ «е»): только в этом случае порядок иначе
+/// не определён («A.txt» раньше «a.txt», «еж.txt» раньше «ёж.txt»).
 ///
 /// Это не полное locale-сравнение: знаки препинания и пробелы не игнорируются —
 /// для имён файлов, где имена различаются буквами, этого достаточно.
@@ -75,7 +80,13 @@ fn compare_names_folded(left: &str, right: &str) -> Ordering {
             continue;
         }
         if a.is_ascii() && b.is_ascii() {
-            return a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase());
+            match a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()) {
+                // Различие только в регистре сравнение не решает: иначе имена
+                // сортировались бы по регистру («AB» раньше «a», «Apricot.txt»
+                // раньше «apple.txt»), а не по алфавиту.
+                Ordering::Equal => continue,
+                order => return order,
+            }
         }
         // Не-ASCII: байтовый порядок в UTF-8 не совпадает с алфавитным (заглавная
         // «З» = 0xD0 0x97 идёт раньше строчной «а» = 0xD0 0xB0), поэтому дальше
@@ -714,6 +725,62 @@ mod tests {
             .map(|row| row.name.clone())
             .collect();
         assert_eq!(names, ["еж.txt", "ёж.txt", "Ель.txt", "Жук.txt"]);
+    }
+
+    /// ASCII без учёта регистра: различие только в регистре НЕ решает сравнение.
+    /// Иначе «Apricot.txt» встало бы раньше «apple.txt», «AB» — раньше «a», а
+    /// «RELEASE.txt» — раньше «readme.md», то есть сортировка шла бы по регистру,
+    /// а не по алфавиту.
+    #[test]
+    fn test_sorts_ascii_case_insensitively() {
+        let mut index = ScanIndex::new("C:");
+        let root = index.root();
+        let folder = index.folder(root, "ascii-case");
+        for (position, name) in [
+            "apple.txt",
+            "Apricot.txt",
+            "a",
+            "AB",
+            "readme.md",
+            "RELEASE.txt",
+        ]
+        .iter()
+        .enumerate()
+        {
+            // Одинаковый размер: порядок задаёт имя (в т.ч. tie-break).
+            index.add_file(folder, meta(name, 100, position as u64));
+        }
+
+        let names = |sort: FileSort, desc: bool| -> Vec<String> {
+            index
+                .child_files(folder, sort, desc, 0, 10)
+                .iter()
+                .map(|row| row.name.clone())
+                .collect()
+        };
+
+        let ascending = [
+            "a",
+            "AB",
+            "apple.txt",
+            "Apricot.txt",
+            "readme.md",
+            "RELEASE.txt",
+        ];
+        assert_eq!(names(FileSort::Name, false), ascending);
+        // Tie-break по имени при равных размерах идёт через тот же компаратор.
+        assert_eq!(names(FileSort::SizeOnDisk, false), ascending);
+        assert_eq!(
+            names(FileSort::Name, true),
+            [
+                "RELEASE.txt",
+                "readme.md",
+                "Apricot.txt",
+                "apple.txt",
+                "AB",
+                "a"
+            ]
+        );
     }
 
     /// Дубликат жёсткой ссылки, чья первая копия лежит в другой папке: размер
