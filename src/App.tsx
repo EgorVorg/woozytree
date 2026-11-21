@@ -13,6 +13,7 @@ import {
   onTop,
   startScan,
 } from "@/lib/ipc";
+import { root_crumb_name } from "@/lib/treemap";
 import type {
   DriveInfo,
   FolderSummary,
@@ -162,8 +163,9 @@ function App() {
     setCancelled(false);
     setScanning(true);
     setStopping(false);
-    // Новая карта начинается с корня выбранного диска.
-    setPath([{ id: 0, name: `${selected}:\\` }]);
+    // Новая карта начинается с корня выбранного диска:
+    // «C:» → «C:\» (без двойного двоеточия).
+    setPath([{ id: 0, name: root_crumb_name(selected) }]);
     setScanRun((run) => run + 1);
     startScan({ drive: selected }).catch((err: unknown) => {
       setError(String(err));

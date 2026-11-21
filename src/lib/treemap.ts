@@ -118,3 +118,17 @@ export function analyze_rects(rects: TreemapRect[]): TreemapTile[] {
 export function is_other(rect: TreemapRect): boolean {
   return !rect.is_dir && rect.id === 0 && rect.name === "прочее";
 }
+
+/**
+ * Имя корневой хлебной крошки по букве диска из `DriveInfo.letter`.
+ *
+ * `letter` приходит из Rust уже без обратного слэша, но с двоеточием («C:»),
+ * поэтому шаблон `${letter}:\\` давал бы «C::\». Принимаем все три формы:
+ * «C:», «C:\» и «C» → «C:\».
+ */
+export function root_crumb_name(letter: string): string {
+  const trimmed = letter.trim();
+  if (trimmed === "") return "";
+  const base = trimmed.replace(/[\\:]+$/, "");
+  return base === "" ? "" : `${base}:\\`;
+}

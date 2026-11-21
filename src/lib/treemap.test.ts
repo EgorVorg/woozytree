@@ -2,7 +2,7 @@
 // Контракт координат — нормированные 0..1 (см. `TreemapRect` в Rust).
 import { describe, expect, it } from "vitest";
 
-import { analyze_rects, hit_test, is_other } from "./treemap";
+import { analyze_rects, hit_test, is_other, root_crumb_name } from "./treemap";
 import type { TreemapRect } from "./types";
 
 /** Плитка с координатами; по умолчанию — папка нулевого размера-заглушки. */
@@ -142,5 +142,16 @@ describe("is_other", () => {
     expect(
       is_other(tile({ x: 0, y: 0, w: 1, h: 1, name: "прочее.txt", size: 10 })),
     ).toBe(false);
+  });
+});
+
+describe("root_crumb_name", () => {
+  it("root_crumb_name_normalizes_drive_letter", () => {
+    // DriveInfo.letter уже оканчивается двоеточием; шаблон не должен давать «C::\».
+    expect(root_crumb_name("C:")).toBe("C:\\");
+    expect(root_crumb_name("C:\\")).toBe("C:\\");
+    expect(root_crumb_name("C")).toBe("C:\\");
+    expect(root_crumb_name("D:")).toBe("D:\\");
+    expect(root_crumb_name("")).toBe("");
   });
 });
