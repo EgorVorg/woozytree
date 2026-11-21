@@ -6,7 +6,7 @@
 
 **Architecture:** Tauri 2: Rust сканирует диск в фоновом потоке, строит `ScanIndex` в памяти и отправляет события во фронтенд (события Tauri). Фронтенд — React + минимальные экраны (панель прогресса, таблица топ-папок). Полная treemap-карта, дерево и таблица файлов — в Плане 2.
 
-**Tech Stack:** Rust (edition 2021), Tauri 2, React + TypeScript + Vite, shadcn/ui (пресет `b6ZR0yFgO`, тёмная тема), крейты: `mft`, `windows`, `serde`, `tempfile` (dev), `embed-resource` (build).
+**Tech Stack:** Rust (edition 2024), Tauri 2, React + TypeScript + Vite, shadcn/ui (пресет `b6ZR0yFgO`, тёмная тема), крейты: `mft`, `windows`, `serde`, `tempfile` (dev), `embed-resource` (build).
 
 **Spec:** [docs/superpowers/specs/2026-11-21-woozytree-design.md](../specs/2026-11-21-woozytree-design.md)
 
@@ -22,6 +22,8 @@
 - Интерфейс: тёмная тема, тексты на русском, компоненты shadcn/ui.
 - Код простой и понятный; короткие комментарии на русском там, где логика неочевидна.
 - Коммит после каждой задачи. Никакой работы поверх незакоммиченного предыдущего шага.
+- Тесты запускать командой `cargo test --manifest-path src-tauri/Cargo.toml --lib`: бинарные цели несут манифест администратора и не запускаются без повышения прав; все юнит-тесты живут в lib-цели.
+- Упаковка установщика (MSI/NSIS) вне плана: сборка проверяется с флагом `--no-bundle`.
 
 ## Review Focus
 
@@ -76,7 +78,7 @@ WoozyTree/
 
 **Interfaces:**
 - Consumes: нет (первая задача).
-- Produces: запускаемое окно приложения с тёмной темой и запросом прав админа; git-репозиторий; команды `cargo test --manifest-path src-tauri/Cargo.toml` и `npm run tauri dev` работают.
+- Produces: запускаемое окно приложения с тёмной темой и запросом прав админа; git-репозиторий; команды `cargo test --manifest-path src-tauri/Cargo.toml --lib` и `npm run tauri dev` работают.
 
 - [ ] **Step 1: Установить Rust и проверить инструменты сборки Windows**
 
@@ -260,7 +262,7 @@ impl ScanIndex {
 
 - [ ] **Step 2: Запустить тесты и убедиться, что они падают**
 
-Run: `cargo test --manifest-path src-tauri/Cargo.toml`
+Run: `cargo test --manifest-path src-tauri/Cargo.toml --lib`
 Expected: FAIL — `ScanIndex` не существует.
 
 - [ ] **Step 3: Реализовать `model.rs` и `ScanIndex`**
@@ -269,7 +271,7 @@ Expected: FAIL — `ScanIndex` не существует.
 
 - [ ] **Step 4: Запустить тесты и убедиться, что они проходят**
 
-Run: `cargo test --manifest-path src-tauri/Cargo.toml`
+Run: `cargo test --manifest-path src-tauri/Cargo.toml --lib`
 Expected: все тесты PASS.
 
 - [ ] **Step 5: Commit**
@@ -319,7 +321,7 @@ pub fn walk(
 
 - [ ] **Step 2: Запустить тесты и убедиться, что они падают**
 
-Run: `cargo test --manifest-path src-tauri/Cargo.toml`
+Run: `cargo test --manifest-path src-tauri/Cargo.toml --lib`
 Expected: FAIL — `walk` не существует.
 
 - [ ] **Step 3: Реализовать `walk`**
@@ -328,7 +330,7 @@ Expected: FAIL — `walk` не существует.
 
 - [ ] **Step 4: Запустить тесты и убедиться, что они проходят**
 
-Run: `cargo test --manifest-path src-tauri/Cargo.toml`
+Run: `cargo test --manifest-path src-tauri/Cargo.toml --lib`
 Expected: все тесты PASS.
 
 - [ ] **Step 5: Commit**
@@ -380,7 +382,7 @@ impl VolumeReader {
 
 - [ ] **Step 3: Запустить тесты и убедиться, что они падают**
 
-Run: `cargo test --manifest-path src-tauri/Cargo.toml`
+Run: `cargo test --manifest-path src-tauri/Cargo.toml --lib`
 Expected: FAIL.
 
 - [ ] **Step 4: Реализовать `volume.rs` и утилиту `dump_mft`**
@@ -391,7 +393,7 @@ Expected: FAIL.
 
 - [ ] **Step 5: Запустить тесты, проверить утилиту на реальном диске**
 
-Run: `cargo test --manifest-path src-tauri/Cargo.toml` — Expected: PASS.
+Run: `cargo test --manifest-path src-tauri/Cargo.toml --lib` — Expected: PASS.
 Run (от администратора): `cargo run --manifest-path src-tauri/Cargo.toml --bin dump_mft -- C: src-tauri\tests\fixtures\sample.mft --records 2000 --boot` — Expected: файл `sample.mft` размером `2000 * record_size` байт и `boot.bin` (512 байт); затем `cargo run --manifest-path src-tauri/Cargo.toml --bin dump_mft -- C: src-tauri\tests\fixtures\corrupt.mft --records 2000 --corrupt` — Expected: `corrupt.mft` готов; тайминг полного чтения записан в спайк-заметки.
 
 - [ ] **Step 6: Commit**
@@ -457,7 +459,7 @@ pub fn scan_ntfs(
 
 - [ ] **Step 2: Запустить тесты и убедиться, что они падают**
 
-Run: `cargo test --manifest-path src-tauri/Cargo.toml`
+Run: `cargo test --manifest-path src-tauri/Cargo.toml --lib`
 Expected: FAIL.
 
 - [ ] **Step 3: Реализовать `parse_record` и `scan_ntfs`**
@@ -466,7 +468,7 @@ Expected: FAIL.
 
 - [ ] **Step 4: Запустить тесты и убедиться, что они проходят**
 
-Run: `cargo test --manifest-path src-tauri/Cargo.toml` — Expected: все PASS.
+Run: `cargo test --manifest-path src-tauri/Cargo.toml --lib` — Expected: все PASS.
 Run (от администратора) — замер скорости на реальном диске: временный `main`/тестовый бинарь сканирует `C:` через `scan_ntfs` и печатает `ScanTotals` с таймингом. Expected по Global Constraints: единицы секунд; итог `size_on_disk` близок к занятому месту `C:` (у `fsutil volume diskfree C:` — в пределах ~5% с учётом служебных файлов). Результат — в спайк-заметки.
 
 - [ ] **Step 5: Commit**
@@ -518,7 +520,7 @@ pub enum FallbackAction { ShowFatal, OfferWalkFallback }
 
 - [ ] **Step 2: Запустить тесты и убедиться, что они падают**
 
-Run: `cargo test --manifest-path src-tauri/Cargo.toml`
+Run: `cargo test --manifest-path src-tauri/Cargo.toml --lib`
 Expected: FAIL.
 
 - [ ] **Step 3: Реализовать `run_scan`, `classify_error` и команды Tauri**
