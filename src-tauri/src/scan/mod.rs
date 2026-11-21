@@ -8,6 +8,9 @@ pub mod mft;
 pub mod volume;
 pub mod walk;
 
+#[cfg(test)]
+mod test_support;
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -358,21 +361,9 @@ mod tests {
     use super::*;
     use crate::model::{FolderSummary, ScanError, ScanProgress, ScanTotals};
     use crate::scan::index::ScanIndex;
-    use std::path::Path;
+    use crate::scan::test_support::test_dir;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
-
-    /// Своя временная папка на каждый тест (в ограниченной среде `%TEMP%`
-    /// может быть недоступен, поэтому есть запасной вариант внутри `target`).
-    fn test_dir() -> tempfile::TempDir {
-        tempfile::tempdir().unwrap_or_else(|_| {
-            let base = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("target")
-                .join("test-tmp");
-            std::fs::create_dir_all(&base).expect("не удалось создать папку для тестовых tempdir");
-            tempfile::tempdir_in(base).expect("не удалось создать временную папку теста")
-        })
-    }
 
     /// Приёмник событий сканирования: запоминает всё, что прислал `run_scan`.
     #[derive(Default)]

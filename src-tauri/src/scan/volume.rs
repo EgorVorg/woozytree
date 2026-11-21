@@ -556,25 +556,22 @@ fn parse_mft_data(record: &[u8]) -> Result<(Vec<Extent>, u64), ScanError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
-
-    fn fixture(name: &str) -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("tests")
-            .join("fixtures")
-            .join(name)
-    }
+    use crate::scan::test_support::{
+        BOOT_BYTES_PER_SECTOR, BOOT_MFT_LCN, BOOT_RECORD_SIZE, BOOT_SECTORS_PER_CLUSTER,
+        BOOT_TOTAL_SECTORS, BOOT_VOLUME_SERIAL, SAMPLE_RECORD_COUNT, fixture,
+    };
 
     #[test]
     fn parse_boot_sector_reads_mft_params() {
         let raw = std::fs::read(fixture("boot.bin")).expect("нет фикстуры boot.bin");
         let boot = parse_boot_sector(&raw).expect("загрузочный сектор должен разбираться");
 
-        assert_eq!(boot.bytes_per_sector, 512);
-        assert_eq!(boot.sectors_per_cluster, 8);
-        assert_eq!(boot.record_size, 1024);
-        assert_eq!(boot.mft_lcn, 786_432);
-        assert_eq!(boot.volume_serial, 0xe896_0b86_960b_548a);
+        assert_eq!(boot.bytes_per_sector, BOOT_BYTES_PER_SECTOR);
+        assert_eq!(boot.sectors_per_cluster, BOOT_SECTORS_PER_CLUSTER);
+        assert_eq!(boot.record_size, BOOT_RECORD_SIZE);
+        assert_eq!(boot.mft_lcn, BOOT_MFT_LCN);
+        assert_eq!(boot.total_sectors, BOOT_TOTAL_SECTORS);
+        assert_eq!(boot.volume_serial, BOOT_VOLUME_SERIAL);
     }
 
     #[test]
@@ -614,7 +611,7 @@ mod tests {
         let reader = VolumeReader::from_fixture(&fixture("sample.mft"), 1024)
             .expect("фикстура sample.mft должна открываться");
         assert_eq!(reader.record_size(), 1024);
-        assert_eq!(reader.record_count(), 2000);
+        assert_eq!(reader.record_count(), SAMPLE_RECORD_COUNT);
 
         let mut records = 0u64;
         let mut wrong_size = 0u64;
@@ -631,8 +628,8 @@ mod tests {
             })
             .expect("чтение фикстуры не должно падать");
 
-        assert_eq!(count, 2000);
-        assert_eq!(records, 2000);
+        assert_eq!(count, SAMPLE_RECORD_COUNT);
+        assert_eq!(records, SAMPLE_RECORD_COUNT);
         assert_eq!(wrong_size, 0);
         assert!(first_signature_ok, "первая запись должна начинаться с FILE");
     }

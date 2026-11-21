@@ -267,21 +267,8 @@ fn modified_ms(meta: &fs::Metadata) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scan::test_support::test_dir;
     use std::path::{Path, PathBuf};
-
-    /// Своя временная папка на каждый тест.
-    ///
-    /// Обычно это системный `%TEMP%`, но в ограниченной среде запись туда может быть
-    /// запрещена — тогда берём папку внутри `target`, который и так принадлежит сборке.
-    fn test_dir() -> tempfile::TempDir {
-        tempfile::tempdir().unwrap_or_else(|_| {
-            let base = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("target")
-                .join("test-tmp");
-            std::fs::create_dir_all(&base).expect("не удалось создать папку для тестовых tempdir");
-            tempfile::tempdir_in(base).expect("не удалось создать временную папку теста")
-        })
-    }
 
     fn walk_index(root: &Path) -> (ScanIndex, WalkStats) {
         let mut index = ScanIndex::new("root");
