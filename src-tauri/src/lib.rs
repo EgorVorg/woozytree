@@ -11,9 +11,7 @@ use tauri::{AppHandle, Emitter, State};
 
 use model::{DriveInfo, FolderSummary, ScanError, ScanProgress, ScanTotals};
 use scan::index::ScanIndex;
-use scan::{
-    FallbackAction, ScanService, ScanSink, ScanTarget, classify_error, drive_root, run_scan,
-};
+use scan::{ScanService, ScanSink, ScanTarget, drive_root, run_scan};
 
 /// Состояние приложения: сервис сканирования живёт всё время работы окна.
 struct AppState {
@@ -112,18 +110,16 @@ impl ScanSink for TauriSink {
     }
 }
 
-/// Русский текст ошибки для окна; при нехватке прав подсказываем обход.
+/// Русский текст ошибки для окна.
+///
+/// Обход при нехватке прав запускается автоматически (`run_scan`), поэтому
+/// отдельного совета «попробуйте обходом» здесь нет: при нехватке прав ошибка
+/// показывается уже после того, как не удался и обход.
 fn error_text(err: &ScanError) -> String {
-    let base = match err {
+    match err {
         ScanError::VolumeAccess(msg) => format!("Нет доступа к тому: {msg}"),
         ScanError::Io(msg) => format!("Ошибка ввода-вывода: {msg}"),
         ScanError::Parse(msg) => format!("Не удалось разобрать данные тома: {msg}"),
-    };
-    match classify_error(err) {
-        FallbackAction::OfferWalkFallback => {
-            format!("{base} Попробуйте сканировать папку обходом.")
-        }
-        FallbackAction::ShowFatal => base,
     }
 }
 
@@ -135,6 +131,17 @@ fn root_name(target: &ScanTarget) -> String {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string()),
+    }
+}
+
+/// Итоги, которые можно сохранить для команды `get_scan_totals`.
+///
+/// Частичный результат отменённого скана не выдаём за финальный: окно получает
+/// его событием `scan://done` с `cancelled == true` и само помечает данные.
+fn final_totals(result: &Result<ScanTotals, ScanError>) -> Option<ScanTotals> {
+    match result {
+        Ok(totals) if !totals.cancelled => Some(totals.clone()),
+        _ => None,
     }
 }
 
@@ -163,7 +170,7 @@ fn start_scan(
             let mut index = ScanIndex::new(&index_name);
             let mut sink = TauriSink::new(app, Arc::clone(&service), Arc::clone(&cancel));
             let result = run_scan(&target, &mut index, &mut sink, &cancel);
-            service.finish(&cancel, Arc::new(index), result.as_ref().ok().cloned());
+            service.finish(&cancel, Arc::new(index), final_totals(&result));
             // Итоги уходят после сохранения индекса — без гонки с get_children.
             sink.emit_final();
         })
@@ -217,4 +224,41 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn totals(cancelled: bool) -> ScanTotals {
+        ScanTotals {
+            files: 1,
+            folders: 1,
+            size_on_disk: 10,
+            size_logical: 10,
+            skipped: 0,
+            cancelled,
+            elapsed_ms: 1,
+        }
+    }
+
+    #[test]
+    fn final_totals_keeps_only_completed_run() {
+        assert!(final_totals(&Ok(totals(false))).is_some());
+        assert!(
+            final_totals(&Ok(totals(true))).is_none(),
+            "частичные итоги отменённого скана нельзя отдавать как финальные"
+        );
+        assert!(final_totals(&Err(ScanError::Io("диск отвалился".into()))).is_none());
+    }
+
+    #[test]
+    fn volume_access_error_does_not_advise_manual_walk() {
+        let text = error_text(&ScanError::VolumeAccess("нет прав".into()));
+        assert!(text.contains("Нет доступа к тому: нет прав"), "{text}");
+        assert!(
+            !text.contains("Попробуйте сканировать папку обходом"),
+            "обход теперь запускается автоматически, совет вручную недостижим: {text}"
+        );
+    }
 }

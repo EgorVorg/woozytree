@@ -31,6 +31,7 @@ function App() {
   const [selected, setSelected] = useState("");
   const [scanning, setScanning] = useState(false);
   const [stopping, setStopping] = useState(false);
+  const [cancelled, setCancelled] = useState(false);
   const [progress, setProgress] = useState<ScanProgress | null>(null);
   const [totals, setTotals] = useState<ScanTotals | null>(null);
   const [top, setTop] = useState<FolderSummary[]>([]);
@@ -77,6 +78,7 @@ function App() {
     subscribe(onTop, (rows) => setTop(rows));
     subscribe(onDone, (result) => {
       setTotals(result);
+      setCancelled(result.cancelled);
       setProgress({
         files: result.files,
         folders: result.folders,
@@ -88,6 +90,7 @@ function App() {
     });
     subscribe(onError, (message) => {
       setError(message);
+      setCancelled(false);
       setScanning(false);
       setStopping(false);
     });
@@ -99,15 +102,20 @@ function App() {
   }, []);
 
   // Заполненность бара — доля занятого места диска, уже попавшая в индекс.
+  // У остановленного скана остаётся частичное значение: 100 % означало бы,
+  // что данные полные, а их такими показывать нельзя.
   const percent = (() => {
+    const drive = drives.find((item) => item.letter === selected);
+    const used = drive ? drive.total_bytes - drive.free_bytes : 0;
+    const live =
+      used > 0 && progress
+        ? Math.min(99, Math.round((progress.size_on_disk / used) * 100))
+        : 0;
+    if (cancelled) return live;
     if (!scanning) {
       return totals ? 100 : 0;
     }
-    const drive = drives.find((item) => item.letter === selected);
-    if (!drive || !progress) return 0;
-    const used = drive.total_bytes - drive.free_bytes;
-    if (used <= 0) return 0;
-    return Math.min(99, Math.round((progress.size_on_disk / used) * 100));
+    return live;
   })();
 
   const handleScan = () => {
@@ -116,6 +124,7 @@ function App() {
     setTotals(null);
     setTop([]);
     setProgress(EMPTY_PROGRESS);
+    setCancelled(false);
     setScanning(true);
     setStopping(false);
     startScan({ drive: selected }).catch((err: unknown) => {
@@ -168,6 +177,7 @@ function App() {
           percent={percent}
           scanning={scanning}
           stopping={stopping}
+          cancelled={cancelled}
           skipped={totals?.skipped ?? 0}
         />
 

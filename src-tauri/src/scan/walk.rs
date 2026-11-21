@@ -15,8 +15,9 @@ use std::time::Instant;
 
 use windows::Win32::Foundation::HANDLE;
 use windows::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-    FILE_STANDARD_INFO, FileStandardInfo, GetFileInformationByHandle, GetFileInformationByHandleEx,
+    BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_STANDARD_INFO, FileStandardInfo,
+    GetFileInformationByHandle, GetFileInformationByHandleEx,
 };
 
 use crate::model::{FileKey, FileMeta, FolderId, ScanError, ScanProgress};
@@ -30,10 +31,25 @@ const PROGRESS_EVERY_FILES: u64 = 1000;
 pub struct WalkStats {
     /// Записи, которые не удалось прочитать (нет прав, висячая ссылка и т.п.).
     pub skipped: u32,
-    /// Reparse-точки (junction, симлинки), в которые обход намеренно не заходил.
+    /// Каталоги-reparse-точки (junction, симлинки папок), в которые обход не заходил.
     pub reparse_skipped: u32,
     /// Жёсткие ссылки, чьи байты не задвоены (второе и последующие имена файла).
     pub hard_link_duplicates: u32,
+}
+
+/// Нужно ли намеренно не заходить в запись обхода.
+///
+/// Пропускаем только **каталоги** с атрибутом reparse: junction и симлинк папки
+/// могут вести на предка (бесконечный цикл) или на уже посчитанные данные
+/// (двойной счёт). Файл с reparse-атрибутом — облачный плейсхолдер OneDrive
+/// («Файлы по запросу») или WOF-сжатый файл (CompactOS): его байты лежат на
+/// диске, поэтому он учитывается обычным путём.
+///
+/// `is_dir` — именно бит `FILE_ATTRIBUTE_DIRECTORY`, а не `Metadata::is_dir()`:
+/// для junction и симлинка папки std считает `is_dir() == false`, потому что
+/// относит их к симлинкам.
+fn is_skippable_reparse(is_dir: bool, attributes: u32) -> bool {
+    is_dir && attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
 }
 
 /// Обойти папку `root` и сложить найденное в `index`.
@@ -102,8 +118,11 @@ pub fn walk(
                 }
             };
 
-            if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
-                // Не заходим в reparse-точки: junction может вести на предка
+            let attributes = meta.file_attributes();
+            let is_reparse = attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0;
+            let is_directory = attributes & FILE_ATTRIBUTE_DIRECTORY.0 != 0;
+            if is_skippable_reparse(is_directory, attributes) {
+                // Не заходим в reparse-каталоги: junction может вести на предка
                 // (бесконечный цикл), а симлинк — на уже посчитанные данные
                 // (двойной счёт). Висячая ссылка недоступна — это обычный пропуск.
                 if fs::metadata(&path).is_ok() {
@@ -116,14 +135,16 @@ pub fn walk(
 
             let name = entry.file_name().to_string_lossy().into_owned();
 
-            if meta.is_dir() {
+            if is_directory {
                 folders += 1;
                 let child_id = index.folder(dir_id, &name);
                 stack.push((path, child_id, false));
                 continue;
             }
 
-            if !meta.is_file() {
+            // Файл с reparse-атрибутом std считает симлинком (`is_file()` == false),
+            // но для нас это обычный файл: облачный плейсхолдер или WOF-сжатый файл.
+            if !meta.is_file() && !is_reparse {
                 continue; // не файл и не папка (устройства и т.п.) — пропускаем молча
             }
 
@@ -196,6 +217,9 @@ fn report(
 fn file_info(path: &Path) -> io::Result<(FileKey, u64)> {
     let file = fs::OpenOptions::new()
         .access_mode(FILE_READ_ATTRIBUTES.0)
+        // Открываем саму запись, а не цель reparse-точки: облачный плейсхолдер не
+        // гидратируется, а файл с незнакомым системе тегом всё равно отдаёт размеры.
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
         .open(path)?;
     let handle = HANDLE(file.as_raw_handle());
 
@@ -410,12 +434,14 @@ mod tests {
 
         // Запрещаем чтение данных (RD): метаданные и размеры остаются доступны,
         // как у занятых системных файлов и файлов с запрещающей DACL.
+        // Группа задаётся SID `*S-1-1-0`, а не локализованным именем `Everyone`:
+        // алиас не резолвится на неанглийской Windows.
         let output = std::process::Command::new("cmd")
             .arg("/c")
             .arg("icacls")
             .arg(&locked)
             .arg("/deny")
-            .arg("Everyone:(RD)")
+            .arg("*S-1-1-0:(RD)")
             .output()
             .expect("не удалось запустить icacls");
         assert!(
@@ -432,7 +458,7 @@ mod tests {
             .arg("icacls")
             .arg(&locked)
             .arg("/remove:d")
-            .arg("Everyone")
+            .arg("*S-1-1-0")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
@@ -442,6 +468,104 @@ mod tests {
         assert_eq!(totals.size_logical, 64);
         assert!(totals.size_on_disk >= 64);
         assert_eq!(stats.skipped, 0, "пропусков быть не должно: {:?}", stats);
+    }
+
+    #[test]
+    fn is_skippable_reparse_only_for_directories() {
+        let reparse = FILE_ATTRIBUTE_REPARSE_POINT.0;
+        let dir_attrs = FILE_ATTRIBUTE_DIRECTORY.0;
+        // Пропускаем только каталоги-точки (junction/симлинк папки): в них нельзя
+        // заходить из-за циклов и двойного счёта. Именно так выглядит junction:
+        // DIRECTORY | REPARSE.
+        assert!(is_skippable_reparse(true, dir_attrs | reparse));
+        // Файл с reparse-атрибутом (облачный плейсхолдер, WOF) — обычный файл.
+        assert!(!is_skippable_reparse(false, reparse));
+        // Каталог без reparse-атрибута — обычная папка.
+        assert!(!is_skippable_reparse(true, dir_attrs));
+        assert!(!is_skippable_reparse(false, 0));
+    }
+
+    /// Пометить обычный файл reparse-точкой пользовательского (ISV) тега.
+    ///
+    /// Такой тег Windows принимает на пользовательском файле без повышения прав и
+    /// без данных: файл остаётся на месте, но получает `FILE_ATTRIBUTE_REPARSE_POINT`.
+    /// Это модель облачных плейсхолдеров и WOF-сжатых файлов, которые обход обязан
+    /// учитывать, а не выбрасывать.
+    fn make_reparse_file(path: &Path, len: usize) {
+        use windows::Win32::System::IO::DeviceIoControl;
+        use windows::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
+
+        /// Диапазон тегов, зарезервированный для ISV/фильтров: не требует прав.
+        const ISV_REPARSE_TAG: u32 = 0x8000_1000;
+        /// `REPARSE_DATA_BUFFER`: тег (u32), длина данных (u16), резерв (u16).
+        const HEADER_LEN: usize = 8;
+
+        std::fs::write(path, vec![0u8; len]).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        let handle = HANDLE(file.as_raw_handle());
+
+        let mut buffer = [0u8; HEADER_LEN];
+        buffer[..4].copy_from_slice(&ISV_REPARSE_TAG.to_le_bytes());
+        // ReparseDataLength = 0, Reserved = 0: пустая полезная нагрузка.
+        unsafe {
+            DeviceIoControl(
+                handle,
+                FSCTL_SET_REPARSE_POINT,
+                Some(buffer.as_ptr() as *const c_void),
+                buffer.len() as u32,
+                None,
+                0,
+                None,
+                None,
+            )
+        }
+        .expect("FSCTL_SET_REPARSE_POINT не сработал");
+    }
+
+    #[test]
+    fn test_walk_counts_file_with_reparse_point() {
+        let dir = test_dir();
+        let file = dir.path().join("cloud-placeholder.bin");
+        let len = 64;
+        make_reparse_file(&file, len);
+
+        // Убедимся, что атрибут действительно выставлен: иначе тест ничего не проверяет.
+        let meta = fs::symlink_metadata(&file).unwrap();
+        assert_ne!(
+            meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0,
+            0,
+            "файл должен получить атрибут reparse-точки"
+        );
+
+        let (index, stats) = walk_index(dir.path());
+        fs::remove_file(&file).ok(); // иначе tempdir не удалится: тег неизвестен системе
+        let totals = index.folder_totals(index.root());
+
+        // Файлы с reparse-атрибутом (облачные плейсхолдеры, WOF) — обычные файлы:
+        // их байты лежат на диске, поэтому они обязаны попасть в индекс и в размер.
+        assert_eq!(
+            totals.file_count, 1,
+            "файл с reparse-атрибутом потерян: {:?}",
+            stats
+        );
+        assert_eq!(totals.size_logical, len as u64);
+        assert!(
+            totals.size_on_disk > 0,
+            "занятое место обязано учитываться по AllocationSize"
+        );
+        assert_eq!(
+            stats.reparse_skipped, 0,
+            "файл — не пропущенная reparse-точка"
+        );
+        assert_eq!(
+            stats.skipped, 0,
+            "файл не должен попасть в skipped: {:?}",
+            stats
+        );
     }
 
     fn make_sparse_file(path: &Path, len: u64) {

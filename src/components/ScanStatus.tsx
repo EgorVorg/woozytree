@@ -9,6 +9,8 @@ interface ScanStatusProps {
   scanning: boolean;
   /** Нажали «Остановить», но ядро ещё сворачивает работу. */
   stopping: boolean;
+  /** Скан остановлен: цифры ниже — частичный срез, а не полный итог. */
+  cancelled: boolean;
   /** Сколько записей не попало в индекс (0 — пропусков не было). */
   skipped: number;
 }
@@ -19,6 +21,7 @@ export default function ScanStatus({
   percent,
   scanning,
   stopping,
+  cancelled,
   skipped,
 }: ScanStatusProps) {
   const files = progress?.files ?? 0;
@@ -30,9 +33,11 @@ export default function ScanStatus({
     ? "Остановка…"
     : scanning
       ? "Сканирование…"
-      : progress
-        ? "Готово"
-        : "Ожидание";
+      : cancelled
+        ? "Остановлено"
+        : progress
+          ? "Готово"
+          : "Ожидание";
 
   return (
     <section className="space-y-3 rounded-lg border border-border bg-card p-4">
@@ -73,6 +78,15 @@ export default function ScanStatus({
       {skipped > 0 ? (
         <p className="text-xs text-muted-foreground">
           Пропущено записей: {formatCount(skipped)}
+        </p>
+      ) : null}
+
+      {cancelled ? (
+        <p
+          role="status"
+          className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+        >
+          Данные частичные: сканирование остановлено до завершения.
         </p>
       ) : null}
     </section>

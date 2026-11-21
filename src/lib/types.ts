@@ -26,6 +26,8 @@ export interface ScanTotals {
   size_on_disk: number;
   size_logical: number;
   skipped: number;
+  /** Скан остановлен пользователем: цифры — частичный срез, а не полный итог. */
+  cancelled: boolean;
   elapsed_ms: number;
 }
 

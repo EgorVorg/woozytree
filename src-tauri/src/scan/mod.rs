@@ -62,6 +62,36 @@ pub fn classify_error(err: &ScanError) -> FallbackAction {
     }
 }
 
+/// Нехватку прав на том лечим тем же охватом через обход папок.
+///
+/// Быстрый движок NTFS требует прав администратора; обход читает тот же корень
+/// обычными API файловой системы и работает без них. Ошибку показываем, только
+/// если не удался и обход, — иначе пользователь увидел бы «нет доступа» при
+/// успешном результате.
+fn with_walk_fallback(
+    fast: Result<ScanTotals, ScanError>,
+    walk: impl FnOnce() -> Result<ScanTotals, ScanError>,
+) -> Result<ScanTotals, ScanError> {
+    match fast {
+        Err(ScanError::VolumeAccess(fast_error)) => walk().map_err(|walk_error| {
+            ScanError::VolumeAccess(format!(
+                "{fast_error}; обход папок тоже не удался: {}",
+                error_message(&walk_error)
+            ))
+        }),
+        other => other,
+    }
+}
+
+/// Текст ошибки без префикса варианта — для составных сообщений.
+fn error_message(err: &ScanError) -> &str {
+    match err {
+        ScanError::VolumeAccess(message) | ScanError::Io(message) | ScanError::Parse(message) => {
+            message
+        }
+    }
+}
+
 /// Прогресс и итоги наружу в одном месте: движки только сообщают цифры.
 ///
 /// Топ папок отправляется по завершении: движок держит `&mut ScanIndex` всё
@@ -77,8 +107,15 @@ pub fn run_scan(
     let result = match target {
         // NTFS-том читаем напрямую; всё остальное — обходом.
         ScanTarget::Drive(letter) if is_ntfs(letter) => {
-            let mut report = |p: &ScanProgress| sink.progress(p);
-            scan_ntfs(letter, index, cancel, &mut report)
+            let fast = {
+                let mut report = |p: &ScanProgress| sink.progress(p);
+                scan_ntfs(letter, index, cancel, &mut report)
+            };
+            // Нет прав на том — не тупик: тот же охват обходом, без ошибки в окне.
+            with_walk_fallback(fast, || {
+                let mut report = |p: &ScanProgress| sink.progress(p);
+                walk_target(target, index, cancel, &mut report)
+            })
         }
         _ => {
             let mut report = |p: &ScanProgress| sink.progress(p);
@@ -87,7 +124,10 @@ pub fn run_scan(
     };
 
     match result {
-        Ok(totals) => {
+        Ok(mut totals) => {
+            // Флаг отмены — единственный достоверный признак частичности на момент
+            // завершения: движок мог остановиться уже после нажатия «Остановить».
+            totals.cancelled = cancel.load(Ordering::Relaxed);
             let rows: Vec<FolderSummary> = index
                 .child_folders(index.root())
                 .into_iter()
@@ -126,9 +166,10 @@ fn walk_target(
         size_on_disk: totals.size_on_disk,
         size_logical: totals.size_logical,
         // В skipped входит всё, что не попало в индекс: недоступные записи и
-        // reparse-точки. Дубликаты жёстких ссылок — не пропуски, они учтены
+        // reparse-каталоги. Дубликаты жёстких ссылок — не пропуски, они учтены
         // отдельным счётчиком `WalkStats::hard_link_duplicates`.
         skipped: stats.skipped.saturating_add(stats.reparse_skipped),
+        cancelled: cancel.load(Ordering::Relaxed),
         elapsed_ms: started.elapsed().as_millis() as u64,
     })
 }
@@ -408,6 +449,10 @@ mod tests {
         .expect("сканирование папки должно завершиться без ошибки");
 
         assert_eq!(totals.files, 3);
+        assert!(
+            !totals.cancelled,
+            "обычный скан не должен помечаться отменённым"
+        );
         assert_eq!(index.folder_totals(index.root()).file_count, 3);
         assert!(
             !sink.progress.is_empty(),
@@ -479,6 +524,84 @@ mod tests {
         );
     }
 
+    fn sample_totals(files: u64, size_on_disk: u64) -> ScanTotals {
+        ScanTotals {
+            files,
+            folders: 1,
+            size_on_disk,
+            size_logical: size_on_disk,
+            skipped: 0,
+            cancelled: false,
+            elapsed_ms: 1,
+        }
+    }
+
+    #[test]
+    fn volume_access_falls_back_to_walk() {
+        let mut walk_called = false;
+        let result = with_walk_fallback(
+            Err(ScanError::VolumeAccess("нет прав".into())),
+            || {
+                walk_called = true;
+                Ok(sample_totals(7, 70))
+            },
+        );
+
+        let totals = result.expect("обход обязан заменить неудачу быстрого движка");
+        assert!(walk_called, "при VolumeAccess обход должен запускаться");
+        assert_eq!(totals.files, 7);
+        assert_eq!(totals.size_on_disk, 70);
+    }
+
+    #[test]
+    fn successful_fast_scan_does_not_fall_back() {
+        let mut walk_called = false;
+        let result = with_walk_fallback(Ok(sample_totals(3, 30)), || {
+            walk_called = true;
+            Ok(sample_totals(9, 90))
+        });
+
+        assert_eq!(result.expect("успех должен пройти насквозь").files, 3);
+        assert!(!walk_called, "успешный скан не должен повторяться обходом");
+    }
+
+    #[test]
+    fn non_volume_errors_do_not_fall_back() {
+        let mut walk_called = false;
+        let result = with_walk_fallback(
+            Err(ScanError::Io("диск отвалился".into())),
+            || {
+                walk_called = true;
+                Ok(sample_totals(1, 1))
+            },
+        );
+
+        assert!(!walk_called, "Io-ошибка обходом не лечится");
+        assert!(matches!(result, Err(ScanError::Io(_))));
+    }
+
+    #[test]
+    fn failed_walk_reports_both_causes() {
+        let result = with_walk_fallback(
+            Err(ScanError::VolumeAccess("нет прав".into())),
+            || Err(ScanError::Io("папка недоступна".into())),
+        );
+
+        match result {
+            Err(ScanError::VolumeAccess(message)) => {
+                assert!(
+                    message.contains("нет прав"),
+                    "исходная причина должна остаться: {message}"
+                );
+                assert!(
+                    message.contains("папка недоступна"),
+                    "причина неудачи обхода должна остаться: {message}"
+                );
+            }
+            other => panic!("ожидалась VolumeAccess с обеими причинами, получено {other:?}"),
+        }
+    }
+
     #[test]
     fn cancel_scan_stops_run() {
         let dir = test_dir();
@@ -501,5 +624,9 @@ mod tests {
 
         assert_eq!(totals.files, 0, "до отмены файлы не должны считаться");
         assert_eq!(totals.skipped, 0, "отмена не создаёт пропусков");
+        assert!(
+            totals.cancelled,
+            "остановленный скан обязан помечать итоги как частичные"
+        );
     }
 }

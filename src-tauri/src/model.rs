@@ -45,6 +45,11 @@ pub struct ScanProgress {
     pub elapsed_ms: u64,
 }
 
+/// Итоги сканирования.
+///
+/// `cancelled == true` означает, что пользователь остановил скан: цифры — срез на
+/// момент остановки, а не полный результат. Такие итоги нельзя показывать как
+/// завершённые 100 % и нельзя сохранять как финальные (см. `get_scan_totals`).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ScanTotals {
     pub files: u64,
@@ -60,6 +65,8 @@ pub struct ScanTotals {
     /// корне». Разбивка по причинам — `crate::scan::mft::ScanDiag` (см.
     /// `scan_ntfs_reader_diag`).
     pub skipped: u32,
+    /// Скан остановлен пользователем: данные частичные.
+    pub cancelled: bool,
     pub elapsed_ms: u64,
 }
 

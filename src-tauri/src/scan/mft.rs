@@ -758,6 +758,7 @@ pub fn scan_ntfs_reader_diag(
             size_on_disk,
             size_logical,
             skipped,
+            cancelled: cancel.load(Ordering::Relaxed),
             elapsed_ms,
         },
         diag,
