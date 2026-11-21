@@ -280,6 +280,14 @@ fn read_volume(
         }
     }
 
+    // Runlist короче реального размера $MFT: чтение вернуло бы только часть
+    // таблицы. Молчаливое усечение недопустимо — это ошибка разбора.
+    if remaining > 0 {
+        return Err(ScanError::Parse(format!(
+            "runlist $MFT покрывает не весь реальный размер таблицы: не дочитано {remaining} байт из {mft_size}"
+        )));
+    }
+
     Ok(records)
 }
 
@@ -516,6 +524,14 @@ fn parse_mft_data(record: &[u8]) -> Result<(Vec<Extent>, u64), ScanError> {
         let name_len = record[off + 0x09];
         // $MFT — это неименованный нерезидентный поток $DATA (атрибут 0x80).
         if attr_type == ATTR_DATA && non_resident && name_len == 0 {
+            // Нерезидентный заголовок атрибута занимает 0x40 байт: поля runlist
+            // (0x20) и реального размера (0x30..0x38) лежат внутри него. Если
+            // атрибут короче, чтение вышло бы за его границы (и за запись).
+            if attr_len < 0x40 {
+                return Err(ScanError::Parse(format!(
+                    "нерезидентный $DATA короче заголовка атрибута: {attr_len} < 0x40"
+                )));
+            }
             let run_off = u16::from_le_bytes([record[off + 0x20], record[off + 0x21]]) as usize;
             let real_size =
                 u64::from_le_bytes(record[off + 0x30..off + 0x38].try_into().unwrap());
@@ -619,5 +635,56 @@ mod tests {
         assert_eq!(records, 2000);
         assert_eq!(wrong_size, 0);
         assert!(first_signature_ok, "первая запись должна начинаться с FILE");
+    }
+
+    #[test]
+    fn test_parse_mft_data_rejects_short_attr_without_panic() {
+        // Синтетическая запись №0: нерезидентный $DATA с attr_len = 0x18 прижат
+        // к концу записи. Нерезидентный заголовок занимает 0x40 байт, поэтому
+        // поля по смещениям 0x20 и 0x30 лежат за границей атрибута и записи.
+        // Ждём ScanError::Parse, а не панику выхода за границы среза.
+        let mut record = vec![0u8; 1024];
+        record[0..4].copy_from_slice(b"FILE");
+        let attr_off = 1024 - 0x18;
+        record[0x14..0x16].copy_from_slice(&(attr_off as u16).to_le_bytes());
+        record[attr_off..attr_off + 4].copy_from_slice(&ATTR_DATA.to_le_bytes());
+        record[attr_off + 4..attr_off + 8].copy_from_slice(&0x18u32.to_le_bytes());
+        record[attr_off + 8] = 1; // нерезидентный
+        record[attr_off + 9] = 0; // имя пустое
+
+        let error = parse_mft_data(&record).expect_err("короткий $DATA должен быть ошибкой");
+        assert!(
+            matches!(error, ScanError::Parse(_)),
+            "ожидалась ScanError::Parse, получено {error:?}"
+        );
+    }
+
+    #[test]
+    fn test_truncated_runlist_is_a_parse_error() {
+        // Том «подменяем» слепком: один экстент на 4 кластера по 1024 байта
+        // покрывает 4096 байт, а реальный размер $MFT — 8192. Чтение обязано
+        // громко упасть, а не вернуть половину таблицы как успех.
+        let file = File::open(fixture("sample.mft")).expect("нет фикстуры sample.mft");
+        let extents = [Extent {
+            lcn: 0,
+            clusters: 4,
+        }];
+
+        let result = read_volume(
+            &RefCell::new(file),
+            &extents,
+            1024, // размер кластера
+            8192, // реальный размер $MFT: больше, чем покрывают экстенты
+            1024, // размер записи
+            &mut |_record| {},
+        );
+
+        match result {
+            Err(ScanError::Parse(message)) => assert!(
+                message.contains("runlist"),
+                "сообщение должно объяснять причину, получено: {message}"
+            ),
+            other => panic!("ожидалась ScanError::Parse, получено {other:?}"),
+        }
     }
 }
