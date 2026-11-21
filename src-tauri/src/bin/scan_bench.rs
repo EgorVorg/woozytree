@@ -1,4 +1,4 @@
-//! scan_bench — временная утилита замера скорости сканирования NTFS через MFT.
+﻿//! scan_bench — временная утилита замера скорости сканирования NTFS через MFT.
 //!
 //! Пример: `scan_bench C:` (нужны права администратора) или
 //! `scan_bench --fixture <путь к слепку MFT>` для проверки без тома.
@@ -283,7 +283,11 @@ fn run_live(drive: &str) {
          папки в прогрессе живыми: {}",
         sink.first_top,
         sink.max_top_gap,
-        if sink.live_folders_seen { "да" } else { "нет" }
+        if sink.live_folders_seen {
+            "да"
+        } else {
+            "нет"
+        }
     );
     if let Some(progress) = &sink.last_progress {
         println!(
@@ -296,7 +300,9 @@ fn run_live(drive: &str) {
     let root_totals = index.folder_totals(index.root());
     println!(
         "[bench] итоги корня индекса: файлов {}, папок {}, занято {} байт, логически {}",
-        root_totals.file_count, root_totals.folder_count, root_totals.size_on_disk,
+        root_totals.file_count,
+        root_totals.folder_count,
+        root_totals.size_on_disk,
         root_totals.size_logical
     );
 
@@ -460,7 +466,9 @@ fn main() {
     let root_totals = index.folder_totals(index.root());
     println!(
         "[bench] итоги корня индекса: файлов {}, папок {}, занято {} байт, логически {}",
-        root_totals.file_count, root_totals.folder_count, root_totals.size_on_disk,
+        root_totals.file_count,
+        root_totals.folder_count,
+        root_totals.size_on_disk,
         root_totals.size_logical
     );
 

@@ -47,23 +47,67 @@ fn zero_totals() -> FolderTotals {
     }
 }
 
-/// Сравнение имён без учёта регистра (как в проводнике), без аллокаций.
+/// Сравнение имён для сортировки — по-русски, как в проводнике: регистр не
+/// различается (включая кириллицу), «ё» стоит наравне с «е». Порядок символов —
+/// по коду Unicode: латиница раньше кириллицы, а после снятия регистра строчные
+/// «а»…«я» идут по алфавиту.
 ///
-/// При полном совпадении без регистра сравниваем байты: порядок должен быть
-/// однозначным (`a.txt` и `A.txt` — разные файлы).
+/// ASCII-имена (типичный случай) сравниваются побайтово, без аллокаций: быстрый
+/// путь включается, пока различающиеся байты ASCII. На не-ASCII (кириллица)
+/// регистр снимается посимвольно через `char::to_lowercase` — тоже без аллокаций.
+///
+/// При полном совпадении без учёта регистра сравниваем исходные байты: порядок
+/// однозначен («A.txt» раньше «a.txt», «еж.txt» раньше «ёж.txt»).
+///
+/// Это не полное locale-сравнение: знаки препинания и пробелы не игнорируются —
+/// для имён файлов, где имена различаются буквами, этого достаточно.
 fn compare_names(left: &str, right: &str) -> Ordering {
-    let (left, right) = (left.as_bytes(), right.as_bytes());
-    let shared = left.len().min(right.len());
+    compare_names_folded(left, right).then_with(|| left.as_bytes().cmp(right.as_bytes()))
+}
+
+/// Первичное сравнение имён: регистр и «ё»/«е» не различаются.
+fn compare_names_folded(left: &str, right: &str) -> Ordering {
+    let (left_bytes, right_bytes) = (left.as_bytes(), right.as_bytes());
+    let shared = left_bytes.len().min(right_bytes.len());
     for index in 0..shared {
-        let (a, b) = (
-            left[index].to_ascii_lowercase(),
-            right[index].to_ascii_lowercase(),
-        );
-        if a != b {
-            return a.cmp(&b);
+        let (a, b) = (left_bytes[index], right_bytes[index]);
+        if a == b {
+            continue;
+        }
+        if a.is_ascii() && b.is_ascii() {
+            return a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase());
+        }
+        // Не-ASCII: байтовый порядок в UTF-8 не совпадает с алфавитным (заглавная
+        // «З» = 0xD0 0x97 идёт раньше строчной «а» = 0xD0 0xB0), поэтому дальше
+        // сравниваем символы.
+        return compare_lowered_chars(left, right);
+    }
+    // Байтовый префикс совпал — короткое имя раньше. Для UTF-8 это совпадает с
+    // посимвольным сравнением: префикс байт = префикс символов.
+    left_bytes.len().cmp(&right_bytes.len())
+}
+
+/// Посимвольное сравнение: регистр снят, «ё» приведена к «е».
+fn compare_lowered_chars(left: &str, right: &str) -> Ordering {
+    let mut left_chars = lowered_chars(left);
+    let mut right_chars = lowered_chars(right);
+    loop {
+        match (left_chars.next(), right_chars.next()) {
+            (Some(a), Some(b)) if a == b => continue,
+            (Some(a), Some(b)) => return a.cmp(&b),
+            (Some(_), None) => return Ordering::Greater,
+            (None, Some(_)) => return Ordering::Less,
+            (None, None) => return Ordering::Equal,
         }
     }
-    left.len().cmp(&right.len()).then_with(|| left.cmp(right))
+}
+
+/// Символы имени в нижнем регистре, «ё» приведена к «е» (в русской сортировке
+/// они на одном месте); аллокаций нет: `char::to_lowercase` — итератор.
+fn lowered_chars(text: &str) -> impl Iterator<Item = char> + '_ {
+    text.chars()
+        .flat_map(char::to_lowercase)
+        .map(|c| if c == 'ё' { 'е' } else { c })
 }
 
 /// Порядок с учётом направления сортировки.
@@ -477,7 +521,9 @@ mod tests {
         );
         // limit больше числа файлов — отдаём всё, что есть.
         assert_eq!(
-            index.child_files(folder, FileSort::Name, false, 0, 100).len(),
+            index
+                .child_files(folder, FileSort::Name, false, 0, 100)
+                .len(),
             5
         );
         // Хвост страницы: offset 3 при большом limit — только две последние строки.
@@ -528,16 +574,40 @@ mod tests {
         };
 
         // Равные размеры — по имени (вставка была в порядке b, a, c, d).
-        assert_eq!(names(FileSort::SizeOnDisk, false), ["d.txt", "a.txt", "b.txt", "c.txt"]);
-        assert_eq!(names(FileSort::SizeOnDisk, true), ["a.txt", "b.txt", "c.txt", "d.txt"]);
+        assert_eq!(
+            names(FileSort::SizeOnDisk, false),
+            ["d.txt", "a.txt", "b.txt", "c.txt"]
+        );
+        assert_eq!(
+            names(FileSort::SizeOnDisk, true),
+            ["a.txt", "b.txt", "c.txt", "d.txt"]
+        );
         // Имя — самостоятельный ключ: desc разворачивает его.
-        assert_eq!(names(FileSort::Name, false), ["a.txt", "b.txt", "c.txt", "d.txt"]);
-        assert_eq!(names(FileSort::Name, true), ["d.txt", "c.txt", "b.txt", "a.txt"]);
+        assert_eq!(
+            names(FileSort::Name, false),
+            ["a.txt", "b.txt", "c.txt", "d.txt"]
+        );
+        assert_eq!(
+            names(FileSort::Name, true),
+            ["d.txt", "c.txt", "b.txt", "a.txt"]
+        );
         // Логический размер и время изменения — тоже с tie-break по имени.
-        assert_eq!(names(FileSort::SizeLogical, false), ["a.txt", "c.txt", "b.txt", "d.txt"]);
-        assert_eq!(names(FileSort::SizeLogical, true), ["d.txt", "b.txt", "c.txt", "a.txt"]);
-        assert_eq!(names(FileSort::Modified, false), ["a.txt", "b.txt", "c.txt", "d.txt"]);
-        assert_eq!(names(FileSort::Modified, true), ["d.txt", "c.txt", "b.txt", "a.txt"]);
+        assert_eq!(
+            names(FileSort::SizeLogical, false),
+            ["a.txt", "c.txt", "b.txt", "d.txt"]
+        );
+        assert_eq!(
+            names(FileSort::SizeLogical, true),
+            ["d.txt", "b.txt", "c.txt", "a.txt"]
+        );
+        assert_eq!(
+            names(FileSort::Modified, false),
+            ["a.txt", "b.txt", "c.txt", "d.txt"]
+        );
+        assert_eq!(
+            names(FileSort::Modified, true),
+            ["d.txt", "c.txt", "b.txt", "a.txt"]
+        );
     }
 
     #[test]
@@ -558,8 +628,14 @@ mod tests {
         let rows = index.child_files(folder, FileSort::Name, false, 0, 10);
         let names: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
         assert_eq!(names, ["first.txt", "second.txt"]);
-        assert!(!rows[0].hard_linked, "первая ссылка считается обычным файлом");
-        assert!(rows[1].hard_linked, "у повторной ссылки должна быть пометка");
+        assert!(
+            !rows[0].hard_linked,
+            "первая ссылка считается обычным файлом"
+        );
+        assert!(
+            rows[1].hard_linked,
+            "у повторной ссылки должна быть пометка"
+        );
         // Фактический размер виден у обеих строк...
         assert_eq!(rows[0].size_on_disk, 4096);
         assert_eq!(rows[1].size_on_disk, 4096);
@@ -583,6 +659,61 @@ mod tests {
     #[test]
     fn file_record_stays_compact() {
         assert_eq!(std::mem::size_of::<FileRecord>(), 56);
+    }
+
+    /// Имена по-русски: без учёта регистра «архив.zip» идёт раньше «Загрузки».
+    /// Побайтовый компаратор ставил заглавную «З» (U+0417) впереди строчной «а»
+    /// (U+0430), то есть сортировал не по алфавиту.
+    #[test]
+    fn test_sorts_cyrillic_alphabetically() {
+        let mut index = ScanIndex::new("C:");
+        let root = index.root();
+        let folder = index.folder(root, "russian");
+        // Все файлы одного размера: порядок задаёт только имя (в т.ч. tie-break).
+        for (position, name) in ["Загрузки", "архив.zip", "документы"].iter().enumerate()
+        {
+            index.add_file(folder, meta(name, 100, position as u64));
+        }
+
+        let names = |sort: FileSort, desc: bool| -> Vec<String> {
+            index
+                .child_files(folder, sort, desc, 0, 10)
+                .iter()
+                .map(|row| row.name.clone())
+                .collect()
+        };
+
+        let ascending = ["архив.zip", "документы", "Загрузки"];
+        assert_eq!(names(FileSort::Name, false), ascending);
+        // Tie-break по имени действует и при сортировке по размеру.
+        assert_eq!(names(FileSort::SizeOnDisk, false), ascending);
+        assert_eq!(
+            names(FileSort::Name, true),
+            ["Загрузки", "документы", "архив.zip"]
+        );
+    }
+
+    /// «ё» сортируется наравне с «е», как в проводнике: «ёж» раньше «Жук».
+    /// При полном совпадении без учёта регистра порядок однозначный: «еж.txt»
+    /// раньше «ёж.txt» (побайтовый tie-break, как и «A.txt» раньше «a.txt»).
+    #[test]
+    fn test_sorts_yo_like_ye() {
+        let mut index = ScanIndex::new("C:");
+        let root = index.root();
+        let folder = index.folder(root, "yo");
+        for (position, name) in ["Жук.txt", "Ель.txt", "ёж.txt", "еж.txt"]
+            .iter()
+            .enumerate()
+        {
+            index.add_file(folder, meta(name, 100, position as u64));
+        }
+
+        let names: Vec<String> = index
+            .child_files(folder, FileSort::Name, false, 0, 10)
+            .iter()
+            .map(|row| row.name.clone())
+            .collect();
+        assert_eq!(names, ["еж.txt", "ёж.txt", "Ель.txt", "Жук.txt"]);
     }
 
     /// Дубликат жёсткой ссылки, чья первая копия лежит в другой папке: размер
