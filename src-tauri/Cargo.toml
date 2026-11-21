@@ -14,6 +14,13 @@ edition = "2024"
 name = "woozytree_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[[bin]]
+name = "woozytree"
+path = "src/main.rs"
+# Тестов в bin нет, а тестовый харнесс bin-цели наследует манифест requireAdministrator
+# и без прав падает с os error 740, поэтому bin-тесты отключены.
+test = false
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 embed-resource = "3"
