@@ -296,7 +296,7 @@ git commit -m "feat(scanner): модель данных и ScanIndex с деду
 ```rust
 // scan/walk.rs
 #[derive(Debug, Default)]
-pub struct WalkStats { pub skipped: u32, pub reparse_skipped: u32 }
+pub struct WalkStats { pub skipped: u32, pub reparse_skipped: u32, pub hard_link_duplicates: u32 }
 
 pub fn walk(
     root: &Path,
@@ -314,7 +314,7 @@ pub fn walk(
 
 - `test_walk_sums_file_sizes` — файлы 10 и 32 байта → итоги папки: `size_on_disk` ≥ 42, `file_count: 2`.
 - `test_walk_handles_unicode_and_long_paths` — файл `файл 🚀 тест.txt` и вложенная цепочка папок с полным путём больше 260 символов → оба файла в индексе с верными размерами; запуск и по пути с префиксом `\\?\`, и без него.
-- `test_walk_counts_hard_link_once` — `std::fs::hard_link` создал второе имя файла → итоги по размеру равны одному файлу, второй файл в индексе с пометкой дубликата.
+- `test_walk_counts_hard_link_once` — `std::fs::hard_link` создал второе имя файла → итоги по размеру равны одному файлу; дубликат наблюдаем: `WalkStats.hard_link_duplicates == 1` (пофайловая пометка `hard_linked` — в Плане 2, с табличкой файлов).
 - `test_walk_does_not_follow_junctions` — создать junction (`cmd /c mklink /J`) из подпапки на её предка → `walk` завершается, размеры и счётчики не задвоены, `reparse_skipped ≥ 1`.
 - `test_walk_tolerates_dangling_junction` — junction на удалённую папку → `walk` завершается `Ok`, `skipped ≥ 1`.
 - `test_walk_stops_on_cancel` — `cancel` выставлен в `progress`-колбэке → `walk` возвращается досрочно, без ошибки.
