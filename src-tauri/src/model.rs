@@ -79,6 +79,23 @@ pub struct DriveInfo {
     pub free_bytes: u64,
 }
 
+/// Прямоугольник живой карты (treemap): координаты нормированы в 0..1.
+///
+/// Данные раскладки подключает Задача 3; в Задаче 1 событие `treemap` уже
+/// приходит с нужным ритмом, а срез может быть пустым.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TreemapRect {
+    /// Для папок — `FolderId`, для файлов — 0 (различать по `is_dir`).
+    pub id: u64,
+    pub name: String,
+    pub size: u64,
+    pub is_dir: bool,
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
 #[derive(Debug)]
 pub enum ScanError {
     VolumeAccess(String),

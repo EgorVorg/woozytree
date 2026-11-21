@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter, State};
 
-use model::{DriveInfo, FolderSummary, ScanError, ScanProgress, ScanTotals};
+use model::{DriveInfo, FolderSummary, ScanError, ScanProgress, ScanTotals, TreemapRect};
 use scan::index::ScanIndex;
 use scan::{ScanService, ScanSink, ScanTarget, drive_root, run_scan};
 
@@ -100,6 +100,13 @@ impl ScanSink for TauriSink {
             return;
         }
         let _ = self.app.emit("scan://top", rows);
+    }
+
+    fn treemap(&mut self, rects: &[TreemapRect]) {
+        if !self.is_current() {
+            return;
+        }
+        let _ = self.app.emit("scan://treemap", rects);
     }
 
     fn done(&mut self, r: Result<&ScanTotals, &ScanError>) {

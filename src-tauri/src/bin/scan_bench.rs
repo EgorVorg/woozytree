@@ -7,12 +7,13 @@
 
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use woozytree_lib::model::{ScanError, ScanProgress};
+use woozytree_lib::model::{FolderSummary, ScanError, ScanProgress, ScanTotals, TreemapRect};
 use woozytree_lib::scan::index::ScanIndex;
-use woozytree_lib::scan::mft::{scan_ntfs_reader_diag, ScanDiag};
+use woozytree_lib::scan::mft::{ScanDiag, scan_ntfs_reader_diag};
 use woozytree_lib::scan::volume::VolumeReader;
+use woozytree_lib::scan::{ScanSink, ScanTarget, run_scan};
 
 fn describe(error: ScanError) -> String {
     match error {
@@ -26,8 +27,173 @@ fn gib(bytes: u64) -> f64 {
     bytes as f64 / (1u64 << 30) as f64
 }
 
+/// Приёмник живого сканирования: печатает прогресс, топ и карту с отметками
+/// времени — так видно, что события идут во время чтения, а не после него.
+struct LiveSink {
+    started: Instant,
+    progress_events: u64,
+    top_events: u64,
+    treemap_events: u64,
+    first_top: Option<Duration>,
+    last_top: Option<Duration>,
+    max_top_gap: Duration,
+    last_progress: Option<ScanProgress>,
+    live_folders_seen: bool,
+}
+
+impl LiveSink {
+    fn new() -> LiveSink {
+        LiveSink {
+            started: Instant::now(),
+            progress_events: 0,
+            top_events: 0,
+            treemap_events: 0,
+            first_top: None,
+            last_top: None,
+            max_top_gap: Duration::ZERO,
+            last_progress: None,
+            live_folders_seen: false,
+        }
+    }
+}
+
+impl ScanSink for LiveSink {
+    fn progress(&mut self, p: &ScanProgress) {
+        self.progress_events += 1;
+        self.last_progress = Some(p.clone());
+        if p.folders > 0 {
+            self.live_folders_seen = true;
+        }
+        // Не засоряем лог: первое событие и каждое сотое.
+        if self.progress_events == 1 || self.progress_events % 100 == 0 {
+            println!(
+                "[live] прогресс #{:>4} в {:.2} с: файлов {}, папок {}, занято {:.2} ГиБ",
+                self.progress_events,
+                self.started.elapsed().as_secs_f64(),
+                p.files,
+                p.folders,
+                gib(p.size_on_disk)
+            );
+        }
+    }
+
+    fn top_folders(&mut self, rows: &[FolderSummary]) {
+        let at = self.started.elapsed();
+        self.top_events += 1;
+        if let Some(previous) = self.last_top {
+            self.max_top_gap = self.max_top_gap.max(at - previous);
+        }
+        self.first_top.get_or_insert(at);
+        self.last_top = Some(at);
+        let head = rows
+            .first()
+            .map(|row| format!("{}, {:.2} ГиБ", row.name, gib(row.size_on_disk)))
+            .unwrap_or_else(|| "пусто".to_string());
+        println!(
+            "[live] топ #{:>3} в {:.2} с: папок {}, крупнейшая {}",
+            self.top_events,
+            at.as_secs_f64(),
+            rows.len(),
+            head
+        );
+    }
+
+    fn treemap(&mut self, rects: &[TreemapRect]) {
+        self.treemap_events += 1;
+        println!(
+            "[live] карта #{:>3} в {:.2} с: прямоугольников {}",
+            self.treemap_events,
+            self.started.elapsed().as_secs_f64(),
+            rects.len()
+        );
+    }
+
+    fn done(&mut self, r: Result<&ScanTotals, &ScanError>) {
+        let text = match r {
+            Ok(totals) => format!(
+                "файлов {}, папок {}, занято {:.3} ГиБ",
+                totals.files,
+                totals.folders,
+                gib(totals.size_on_disk)
+            ),
+            Err(err) => format!("ошибка: {err:?}"),
+        };
+        println!(
+            "[live] done в {:.2} с: {text}",
+            self.started.elapsed().as_secs_f64()
+        );
+    }
+}
+
+/// Живой режим: скан через `run_scan` — тот же путь, что и в приложении,
+/// с таймером живых событий (топ и карта раз в секунду).
+fn run_live(drive: &str) {
+    let letter = drive.trim_end_matches([':', '\\', '/']).to_string();
+    let target = ScanTarget::Drive(letter.clone());
+    let mut index = ScanIndex::new(drive);
+    let cancel = AtomicBool::new(false);
+    let mut sink = LiveSink::new();
+    let started = Instant::now();
+
+    let totals = match run_scan(&target, &mut index, &mut sink, &cancel) {
+        Ok(totals) => totals,
+        Err(error) => {
+            eprintln!("scan_bench: {}", describe(error));
+            std::process::exit(1);
+        }
+    };
+    let wall = started.elapsed();
+
+    println!("[bench] цель: {drive} (живой режим run_scan)");
+    println!(
+        "[bench] всего: файлов {}, папок {}, занято {:.3} ГиБ ({} байт), логически {:.3} ГиБ, \
+         пропущено {}, elapsed_ms {}",
+        totals.files,
+        totals.folders,
+        gib(totals.size_on_disk),
+        totals.size_on_disk,
+        gib(totals.size_logical),
+        totals.skipped,
+        totals.elapsed_ms
+    );
+    println!(
+        "[bench] по стенным часам: {:.3} с; прогресс {}, топ {}, карта {}",
+        wall.as_secs_f64(),
+        sink.progress_events,
+        sink.top_events,
+        sink.treemap_events
+    );
+    println!(
+        "[bench] живые события: первый топ в {:?}, максимальная пауза между топами {:?}, \
+         папки в прогрессе живыми: {}",
+        sink.first_top,
+        sink.max_top_gap,
+        if sink.live_folders_seen { "да" } else { "нет" }
+    );
+    if let Some(progress) = &sink.last_progress {
+        println!(
+            "[bench] последний прогресс: файлов {}, папок {}, занято {:.3} ГиБ",
+            progress.files,
+            progress.folders,
+            gib(progress.size_on_disk)
+        );
+    }
+    let root_totals = index.folder_totals(index.root());
+    println!(
+        "[bench] итоги корня индекса: файлов {}, папок {}, занято {} байт, логически {}",
+        root_totals.file_count, root_totals.folder_count, root_totals.size_on_disk,
+        root_totals.size_logical
+    );
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Живой режим: скан через run_scan с таймером событий (топ и карта).
+    if args.first().map(String::as_str) == Some("--live") {
+        run_live(args.get(1).map(String::as_str).unwrap_or("C"));
+        return;
+    }
 
     // Диагностический режим: печать числа разобранных имён по каждой записи
     // слепка (для сверки с независимым разбором).
@@ -41,8 +207,9 @@ fn main() {
             }
         };
         let mut index = 0u64;
+        let cancel = AtomicBool::new(false);
         reader
-            .read_records(&mut |record| {
+            .read_records(&cancel, &mut |record| {
                 let count = woozytree_lib::scan::mft::parse_record(record).len();
                 if count > 0 {
                     println!("{index} {count}");
@@ -79,7 +246,7 @@ fn main() {
             .map_err(describe)
             .and_then(|reader| {
                 let scanned =
-                    scan_ntfs_reader_diag(&reader, &mut index, &cancel, &mut |progress| {
+                    scan_ntfs_reader_diag(&reader, &mut index, &cancel, &mut |progress, _index| {
                         progress_calls += 1;
                         last_progress = progress.clone();
                     })
@@ -107,11 +274,12 @@ fn main() {
                 .boot_sector()
                 .map_or(0, |boot| boot.volume_serial as u32)
         );
-        let scanned = scan_ntfs_reader_diag(&reader, &mut index, &cancel, &mut |progress| {
-            progress_calls += 1;
-            last_progress = progress.clone();
-        })
-        .map_err(describe);
+        let scanned =
+            scan_ntfs_reader_diag(&reader, &mut index, &cancel, &mut |progress, _index| {
+                progress_calls += 1;
+                last_progress = progress.clone();
+            })
+            .map_err(describe);
         if let Ok((_, breakdown)) = &scanned {
             diag = Some(*breakdown);
         }

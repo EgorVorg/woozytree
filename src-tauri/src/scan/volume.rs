@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::model::ScanError;
 
@@ -183,13 +184,27 @@ impl VolumeReader {
         }
     }
 
-    /// Отдать все записи в `sink` по одной; вернуть их количество.
-    pub fn read_records(&self, sink: &mut dyn FnMut(&[u8])) -> Result<u64, ScanError> {
+    /// Отдать записи в `sink` по одной; вернуть их количество.
+    ///
+    /// `cancel` проверяется перед каждой записью: «Остановить» должно прерывать
+    /// само чтение диска, а не ждать, пока дочитается вся таблица `$MFT`.
+    /// Отмена — не ошибка: возвращается частичный счётчик прочитанного.
+    pub fn read_records(
+        &self,
+        cancel: &AtomicBool,
+        sink: &mut dyn FnMut(&[u8]),
+    ) -> Result<u64, ScanError> {
         match &self.source {
             Source::Fixture {
                 file,
                 record_count,
-            } => read_fixture(file, *record_count, self.record_size, sink),
+            } => read_fixture(
+                file,
+                *record_count,
+                self.record_size,
+                cancel,
+                sink,
+            ),
             Source::Volume {
                 file,
                 extents,
@@ -201,6 +216,7 @@ impl VolumeReader {
                 *cluster_size,
                 *mft_size,
                 self.record_size,
+                cancel,
                 sink,
             ),
         }
@@ -226,12 +242,14 @@ impl VolumeReader {
 }
 
 /// Прочитать том последовательно по экстентам `$MFT` и нарезать на записи.
+#[allow(clippy::too_many_arguments)]
 fn read_volume(
     file: &RefCell<File>,
     extents: &[Extent],
     cluster_size: u64,
     mft_size: u64,
     record_size: usize,
+    cancel: &AtomicBool,
     sink: &mut dyn FnMut(&[u8]),
 ) -> Result<u64, ScanError> {
     let mut file = file.borrow_mut();
@@ -249,6 +267,10 @@ fn read_volume(
         }
         let mut cluster_index = 0u64;
         while cluster_index < extent.clusters && remaining > 0 {
+            // Отмена до системного вызова: не читаем диск, если скан остановлен.
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(records);
+            }
             let take_clusters = chunk_clusters.min(extent.clusters - cluster_index);
             let take_bytes = (take_clusters * cluster_size) as usize;
             let offset = extent.lcn * cluster_size + cluster_index * cluster_size;
@@ -265,10 +287,15 @@ fn read_volume(
             let total = carry + usable;
             let ready = total / record_size;
             for i in 0..ready {
+                // Отмена посреди порции: возвращаем частичный счётчик, а не
+                // ошибку «runlist не дочитан» — это штатная остановка.
+                if cancel.load(Ordering::Relaxed) {
+                    return Ok(records);
+                }
                 let start = i * record_size;
                 sink(&buf[start..start + record_size]);
+                records += 1;
             }
-            records += ready as u64;
 
             // Неполная запись остаётся в начале буфера до следующей порции.
             let consumed = ready * record_size;
@@ -296,6 +323,7 @@ fn read_fixture(
     file: &RefCell<File>,
     record_count: u64,
     record_size: usize,
+    cancel: &AtomicBool,
     sink: &mut dyn FnMut(&[u8]),
 ) -> Result<u64, ScanError> {
     const RECORDS_PER_CHUNK: u64 = 256;
@@ -304,16 +332,24 @@ fn read_fixture(
     let mut count = 0u64;
 
     while count < record_count {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         let take = RECORDS_PER_CHUNK.min(record_count - count) as usize;
         let bytes = take * record_size;
         let offset = count * record_size as u64;
         read_exact_at(&mut file, &mut buf[..bytes], offset)
             .map_err(|e| ScanError::Io(format!("чтение слепка MFT: {e}")))?;
         for i in 0..take {
+            // По одной записи, а не по порции: иначе отмена после N записей
+            // вернула бы целую порцию (256) и «мгновенность» была бы фикцией.
+            if cancel.load(Ordering::Relaxed) {
+                return Ok(count);
+            }
             let start = i * record_size;
             sink(&buf[start..start + record_size]);
+            count += 1;
         }
-        count += take as u64;
     }
 
     Ok(count)
@@ -560,6 +596,8 @@ mod tests {
         BOOT_BYTES_PER_SECTOR, BOOT_MFT_LCN, BOOT_RECORD_SIZE, BOOT_SECTORS_PER_CLUSTER,
         BOOT_TOTAL_SECTORS, BOOT_VOLUME_SERIAL, SAMPLE_RECORD_COUNT, fixture,
     };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn parse_boot_sector_reads_mft_params() {
@@ -616,8 +654,9 @@ mod tests {
         let mut records = 0u64;
         let mut wrong_size = 0u64;
         let mut first_signature_ok = false;
+        let cancel = AtomicBool::new(false);
         let count = reader
-            .read_records(&mut |record| {
+            .read_records(&cancel, &mut |record| {
                 if record.len() != 1024 {
                     wrong_size += 1;
                 }
@@ -632,6 +671,45 @@ mod tests {
         assert_eq!(records, SAMPLE_RECORD_COUNT);
         assert_eq!(wrong_size, 0);
         assert!(first_signature_ok, "первая запись должна начинаться с FILE");
+    }
+
+    #[test]
+    fn read_records_stops_promptly_on_cancel() {
+        // Отмена должна прерывать само чтение, а не только разбор: иначе
+        // «Остановить» ждёт, пока дочитается вся таблица $MFT (на C: это ~0.8 с
+        // чтения и до нескольких секунд разбора).
+        let reader = VolumeReader::from_fixture(&fixture("sample.mft"), 1024)
+            .expect("фикстура sample.mft должна открываться");
+        let cancel = AtomicBool::new(false);
+        let mut seen = 0u64;
+        let started = Instant::now();
+
+        let count = reader
+            .read_records(&cancel, &mut |_record| {
+                seen += 1;
+                if seen == 100 {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            })
+            .expect("отмена чтения — не ошибка");
+
+        let elapsed = started.elapsed();
+        assert_eq!(
+            count, seen,
+            "счётчик чтения обязан совпасть с числом записей в колбэке"
+        );
+        assert_eq!(
+            count, 100,
+            "чтение останавливается сразу после отмены, а не дочитывает таблицу"
+        );
+        assert!(
+            count < SAMPLE_RECORD_COUNT,
+            "из таблицы в {SAMPLE_RECORD_COUNT} записей прочитана только часть"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "отмена обязана прерывать чтение быстрее секунды: {elapsed:?}"
+        );
     }
 
     #[test]
@@ -673,6 +751,7 @@ mod tests {
             1024, // размер кластера
             8192, // реальный размер $MFT: больше, чем покрывают экстенты
             1024, // размер записи
+            &AtomicBool::new(false),
             &mut |_record| {},
         );
 

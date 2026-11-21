@@ -14,6 +14,7 @@
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use woozytree_lib::model::ScanError;
@@ -180,8 +181,11 @@ fn run() -> Result<(), String> {
     let mut write_error: Option<String> = None;
 
     let read_started = Instant::now();
+    // Утилите отмена не нужна: флаг есть только потому, что чтение тома умеет
+    // прерываться (в приложении это кнопка «Остановить»).
+    let cancel = AtomicBool::new(false);
     let read = reader
-        .read_records(&mut |record: &[u8]| {
+        .read_records(&cancel, &mut |record: &[u8]| {
             if written >= limit || write_error.is_some() {
                 return;
             }

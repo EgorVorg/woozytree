@@ -521,17 +521,17 @@ fn parse_file_name_value(record: &[u8], attr_off: usize, attr_len: usize) -> Opt
 
 /// Просканировать NTFS-том, читая записи `$MFT` через `reader`.
 ///
-/// Построение двухпроходное: первый проход разбирает все записи и складывает
-/// имена в память, второй — создаёт папки и файлы в индексе. Иначе нельзя:
-/// родитель по номеру записи может встретиться в `$MFT` и позже ребёнка, а
-/// `FolderId` выдаётся только при создании папки.
+/// Построение инкрементальное: имя попадает в индекс сразу, как только известен
+/// родитель, а родитель, который встретится позже, освобождает ждущих детей.
+/// Иначе нельзя: `FolderId` выдаётся только при создании папки, а номер
+/// записи-родителя может встретиться в `$MFT` и позже ребёнка.
 ///
 /// Тонкая обёртка над [`scan_ntfs_reader_diag`]: отдаёт только итоги.
 pub fn scan_ntfs_reader(
     reader: &VolumeReader,
     index: &mut ScanIndex,
     cancel: &AtomicBool,
-    progress: &mut dyn FnMut(&ScanProgress),
+    progress: &mut dyn FnMut(&ScanProgress, &ScanIndex),
 ) -> Result<ScanTotals, ScanError> {
     scan_ntfs_reader_diag(reader, index, cancel, progress).map(|(totals, _)| totals)
 }
@@ -546,7 +546,7 @@ pub fn scan_ntfs_reader_diag(
     reader: &VolumeReader,
     index: &mut ScanIndex,
     cancel: &AtomicBool,
-    progress: &mut dyn FnMut(&ScanProgress),
+    progress: &mut dyn FnMut(&ScanProgress, &ScanIndex),
 ) -> Result<(ScanTotals, ScanDiag), ScanError> {
     let started = Instant::now();
     // Шаг fixup у живого тома равен размеру сектора из загрузочного сектора
@@ -560,8 +560,9 @@ pub fn scan_ntfs_reader_diag(
         .boot_sector()
         .map_or(0, |boot| boot.volume_serial as u32);
 
-    // Первый проход: разобрать записи. Имена всех записей держим в памяти —
-    // иначе не разрешить родителей, которые лежат в $MFT позже детей.
+    // Имена держим в памяти: родитель может лежать в $MFT позже ребёнка, а
+    // отложенные файлы доукомплектовываются в конце. В индекс имена попадают
+    // сразу, по мере чтения, — дерево и размеры растут на глазах.
     let mut entries: Vec<MftFileInfo> = Vec::with_capacity(64 * 1024);
     // Размеры из extension-записей: номер базовой записи -> ($DATA allocated, real).
     let mut extension_data: HashMap<u64, (u64, u64)> = HashMap::new();
@@ -573,7 +574,9 @@ pub fn scan_ntfs_reader_diag(
     let mut diag = ScanDiag::default();
     let mut parsed_on_disk: u64 = 0;
 
-    reader.read_records(&mut |record| {
+    let mut builder = TreeBuilder::new(index);
+
+    reader.read_records(cancel, &mut |record| {
         // Отмена проверяется на каждой записи: порции чтения $MFT крупнее, а
         // остановить разбор между записями дешевле, чем после всей таблицы.
         if cancel.load(Ordering::Relaxed) {
@@ -589,14 +592,31 @@ pub fn scan_ntfs_reader_diag(
                     // $ATTRIBUTE_LIST не разбирается — запись неполная.
                     diag.partial += 1;
                 }
-                for mut info in infos {
-                    info.file_key.volume_serial = volume_serial;
-                    // Номер записи — её позиция в $MFT: это надёжнее поля 0x2C,
-                    // которого может не быть в старых версиях NTFS.
-                    info.file_key.file_index = record_index;
-                    parsed_on_disk += info.size_on_disk;
-                    entries.push(info);
-                }
+                // Именованные потоки этой записи входят в занятое место файла.
+                // Сегменты одного потока повторяют размер, поэтому по имени
+                // берём максимум и только потом складываем.
+                let stream_extra = if streams.is_empty() {
+                    0
+                } else {
+                    let mut by_name: HashMap<&str, u64> = HashMap::new();
+                    for (name, allocated) in &streams {
+                        let slot = by_name.entry(name.as_str()).or_insert(0);
+                        if *allocated > *slot {
+                            *slot = *allocated;
+                        }
+                    }
+                    by_name.values().sum()
+                };
+                builder.add_names(
+                    &mut entries,
+                    infos,
+                    record_index,
+                    volume_serial,
+                    // $ATTRIBUTE_LIST нет — размеры записи окончательны.
+                    !partial,
+                    stream_extra,
+                    &mut parsed_on_disk,
+                );
                 collect_streams(&mut stream_bytes, record_index, streams);
             }
             RecordParse::Extension {
@@ -621,23 +641,32 @@ pub fn scan_ntfs_reader_diag(
 
         record_index += 1;
         if record_index % PROGRESS_EVERY_RECORDS == 0 {
-            // Пока идёт чтение, точных итогов нет: размер показан без учёта
-            // дедупликации жёстких ссылок и данных из extension-записей,
-            // папки ещё не созданы.
-            progress(&ScanProgress {
-                files: entries.len() as u64,
-                folders: 0,
-                size_on_disk: parsed_on_disk,
-                elapsed_ms: started.elapsed().as_millis() as u64,
-            });
+            // Дерево уже содержит всё прочитанное: счётчик папок и размер живые.
+            let live_folders =
+                u64::from(builder.index.folder_totals(builder.index.root()).folder_count);
+            progress(
+                &ScanProgress {
+                    files: entries.len() as u64,
+                    folders: live_folders,
+                    size_on_disk: parsed_on_disk,
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                },
+                &*builder.index,
+            );
         }
     })?;
 
+    // Дерево закрывается: имена, чей родитель так и не встретился, уходят в
+    // корень, а отложенные файлы получают окончательные размеры.
+    builder.finish(&mut entries, &mut diag);
+
     // Файлам, чей $DATA вынесен в extension-запись, подставляем размеры оттуда:
-    // иначе каждый такой файл выглядел бы пустым (на C: это ~136 ГиБ).
+    // иначе каждый такой файл выглядел бы пустым (на C: это ~136 ГиБ). Это
+    // касается только отложенных записей: у полной записи размеры уже точные.
     if !extension_data.is_empty() {
-        for entry in &mut entries {
-            if entry.is_directory || entry.size_on_disk != 0 || entry.size_logical != 0 {
+        for &position in &builder.deferred_files {
+            let entry = &mut entries[position];
+            if entry.size_on_disk != 0 || entry.size_logical != 0 {
                 continue;
             }
             if let Some(&(allocated, real)) = extension_data.get(&entry.file_key.file_index) {
@@ -655,7 +684,8 @@ pub fn scan_ntfs_reader_diag(
         for ((file_index, _name), allocated) in &stream_bytes {
             *streams_total.entry(*file_index).or_insert(0) += *allocated;
         }
-        for entry in &mut entries {
+        for &position in &builder.deferred_files {
+            let entry = &mut entries[position];
             if entry.is_directory {
                 continue;
             }
@@ -665,104 +695,43 @@ pub fn scan_ntfs_reader_diag(
         }
     }
 
-    // Второй проход: дерево. Корень тома — запись №5, отдельной папки ему не нужно.
-    let mut folders: u64 = 0;
-    let mut files: u64 = 0;
-    let mut size_on_disk: u64 = 0;
-    let mut size_logical: u64 = 0;
-    let mut dirs: HashMap<u64, FolderId> = HashMap::new();
-    dirs.insert(ROOT_RECORD, index.root());
-
-    let mut pending: Vec<usize> = entries
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| entry.is_directory && entry.file_key.file_index != ROOT_RECORD)
-        .map(|(position, _)| position)
-        .collect();
-
-    // Папки создаём волнами: за проход разрешается тот, чей родитель уже известен.
-    // Пока волна приносит новые папки — повторяем; оставшиеся неразрешимы
-    // (родитель вне таблицы или цикл ссылок).
-    loop {
-        let unresolved_before = pending.len();
-        pending.retain(|&position| {
-            let entry = &entries[position];
-            let Some(parent) = dirs.get(&entry.parent_ref).copied() else {
-                return true;
-            };
-            let (id, created) = create_folder(index, parent, &entry.name);
-            if created {
-                folders += 1;
-            }
-            // У папки с несколькими именами (DOS-алиас) дети крепятся к первому.
-            dirs.entry(entry.file_key.file_index).or_insert(id);
-            false
-        });
-        if pending.len() == unresolved_before {
-            break;
-        }
-    }
-
-    for &position in &pending {
-        let entry = &entries[position];
-        let (id, created) = create_folder(index, index.root(), &entry.name);
-        if created {
-            folders += 1;
-        }
-        dirs.entry(entry.file_key.file_index).or_insert(id);
-        // Родитель папки так и не нашёлся — она положена в корень.
-        diag.unresolved_folder += 1;
-    }
-
-    // Файлы: каждое имя — отдельная запись индекса, но байты жёсткой ссылки
-    // засчитываются только один раз (это делает index.add_file по file_key).
-    for entry in entries {
-        if entry.is_directory {
-            continue;
-        }
-        let parent = match dirs.get(&entry.parent_ref).copied() {
+    // Отложенные файлы вставляем теперь, когда размеры окончательные, а всё
+    // дерево папок построено (включая узлы неразрешённых папок в корне).
+    let deferred = std::mem::take(&mut builder.deferred_files);
+    for position in deferred {
+        let parent_ref = entries[position].parent_ref;
+        let parent = match builder.dirs.get(&parent_ref).copied() {
             Some(parent) => parent,
             None => {
                 // Родителя нет в таблице — файл не теряем, кладём в корень.
                 diag.orphan += 1;
-                index.root()
+                builder.index.root()
             }
         };
-        let meta = FileMeta {
-            name: entry.name,
-            size_on_disk: entry.size_on_disk,
-            size_logical: entry.size_logical,
-            modified: entry.modified,
-            file_key: entry.file_key,
-        };
-        if matches!(index.add_file(parent, meta), AddOutcome::Counted) {
-            size_on_disk += entry.size_on_disk;
-            size_logical += entry.size_logical;
-        }
-        files += 1;
+        builder.insert_file(&mut entries, position, parent);
     }
 
     let elapsed_ms = started.elapsed().as_millis() as u64;
-    progress(&ScanProgress {
-        files,
-        folders,
-        size_on_disk,
+    let totals = ScanTotals {
+        files: builder.files,
+        folders: builder.folders,
+        size_on_disk: builder.size_on_disk,
+        size_logical: builder.size_logical,
+        skipped: u32::try_from(diag.total()).unwrap_or(u32::MAX),
+        cancelled: cancel.load(Ordering::Relaxed),
         elapsed_ms,
-    });
-
-    let skipped = u32::try_from(diag.total()).unwrap_or(u32::MAX);
-    Ok((
-        ScanTotals {
-            files,
-            folders,
-            size_on_disk,
-            size_logical,
-            skipped,
-            cancelled: cancel.load(Ordering::Relaxed),
+    };
+    progress(
+        &ScanProgress {
+            files: totals.files,
+            folders: totals.folders,
+            size_on_disk: totals.size_on_disk,
             elapsed_ms,
         },
-        diag,
-    ))
+        &*builder.index,
+    );
+
+    Ok((totals, diag))
 }
 
 /// Просканировать NTFS-том: открыть его и делегировать в [`scan_ntfs_reader`].
@@ -770,10 +739,221 @@ pub fn scan_ntfs(
     drive_letter: &str,
     index: &mut ScanIndex,
     cancel: &AtomicBool,
-    progress: &mut dyn FnMut(&ScanProgress),
+    progress: &mut dyn FnMut(&ScanProgress, &ScanIndex),
 ) -> Result<ScanTotals, ScanError> {
     let reader = VolumeReader::open(drive_letter)?;
     scan_ntfs_reader(&reader, index, cancel, progress)
+}
+
+/// Построитель дерева по мере чтения `$MFT`.
+///
+/// Имя вставляется в индекс сразу, как только известен его родитель. Дети
+/// родителя, который встретится позже, ждут в `waiting` и освобождаются, когда
+/// папка появилась. Каждое имя обрабатывается один раз, поэтому стоимость
+/// линейна по числу записей (в отличие от повторных проходов по всему списку
+/// ожидающих).
+struct TreeBuilder<'a> {
+    index: &'a mut ScanIndex,
+    /// Номер записи папки → узел индекса (корень тома — запись №5).
+    dirs: HashMap<u64, FolderId>,
+    /// Номер записи родителя → позиции имён, ждущих её появления.
+    waiting: HashMap<u64, Vec<usize>>,
+    /// Позиции файлов, чьи размеры уточнятся позже (extension-записи, ADS).
+    deferred_files: Vec<usize>,
+    folders: u64,
+    files: u64,
+    size_on_disk: u64,
+    size_logical: u64,
+}
+
+impl<'a> TreeBuilder<'a> {
+    fn new(index: &'a mut ScanIndex) -> TreeBuilder<'a> {
+        let root = index.root();
+        let mut dirs = HashMap::new();
+        dirs.insert(ROOT_RECORD, root);
+        TreeBuilder {
+            index,
+            dirs,
+            waiting: HashMap::new(),
+            deferred_files: Vec::new(),
+            folders: 0,
+            files: 0,
+            size_on_disk: 0,
+            size_logical: 0,
+        }
+    }
+
+    /// Добавить имена одной записи `$MFT` и сразу вставить те, чьи размеры готовы.
+    ///
+    /// `sizes_final` — запись разобрана полностью: её `$DATA` и именованные
+    /// потоки лежат в ней самой, extension-записей у неё быть не может. Если
+    /// запись неполная (`$ATTRIBUTE_LIST`), файлы ждут конца чтения: размеры
+    /// могут прийти из extension-записи позже.
+    fn add_names(
+        &mut self,
+        entries: &mut Vec<MftFileInfo>,
+        infos: Vec<MftFileInfo>,
+        record_index: u64,
+        volume_serial: u32,
+        sizes_final: bool,
+        stream_extra: u64,
+        parsed_on_disk: &mut u64,
+    ) {
+        for mut info in infos {
+            info.file_key.volume_serial = volume_serial;
+            // Номер записи — её позиция в $MFT: это надёжнее поля 0x2C,
+            // которого может не быть в старых версиях NTFS.
+            info.file_key.file_index = record_index;
+            *parsed_on_disk += info.size_on_disk;
+
+            let is_directory = info.is_directory;
+            if !is_directory && sizes_final {
+                // Место под именованными потоками этой записи известно сразу.
+                info.size_on_disk += stream_extra;
+            }
+
+            let position = entries.len();
+            entries.push(info);
+            if is_directory {
+                // Запись корня тома уже представлена узлом 0.
+                if record_index != ROOT_RECORD {
+                    self.attach(entries, position);
+                }
+            } else if sizes_final {
+                self.attach(entries, position);
+            } else {
+                // Размеры могут уточниться extension-записью или ADS.
+                self.deferred_files.push(position);
+            }
+        }
+    }
+
+    /// Вставить имя в индекс или отложить до появления родителя.
+    fn attach(&mut self, entries: &mut [MftFileInfo], position: usize) {
+        let parent_ref = entries[position].parent_ref;
+        match self.dirs.get(&parent_ref).copied() {
+            Some(parent) => self.insert(entries, position, parent),
+            None => self
+                .waiting
+                .entry(parent_ref)
+                .or_default()
+                .push(position),
+        }
+    }
+
+    /// Вставить папку или файл под известного родителя.
+    ///
+    /// У папки сразу освобождаются дети, ждавшие её номер записи: так цепочки
+    /// «внук → сын → родитель», пришедшие в обратном порядке, разрешаются без
+    /// повторных проходов по всему списку ожидающих.
+    fn insert(&mut self, entries: &mut [MftFileInfo], position: usize, parent: FolderId) {
+        if entries[position].is_directory {
+            let entry = &mut entries[position];
+            let (id, created) = create_folder(self.index, parent, &entry.name);
+            if created {
+                self.folders += 1;
+            }
+            let folder_index = entry.file_key.file_index;
+            // У папки с несколькими именами дети крепятся к первому узлу.
+            self.dirs.entry(folder_index).or_insert(id);
+            self.release(entries, folder_index);
+        } else {
+            self.insert_file(entries, position, parent);
+        }
+    }
+
+    /// Вставить файл: каждое имя — отдельная запись индекса, но байты жёсткой
+    /// ссылки засчитываются только один раз (это делает `index.add_file`).
+    fn insert_file(&mut self, entries: &mut [MftFileInfo], position: usize, parent: FolderId) {
+        let entry = &mut entries[position];
+        let size_on_disk = entry.size_on_disk;
+        let size_logical = entry.size_logical;
+        let meta = FileMeta {
+            name: std::mem::take(&mut entry.name),
+            size_on_disk,
+            size_logical,
+            modified: entry.modified,
+            file_key: entry.file_key.clone(),
+        };
+        if matches!(self.index.add_file(parent, meta), AddOutcome::Counted) {
+            self.size_on_disk += size_on_disk;
+            self.size_logical += size_logical;
+        }
+        self.files += 1;
+    }
+
+    /// Создать детей, ждавших появления папки `folder_index` (и их детей).
+    fn release(&mut self, entries: &mut [MftFileInfo], folder_index: u64) {
+        // Очередь вместо рекурсии: глубокая цепочка папок не переполнит стек.
+        let mut ready = vec![folder_index];
+        while let Some(current) = ready.pop() {
+            let Some(children) = self.waiting.remove(&current) else {
+                continue;
+            };
+            let Some(&parent) = self.dirs.get(&current) else {
+                continue;
+            };
+            for position in children {
+                if entries[position].is_directory {
+                    let entry = &mut entries[position];
+                    let (id, created) = create_folder(self.index, parent, &entry.name);
+                    if created {
+                        self.folders += 1;
+                    }
+                    let child_index = entry.file_key.file_index;
+                    self.dirs.entry(child_index).or_insert(id);
+                    ready.push(child_index);
+                } else {
+                    self.insert_file(entries, position, parent);
+                }
+            }
+        }
+    }
+
+    /// Закрыть дерево: неразрешённые имена — в корень, порядок — порядок чтения.
+    ///
+    /// Папка, чей родитель так и не встретился, кладётся в корень (как в прежнем
+    /// двухпроходном пути), и её файлы-дети попадают именно в неё, а не в корень.
+    fn finish(&mut self, entries: &mut [MftFileInfo], diag: &mut ScanDiag) {
+        let mut unresolved: Vec<usize> = self
+            .waiting
+            .drain()
+            .flat_map(|(_, positions)| positions)
+            .collect();
+        unresolved.sort_unstable();
+
+        // Сначала папки: их родитель не нашёлся — узел в корне.
+        for &position in &unresolved {
+            if !entries[position].is_directory {
+                continue;
+            }
+            let entry = &mut entries[position];
+            let root = self.index.root();
+            let (id, created) = create_folder(self.index, root, &entry.name);
+            if created {
+                self.folders += 1;
+            }
+            self.dirs.entry(entry.file_key.file_index).or_insert(id);
+            diag.unresolved_folder += 1;
+        }
+
+        // Затем файлы, ждавшие родителя: он мог появиться среди папок выше.
+        for &position in &unresolved {
+            if entries[position].is_directory {
+                continue;
+            }
+            let parent_ref = entries[position].parent_ref;
+            let parent = match self.dirs.get(&parent_ref).copied() {
+                Some(parent) => parent,
+                None => {
+                    // Родителя нет в таблице — файл не теряем, кладём в корень.
+                    diag.orphan += 1;
+                    self.index.root()
+                }
+            };
+            self.insert_file(entries, position, parent);
+        }
+    }
 }
 
 /// Создать папку в индексе и сказать, появился ли новый узел.
@@ -997,8 +1177,9 @@ mod tests {
             .expect("фикстура corrupt.mft должна открываться");
 
         let mut last: Vec<u8> = Vec::new();
+        let cancel = AtomicBool::new(false);
         let count = reader
-            .read_records(&mut |record| last = record.to_vec())
+            .read_records(&cancel, &mut |record| last = record.to_vec())
             .expect("чтение фикстуры не должно падать");
         assert_eq!(count, SAMPLE_RECORD_COUNT);
 
@@ -1012,7 +1193,7 @@ mod tests {
         let mut parsed = 0usize;
         VolumeReader::from_fixture(&fixture("corrupt.mft"), 1024)
             .expect("фикстура corrupt.mft должна открываться")
-            .read_records(&mut |record| {
+            .read_records(&cancel, &mut |record| {
                 records += 1;
                 if records < count {
                     parsed += parse_record(record).len();
@@ -1031,7 +1212,7 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let mut reports: Vec<ScanProgress> = Vec::new();
 
-        let totals = scan_ntfs_reader(&reader, &mut index, &cancel, &mut |progress| {
+        let totals = scan_ntfs_reader(&reader, &mut index, &cancel, &mut |progress, _index| {
             reports.push(progress.clone())
         })
         .expect("сканирование фикстуры не должно падать");
@@ -1119,7 +1300,7 @@ mod tests {
             .expect("слепок с жёсткими ссылками должен открываться");
         let mut index = ScanIndex::new("C:");
         let cancel = AtomicBool::new(false);
-        let totals = scan_ntfs_reader(&reader, &mut index, &cancel, &mut |_| {})
+        let totals = scan_ntfs_reader(&reader, &mut index, &cancel, &mut |_, _| {})
             .expect("сканирование слепка не должно падать");
 
         let children = index.child_folders(index.root());
@@ -1168,7 +1349,7 @@ mod tests {
             .expect("слепок с именованным потоком должен открываться");
         let mut index = ScanIndex::new("C:");
         let cancel = AtomicBool::new(false);
-        let totals = scan_ntfs_reader(&reader, &mut index, &cancel, &mut |_| {})
+        let totals = scan_ntfs_reader(&reader, &mut index, &cancel, &mut |_, _| {})
             .expect("сканирование слепка не должно падать");
 
         let root_totals = index.folder_totals(index.root());
@@ -1209,7 +1390,7 @@ mod tests {
             .expect("слепок с сиротой должен открываться");
         let mut index = ScanIndex::new("C:");
         let cancel = AtomicBool::new(false);
-        let totals = scan_ntfs_reader(&reader, &mut index, &cancel, &mut |_| {})
+        let totals = scan_ntfs_reader(&reader, &mut index, &cancel, &mut |_, _| {})
             .expect("сканирование слепка не должно падать");
 
         assert_eq!(totals.files, 1);
@@ -1269,7 +1450,7 @@ mod tests {
             .expect("слепок с пропусками должен открываться");
         let mut index = ScanIndex::new("C:");
         let cancel = AtomicBool::new(false);
-        let (totals, diag) = scan_ntfs_reader_diag(&reader, &mut index, &cancel, &mut |_| {})
+        let (totals, diag) = scan_ntfs_reader_diag(&reader, &mut index, &cancel, &mut |_, _| {})
             .expect("сканирование слепка не должно падать");
 
         assert_eq!(diag.broken, 1, "битая запись");
@@ -1324,7 +1505,7 @@ mod tests {
             .expect("слепок с extension-записью должен открываться");
         let mut index = ScanIndex::new("C:");
         let cancel = AtomicBool::new(false);
-        let totals = scan_ntfs_reader(&reader, &mut index, &cancel, &mut |_| {})
+        let totals = scan_ntfs_reader(&reader, &mut index, &cancel, &mut |_, _| {})
             .expect("сканирование слепка не должно падать");
 
         let root_totals = index.folder_totals(index.root());
@@ -1371,7 +1552,7 @@ mod tests {
             .expect("слепок должен открываться");
         let mut index = ScanIndex::new("C:");
         let cancel = AtomicBool::new(false);
-        let totals = scan_ntfs_reader(&reader, &mut index, &cancel, &mut |_| {})
+        let totals = scan_ntfs_reader(&reader, &mut index, &cancel, &mut |_, _| {})
             .expect("сканирование слепка не должно падать");
 
         assert_eq!(totals.files, 1, "видно только имя базовой записи");
@@ -1387,7 +1568,7 @@ mod tests {
             .expect("фикстура sample.mft должна открываться");
         let mut index = ScanIndex::new("C:");
         let cancel = AtomicBool::new(false);
-        let totals = scan_ntfs_reader(&reader, &mut index, &cancel, &mut |_| {
+        let totals = scan_ntfs_reader(&reader, &mut index, &cancel, &mut |_, _| {
             cancel.store(true, Ordering::Relaxed);
         })
         .expect("отмена — не ошибка");
@@ -1398,5 +1579,244 @@ mod tests {
             totals.files < SAMPLE_FILE_COUNT,
             "после отмены должно быть обработано меньше имён: {totals:?}"
         );
+    }
+
+    #[test]
+    fn scan_ntfs_reader_is_incremental() {
+        // Дерево обязано расти по мере чтения: в промежуточном прогрессе уже
+        // есть и папки, и файлы с размером, а не нули до самого конца.
+        let reader = VolumeReader::from_fixture(&fixture("sample.mft"), 1024)
+            .expect("фикстура sample.mft должна открываться");
+        let mut index = ScanIndex::new("C:");
+        let cancel = AtomicBool::new(false);
+        let mut reports: Vec<ScanProgress> = Vec::new();
+        // Срез индекса на момент каждого отчёта: папки и файлы в нём.
+        let mut live_folders: Vec<u32> = Vec::new();
+        let mut live_files: Vec<u32> = Vec::new();
+
+        let totals = scan_ntfs_reader(&reader, &mut index, &cancel, &mut |progress, current| {
+            reports.push(progress.clone());
+            let root_totals = current.folder_totals(current.root());
+            live_folders.push(root_totals.folder_count);
+            live_files.push(root_totals.file_count);
+        })
+        .expect("сканирование фикстуры не должно падать");
+
+        // Первый отчёт приходит на 1000-й записи, когда папки уже в индексе,
+        // последний — итоговый.
+        assert!(
+            reports.len() >= 2,
+            "нужен промежуточный и итоговый отчёт: {reports:?}"
+        );
+        let intermediate = reports.len() - 1;
+        assert!(
+            live_folders[..intermediate].iter().any(|&count| count > 0),
+            "до завершения счётчик папок должен быть живым: {live_folders:?}"
+        );
+        assert!(
+            live_files[..intermediate].iter().any(|&count| count > 0),
+            "до завершения в индексе должны быть файлы: {live_files:?}"
+        );
+        assert!(
+            reports[..intermediate]
+                .iter()
+                .any(|progress| progress.folders > 0 && progress.size_on_disk > 0),
+            "живой прогресс обязан нести и папки, и занятое место: {reports:?}"
+        );
+        assert!(
+            reports.last().is_some_and(|progress| progress.folders > 0),
+            "итоговый отчёт обязан знать число папок"
+        );
+
+        assert_eq!(totals.files, SAMPLE_FILE_COUNT, "файлы фикстуры");
+        assert_eq!(totals.folders, SAMPLE_FOLDER_COUNT, "папки фикстуры");
+        assert_eq!(totals.size_on_disk, SAMPLE_SIZE_ON_DISK, "занятое место");
+        assert_eq!(totals.size_logical, SAMPLE_SIZE_LOGICAL, "логический размер");
+        assert_eq!(totals.skipped, SAMPLE_SKIPPED, "пропуски фикстуры");
+    }
+
+    #[test]
+    fn incremental_equals_batch_build() {
+        // Родитель «родитель» лежит в $MFT позже ребёнка и попадает в другой
+        // батч (запись 1500): инкрементальная вставка обязана доустановить
+        // таких детей волной, а итог — совпасть с прежним двухпроходным путём.
+        const RECORDS: usize = 2000;
+        let mut records: Vec<Vec<u8>> = (0..RECORDS).map(|_| vec![0u8; 1024]).collect();
+        records[5] = folder_record(5, ".", ROOT_RECORD);
+        records[6] = folder_record(6, "дочерняя", 1500);
+        records[7] = folder_record(7, "внучка", 6);
+        records[8] = make_record(
+            RecordSpec::new(8, RECORD_FLAG_IN_USE)
+                .name("в-дочерней.bin", 6)
+                .data(DataSpec::Resident(11)),
+        );
+        records[9] = make_record(
+            RecordSpec::new(9, RECORD_FLAG_IN_USE)
+                .name("a.bin", ROOT_RECORD)
+                .name("b.bin", ROOT_RECORD)
+                .data(DataSpec::NonResident {
+                    allocated: 4096,
+                    real: 100,
+                }),
+        );
+        records[10] = make_record(
+            RecordSpec::new(10, RECORD_FLAG_IN_USE)
+                .name("сирота.bin", 4242)
+                .data(DataSpec::Resident(7)),
+        );
+        // 11, 12 — неполные записи ($ATTRIBUTE_LIST): их размеры могут прийти
+        // из extension-записей позже, поэтому вставляются в конце. Родитель
+        // одного тоже поздний, у другого отсутствует вовсе.
+        records[11] = make_record(
+            RecordSpec::new(11, RECORD_FLAG_IN_USE)
+                .name("неполный-в-поздней.bin", 1500)
+                .data(DataSpec::Resident(5))
+                .with_attribute_list(),
+        );
+        records[12] = make_record(
+            RecordSpec::new(12, RECORD_FLAG_IN_USE)
+                .name("неполный-сирота.bin", 4242)
+                .with_attribute_list(),
+        );
+        records[1500] = folder_record(1500, "родитель", ROOT_RECORD);
+
+        let dir = test_dir();
+        let fixture_path = dir.path().join("incremental.mft");
+        let bytes: Vec<u8> = records.iter().flatten().copied().collect();
+        std::fs::write(&fixture_path, &bytes).expect("не удалось записать слепок");
+
+        let reader =
+            VolumeReader::from_fixture(&fixture_path, 1024).expect("слепок должен открываться");
+        let mut incremental = ScanIndex::new("C:");
+        let cancel = AtomicBool::new(false);
+        let totals = scan_ntfs_reader(&reader, &mut incremental, &cancel, &mut |_, _| {})
+            .expect("инкрементальное сканирование не должно падать");
+
+        let batch = build_two_pass(&records);
+        assert_eq!(
+            folder_snapshot(&incremental),
+            folder_snapshot(&batch),
+            "инкрементальный индекс обязан совпасть с двухпроходным по тому же набору записей"
+        );
+        assert_eq!(totals.files, 6, "файлов-имён в слепке");
+        assert_eq!(totals.folders, 3, "папок в слепке");
+        assert_eq!(
+            totals.skipped, 4,
+            "две неполные записи и два имени-сироты — четыре события пропуска"
+        );
+
+        // «Перевязка» действительно случилась: дочерняя папка лежит под
+        // родителем, запись которого пришла позже и в другом батче.
+        let snapshot = folder_snapshot(&incremental);
+        assert!(
+            snapshot.contains_key("/родитель/дочерняя/внучка"),
+            "поздний родитель должен принять детей, а не отправить их в корень: {:?}",
+            snapshot.keys().collect::<Vec<_>>()
+        );
+        // Отложенный файл неполной записи тоже нашёл позднего родителя:
+        // в «родителе» он сам и файл вложенной папки, а не только вложенный.
+        assert_eq!(
+            snapshot["/родитель"].2, 2,
+            "в папке «родитель» должен быть отложенный файл: {snapshot:?}"
+        );
+    }
+
+    /// Слепок-эталон: прежний двухпроходный путь (собрать имена, затем дерево).
+    ///
+    /// Нужен только тесту эквивалентности: он показывает, что инкрементальная
+    /// вставка батчами даёт то же состояние индекса, что и старый алгоритм.
+    fn build_two_pass(records: &[Vec<u8>]) -> ScanIndex {
+        let mut entries: Vec<MftFileInfo> = Vec::new();
+        for (position, record) in records.iter().enumerate() {
+            for mut info in parse_record(record) {
+                // Номер записи — её позиция в $MFT: так же поступает сканер.
+                info.file_key.file_index = position as u64;
+                info.file_key.volume_serial = 0;
+                entries.push(info);
+            }
+        }
+
+        let mut index = ScanIndex::new("C:");
+        let mut dirs: HashMap<u64, FolderId> = HashMap::new();
+        dirs.insert(ROOT_RECORD, index.root());
+
+        let mut pending: Vec<usize> = entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.is_directory && entry.file_key.file_index != ROOT_RECORD)
+            .map(|(position, _)| position)
+            .collect();
+        loop {
+            let unresolved = pending.len();
+            pending.retain(|&position| {
+                let entry = &entries[position];
+                let Some(&parent) = dirs.get(&entry.parent_ref) else {
+                    return true;
+                };
+                let id = index.folder(parent, &entry.name);
+                dirs.entry(entry.file_key.file_index).or_insert(id);
+                false
+            });
+            if pending.len() == unresolved {
+                break;
+            }
+        }
+        for &position in &pending {
+            let entry = &entries[position];
+            let id = index.folder(index.root(), &entry.name);
+            dirs.entry(entry.file_key.file_index).or_insert(id);
+        }
+
+        for entry in entries {
+            if entry.is_directory {
+                continue;
+            }
+            let parent = dirs
+                .get(&entry.parent_ref)
+                .copied()
+                .unwrap_or_else(|| index.root());
+            index.add_file(
+                parent,
+                FileMeta {
+                    name: entry.name,
+                    size_on_disk: entry.size_on_disk,
+                    size_logical: entry.size_logical,
+                    modified: entry.modified,
+                    file_key: entry.file_key,
+                },
+            );
+        }
+        index
+    }
+
+    /// Снимок дерева индекса: путь папки → её итоги. Путь корня — пустая строка.
+    ///
+    /// Идентификаторы папок в инкрементальном и двухпроходном построении могут
+    /// различаться (порядок создания другой), поэтому сравнивать надо по путям.
+    fn folder_snapshot(index: &ScanIndex) -> std::collections::BTreeMap<String, (u64, u64, u32, u32)> {
+        let mut snapshot = std::collections::BTreeMap::new();
+        let mut stack = vec![(index.root(), String::new())];
+        while let Some((id, path)) = stack.pop() {
+            let totals = index.folder_totals(id);
+            snapshot.insert(
+                path.clone(),
+                (
+                    totals.size_on_disk,
+                    totals.size_logical,
+                    totals.file_count,
+                    totals.folder_count,
+                ),
+            );
+            for child in index.child_folders(id) {
+                stack.push((child.id, format!("{path}/{}", child.name)));
+            }
+        }
+        snapshot
+    }
+
+    fn folder_record(number: u32, name: &str, parent: u64) -> Vec<u8> {
+        make_record(
+            RecordSpec::new(number, RECORD_FLAG_IN_USE | RECORD_FLAG_DIRECTORY).name(name, parent),
+        )
     }
 }

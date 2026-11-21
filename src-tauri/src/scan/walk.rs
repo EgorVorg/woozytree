@@ -60,7 +60,7 @@ pub fn walk(
     root: &Path,
     index: &mut ScanIndex,
     cancel: &AtomicBool,
-    progress: &mut dyn FnMut(&ScanProgress),
+    progress: &mut dyn FnMut(&ScanProgress, &ScanIndex),
 ) -> Result<WalkStats, ScanError> {
     let started = Instant::now();
     let mut stats = WalkStats::default();
@@ -68,7 +68,6 @@ pub fn walk(
     // Счётчики для прогресса: учитываются все встреченные файлы, включая повторы
     // жёстких ссылок, — прогресс показывает объём работы, а не бухгалтерию размеров.
     let mut files = 0u64;
-    let mut folders = 0u64;
     let mut bytes = 0u64;
     let mut next_report_at = PROGRESS_EVERY_FILES;
 
@@ -136,7 +135,6 @@ pub fn walk(
             let name = entry.file_name().to_string_lossy().into_owned();
 
             if is_directory {
-                folders += 1;
                 let child_id = index.folder(dir_id, &name);
                 stack.push((path, child_id, false));
                 continue;
@@ -176,7 +174,7 @@ pub fn walk(
             bytes += size_on_disk;
 
             if files >= next_report_at {
-                report(progress, files, folders, bytes, started);
+                report(progress, index, files, bytes, started);
                 next_report_at += PROGRESS_EVERY_FILES;
                 if cancel.load(Ordering::Relaxed) {
                     break 'walk;
@@ -186,23 +184,29 @@ pub fn walk(
     }
 
     // Итоговый отчёт нужен и после отмены: UI должен увидеть, сколько успели.
-    report(progress, files, folders, bytes, started);
+    report(progress, index, files, bytes, started);
     Ok(stats)
 }
 
 fn report(
-    progress: &mut dyn FnMut(&ScanProgress),
+    progress: &mut dyn FnMut(&ScanProgress, &ScanIndex),
+    index: &ScanIndex,
     files: u64,
-    folders: u64,
     size_on_disk: u64,
     started: Instant,
 ) {
-    progress(&ScanProgress {
-        files,
-        folders,
-        size_on_disk,
-        elapsed_ms: started.elapsed().as_millis() as u64,
-    });
+    // Папки берём из индекса, а не из локального счётчика: обход создаёт узлы
+    // дерева сразу, поэтому счётчик живой и совпадает с итогами сканирования.
+    let folders = u64::from(index.folder_totals(index.root()).folder_count);
+    progress(
+        &ScanProgress {
+            files,
+            folders,
+            size_on_disk,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        },
+        index,
+    );
 }
 
 /// Уникальный ключ файла (номер тома + file index) и занятый на диске размер.
@@ -274,7 +278,7 @@ mod tests {
         let mut index = ScanIndex::new("root");
         let cancel = AtomicBool::new(false);
         let mut reports = Vec::new();
-        let stats = walk(root, &mut index, &cancel, &mut |progress| {
+        let stats = walk(root, &mut index, &cancel, &mut |progress, _index| {
             reports.push(progress.clone())
         })
         .expect("walk должен завершиться без ошибки");
@@ -377,7 +381,7 @@ mod tests {
         // walk обязан вернуть Ok, а недоступное — учесть в skipped.
         let mut plain_index = ScanIndex::new("root");
         let cancel = AtomicBool::new(false);
-        let plain_stats = walk(root, &mut plain_index, &cancel, &mut |_| {})
+        let plain_stats = walk(root, &mut plain_index, &cancel, &mut |_, _| {})
             .expect("walk без префикса обязан вернуть Ok даже при недоступных путях");
         let plain_totals = plain_index.folder_totals(plain_index.root());
         if plain_totals.file_count != 2 || plain_totals.size_logical != 7 + 11 {
@@ -626,7 +630,7 @@ mod tests {
 
         let mut index = ScanIndex::new("root");
         let cancel = AtomicBool::new(false);
-        let result = walk(dir.path(), &mut index, &cancel, &mut |_| {});
+        let result = walk(dir.path(), &mut index, &cancel, &mut |_, _| {});
         std::fs::remove_dir(&junction).ok();
 
         let stats = result.expect("висячий junction не должен ронять обход");
@@ -647,7 +651,7 @@ mod tests {
 
         let mut index = ScanIndex::new("root");
         let cancel = AtomicBool::new(false);
-        walk(dir.path(), &mut index, &cancel, &mut |_progress| {
+        walk(dir.path(), &mut index, &cancel, &mut |_progress, _index| {
             cancel.store(true, Ordering::Relaxed);
         })
         .expect("отмена — не ошибка");

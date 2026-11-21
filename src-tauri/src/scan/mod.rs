@@ -14,20 +14,26 @@ mod test_support;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use windows::Win32::Storage::FileSystem::{
     GetDiskFreeSpaceExW, GetLogicalDriveStringsW, GetVolumeInformationW,
 };
 use windows::core::PCWSTR;
 
-use crate::model::{DriveInfo, FolderSummary, ScanError, ScanProgress, ScanTotals};
+use crate::model::{DriveInfo, FolderSummary, ScanError, ScanProgress, ScanTotals, TreemapRect};
 use crate::scan::index::ScanIndex;
 use crate::scan::mft::scan_ntfs;
 use crate::scan::walk::walk;
 
 /// Сколько самых тяжёлых папок корня показывать в топе.
 const TOP_FOLDERS_LIMIT: usize = 20;
+
+/// Период живых событий (топ папок и карта) в приложении — раз в секунду.
+///
+/// Тесты передают `Duration::ZERO` через [`run_scan_with_interval`], чтобы
+/// получать события на каждом батче движка, а не ждать секунду.
+const LIVE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Что сканировать: целый диск или отдельную папку.
 ///
@@ -43,7 +49,51 @@ pub enum ScanTarget {
 pub trait ScanSink {
     fn progress(&mut self, p: &ScanProgress);
     fn top_folders(&mut self, rows: &[FolderSummary]);
+    /// Живая карта: раскладку подключает Задача 3, в Задаче 1 важен ритм.
+    fn treemap(&mut self, rects: &[TreemapRect]);
     fn done(&mut self, r: Result<&ScanTotals, &ScanError>);
+}
+
+/// Периодические события для интерфейса: топ папок и карта не чаще раза в
+/// `interval` и не реже раза в секунду на живом сканировании.
+struct LiveEmitter {
+    interval: Duration,
+    last_emit: Instant,
+}
+
+impl LiveEmitter {
+    fn new(interval: Duration) -> LiveEmitter {
+        LiveEmitter {
+            interval,
+            last_emit: Instant::now(),
+        }
+    }
+
+    /// Прогресс уходит всегда, топ и карта — по таймеру. При нулевом интервале
+    /// (тесты) событие приходит на каждом батче движка.
+    fn on_progress(&mut self, sink: &mut dyn ScanSink, progress: &ScanProgress, index: &ScanIndex) {
+        sink.progress(progress);
+        if self.interval.is_zero() || self.last_emit.elapsed() >= self.interval {
+            self.emit(sink, index);
+        }
+    }
+
+    fn emit(&mut self, sink: &mut dyn ScanSink, index: &ScanIndex) {
+        let rows = top_rows(index);
+        sink.top_folders(&rows);
+        // Раскладку карты даст Задача 3; здесь важен ритм событий.
+        sink.treemap(&[]);
+        self.last_emit = Instant::now();
+    }
+}
+
+/// Самые тяжёлые дочерние папки корня — то, что уходит в `sink.top_folders`.
+fn top_rows(index: &ScanIndex) -> Vec<FolderSummary> {
+    index
+        .child_folders(index.root())
+        .into_iter()
+        .take(TOP_FOLDERS_LIMIT)
+        .collect()
 }
 
 /// Что делать с ошибкой: показать фатально или предложить обход папок.
@@ -97,31 +147,47 @@ fn error_message(err: &ScanError) -> &str {
 
 /// Прогресс и итоги наружу в одном месте: движки только сообщают цифры.
 ///
-/// Топ папок отправляется по завершении: движок держит `&mut ScanIndex` всё
-/// время работы, а `ScanSink` не имеет доступа к индексу, поэтому снимать
-/// промежуточные срезы дерева прямо из колбэка прогресса нельзя без изменения
-/// зафиксированных интерфейсов `walk`/`scan_ntfs`.
+/// Живые события (топ папок и карта) отправляются таймером раз в секунду.
+/// Движок держит `&mut ScanIndex` всё время работы, поэтому срез дерева
+/// приходит в колбэк прогресса вместе с индексом — иначе `run_scan` не смог бы
+/// снять топ, пока идёт сканирование.
 pub fn run_scan(
     target: &ScanTarget,
     index: &mut ScanIndex,
     sink: &mut dyn ScanSink,
     cancel: &AtomicBool,
 ) -> Result<ScanTotals, ScanError> {
+    run_scan_with_interval(target, index, sink, cancel, LIVE_INTERVAL)
+}
+
+/// `run_scan` с явным периодом живых событий: тесты передают `Duration::ZERO`
+/// и получают топ/карту на каждом батче, не дожидаясь секунды.
+fn run_scan_with_interval(
+    target: &ScanTarget,
+    index: &mut ScanIndex,
+    sink: &mut dyn ScanSink,
+    cancel: &AtomicBool,
+    live_interval: Duration,
+) -> Result<ScanTotals, ScanError> {
+    let mut live = LiveEmitter::new(live_interval);
     let result = match target {
         // NTFS-том читаем напрямую; всё остальное — обходом.
         ScanTarget::Drive(letter) if is_ntfs(letter) => {
             let fast = {
-                let mut report = |p: &ScanProgress| sink.progress(p);
+                let mut report =
+                    |p: &ScanProgress, current: &ScanIndex| live.on_progress(sink, p, current);
                 scan_ntfs(letter, index, cancel, &mut report)
             };
             // Нет прав на том — не тупик: тот же охват обходом, без ошибки в окне.
             with_walk_fallback(fast, || {
-                let mut report = |p: &ScanProgress| sink.progress(p);
+                let mut report =
+                    |p: &ScanProgress, current: &ScanIndex| live.on_progress(sink, p, current);
                 walk_target(target, index, cancel, &mut report)
             })
         }
         _ => {
-            let mut report = |p: &ScanProgress| sink.progress(p);
+            let mut report =
+                |p: &ScanProgress, current: &ScanIndex| live.on_progress(sink, p, current);
             walk_target(target, index, cancel, &mut report)
         }
     };
@@ -131,12 +197,10 @@ pub fn run_scan(
             // Флаг отмены — единственный достоверный признак частичности на момент
             // завершения: движок мог остановиться уже после нажатия «Остановить».
             totals.cancelled = cancel.load(Ordering::Relaxed);
-            let rows: Vec<FolderSummary> = index
-                .child_folders(index.root())
-                .into_iter()
-                .take(TOP_FOLDERS_LIMIT)
-                .collect();
+            // Итоговые события: топ и карта — ещё раз, по завершении.
+            let rows = top_rows(index);
             sink.top_folders(&rows);
+            sink.treemap(&[]);
             sink.done(Ok(&totals));
             Ok(totals)
         }
@@ -152,7 +216,7 @@ fn walk_target(
     target: &ScanTarget,
     index: &mut ScanIndex,
     cancel: &AtomicBool,
-    progress: &mut dyn FnMut(&ScanProgress),
+    progress: &mut dyn FnMut(&ScanProgress, &ScanIndex),
 ) -> Result<ScanTotals, ScanError> {
     let root = match target {
         ScanTarget::Folder(path) => path.clone(),
@@ -359,30 +423,42 @@ fn from_wide(buffer: &[u16]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{FolderSummary, ScanError, ScanProgress, ScanTotals};
+    use crate::model::{FolderSummary, ScanError, ScanProgress, ScanTotals, TreemapRect};
     use crate::scan::index::ScanIndex;
     use crate::scan::test_support::test_dir;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
 
-    /// Приёмник событий сканирования: запоминает всё, что прислал `run_scan`.
+    /// Приёмник событий сканирования: запоминает всё, что прислал `run_scan`,
+    /// и порядок событий — по нему проверяется «живость» до `done`.
     #[derive(Default)]
     struct RecordingSink {
         progress: Vec<ScanProgress>,
         tops: Vec<Vec<FolderSummary>>,
+        treemaps: Vec<Vec<TreemapRect>>,
+        events: Vec<&'static str>,
         done: Option<Result<ScanTotals, String>>,
     }
 
     impl ScanSink for RecordingSink {
         fn progress(&mut self, p: &ScanProgress) {
+            self.events.push("progress");
             self.progress.push(p.clone());
         }
 
         fn top_folders(&mut self, rows: &[FolderSummary]) {
+            self.events.push("top");
             self.tops.push(rows.to_vec());
         }
 
+        fn treemap(&mut self, rects: &[TreemapRect]) {
+            self.events.push("treemap");
+            self.treemaps.push(rects.to_vec());
+        }
+
         fn done(&mut self, r: Result<&ScanTotals, &ScanError>) {
+            self.events.push("done");
             self.done = Some(match r {
                 Ok(totals) => Ok(totals.clone()),
                 Err(err) => Err(format!("{err:?}")),
@@ -418,6 +494,63 @@ mod tests {
         service.finish(&current, Arc::new(fresh), None);
         let stored = service.index().expect("результат текущего запуска должен сохраниться");
         assert_eq!(stored.child_folders(stored.root()).len(), 1);
+    }
+
+    #[test]
+    fn run_scan_emits_live_top_and_treemap() {
+        // Живые события не должны ждать `done`: на нескольких батчах обхода
+        // sink обязан получить топ и карту ещё во время сканирования.
+        let dir = test_dir();
+        let sub = dir.path().join("с данными");
+        std::fs::create_dir(&sub).unwrap();
+        for index in 0..1000 {
+            std::fs::write(sub.join(format!("f-{index:04}.bin")), b"x").unwrap();
+        }
+
+        let mut index = ScanIndex::new("folder");
+        let cancel = AtomicBool::new(false);
+        let mut sink = RecordingSink::default();
+        let totals = run_scan_with_interval(
+            &ScanTarget::Folder(dir.path().to_path_buf()),
+            &mut index,
+            &mut sink,
+            &cancel,
+            Duration::ZERO,
+        )
+        .expect("сканирование папки должно завершиться без ошибки");
+
+        assert_eq!(totals.files, 1000, "все файлы обязаны попасть в итоги");
+        let done_at = sink
+            .events
+            .iter()
+            .position(|event| *event == "done")
+            .expect("событие done обязано быть");
+        assert!(
+            sink.events[..done_at].iter().any(|event| *event == "top"),
+            "топ папок обязан прийти до done: {:?}",
+            sink.events
+        );
+        assert!(
+            sink.events[..done_at]
+                .iter()
+                .any(|event| *event == "treemap"),
+            "живая карта обязана прийти до done: {:?}",
+            sink.events
+        );
+        assert_eq!(
+            sink.events.last(),
+            Some(&"done"),
+            "done — последнее событие сканирования: {:?}",
+            sink.events
+        );
+        // Живой топ — не пустой срез: к первому событию папка с файлами уже есть.
+        assert!(
+            sink.tops.iter().any(|rows| rows
+                .iter()
+                .any(|row| row.name == "с данными" && row.file_count == 1000)),
+            "живой топ обязан содержать отсканированную папку: {:?}",
+            sink.tops
+        );
     }
 
     #[test]
@@ -471,7 +604,7 @@ mod tests {
         // Эталон: прямой обход той же папки.
         let mut direct = ScanIndex::new("folder");
         let cancel = AtomicBool::new(false);
-        let stats = walk::walk(dir.path(), &mut direct, &cancel, &mut |_| {})
+        let stats = walk::walk(dir.path(), &mut direct, &cancel, &mut |_, _| {})
             .expect("прямой обход должен пройти без ошибки");
         let direct_totals = direct.folder_totals(direct.root());
 
