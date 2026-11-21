@@ -1,0 +1,72 @@
+//! Модель данных сканера: идентификаторы папок, ключи файлов, DTO для фронтенда.
+
+pub type FolderId = u32;
+
+/// Уникальный ключ файла на диске (номер тома + файловая запись).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FileKey {
+    pub volume_serial: u32,
+    pub file_index: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct FileMeta {
+    pub name: String,      // имя файла без пути
+    pub size_on_disk: u64, // байт, занятых на диске
+    pub size_logical: u64, // фактический размер
+    pub modified: i64,     // время изменения, Unix-мс
+    pub file_key: FileKey,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FolderTotals {
+    pub size_on_disk: u64,
+    pub size_logical: u64,
+    pub file_count: u32,
+    pub folder_count: u32,
+}
+
+/// DTO для фронтенда: сводка по одной папке.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FolderSummary {
+    pub id: FolderId,
+    pub name: String,
+    pub size_on_disk: u64,
+    pub file_count: u32,
+    pub folder_count: u32,
+    pub percent_of_parent: f32, // доля от размера родителя, 0.0..=1.0
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScanProgress {
+    pub files: u64,
+    pub folders: u64,
+    pub size_on_disk: u64,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScanTotals {
+    pub files: u64,
+    pub folders: u64,
+    pub size_on_disk: u64,
+    pub size_logical: u64,
+    pub skipped: u32,
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DriveInfo {
+    pub letter: String,
+    pub label: String,
+    pub fs: String,
+    pub total_bytes: u64,
+    pub free_bytes: u64,
+}
+
+#[derive(Debug)]
+pub enum ScanError {
+    VolumeAccess(String),
+    Io(String),
+    Parse(String),
+}
