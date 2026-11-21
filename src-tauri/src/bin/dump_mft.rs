@@ -1,30 +1,23 @@
 //! dump_mft — утилита снятия сырых записей `$MFT` с NTFS-тома.
 //!
-//! Пример: `dump_mft C: tests\fixtures\sample.mft --records 2000 --boot`
+//! Пример: `dump_mft C: C:\Temp\mft\sample.mft --records 2000 --boot`
 //!
 //! Требует прав администратора: без них Windows не даёт открыть `\\.\C:`.
+//! Слепок содержит настоящие имена файлов: это инструмент локальной отладки,
+//! а не источник тестовых данных (тесты генерируют синтетический MFT сами).
 //!
 //! Флаги:
 //! - `--records N`  — записать только первые N записей (по умолчанию все);
 //! - `--boot`       — сохранить первые 512 байт тома в `boot.bin` рядом с выходным файлом;
-//! - `--corrupt`    — испортить байты последней записанной записи (фикстура `corrupt.mft`);
-//! - `--spike`      — замерить альтернативный способ чтения через `FSCTL_GET_NTFS_FILE_RECORD`
-//!   (код спайка, в рабочий путь не входит);
-//! - `--spike-limit N` — ограничить замер спайка первыми N записями.
+//! - `--corrupt`    — испортить байты последней записанной записи (фикстура `corrupt.mft`).
 
-use std::ffi::c_void;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
-use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use windows::Win32::Foundation::HANDLE;
-use windows::Win32::System::IO::DeviceIoControl;
-use windows::Win32::System::Ioctl::{FSCTL_GET_NTFS_FILE_RECORD, NTFS_FILE_RECORD_INPUT_BUFFER};
-
 use woozytree_lib::model::ScanError;
-use woozytree_lib::scan::volume::{normalize_drive_letter, VolumeReader};
+use woozytree_lib::scan::volume::VolumeReader;
 
 struct Args {
     drive: String,
@@ -32,13 +25,10 @@ struct Args {
     records: Option<u64>,
     corrupt: bool,
     boot: bool,
-    spike: bool,
-    spike_limit: Option<u64>,
 }
 
 fn usage() -> &'static str {
-    "Использование: dump_mft <буква_тома> <выходной_файл> [--records N] [--corrupt] [--boot] \
-     [--spike [--spike-limit N]]"
+    "Использование: dump_mft <буква_тома> <выходной_файл> [--records N] [--corrupt] [--boot]"
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -47,8 +37,6 @@ fn parse_args() -> Result<Args, String> {
     let mut records = None;
     let mut corrupt = false;
     let mut boot = false;
-    let mut spike = false;
-    let mut spike_limit = None;
 
     let mut i = 0;
     while i < raw.len() {
@@ -64,20 +52,8 @@ fn parse_args() -> Result<Args, String> {
                 );
                 i += 1;
             }
-            "--spike-limit" => {
-                let value = raw
-                    .get(i + 1)
-                    .ok_or_else(|| format!("--spike-limit требует значение\n{}", usage()))?;
-                spike_limit = Some(
-                    value
-                        .parse::<u64>()
-                        .map_err(|_| format!("--spike-limit: ожидалось число, получено {value}"))?,
-                );
-                i += 1;
-            }
             "--corrupt" => corrupt = true,
             "--boot" => boot = true,
-            "--spike" => spike = true,
             other if other.starts_with("--") => {
                 return Err(format!("неизвестный флаг {other}\n{}", usage()));
             }
@@ -95,8 +71,6 @@ fn parse_args() -> Result<Args, String> {
         records,
         corrupt,
         boot,
-        spike,
-        spike_limit,
     })
 }
 
@@ -150,42 +124,6 @@ fn corrupt_last_record(path: &Path, record_size: usize) -> Result<(), String> {
         file.flush().map_err(|e| e.to_string())?;
     }
     Ok(())
-}
-
-/// Способ (б) из спайка: перебор записей через `FSCTL_GET_NTFS_FILE_RECORD`.
-/// Возвращает (успешных записей, ошибок).
-fn read_via_ioctl(volume: &File, record_count: u64, limit: Option<u64>) -> Result<(u64, u64), String> {
-    let handle = HANDLE(volume.as_raw_handle());
-    let mut out = vec![0u8; 8192];
-    let mut ok = 0u64;
-    let mut errors = 0u64;
-    let total = limit.map_or(record_count, |n| n.min(record_count));
-
-    for index in 0..total {
-        let input = NTFS_FILE_RECORD_INPUT_BUFFER {
-            FileReferenceNumber: index as i64,
-        };
-        let mut returned = 0u32;
-        // SAFETY: буферы живут на время вызова, их размеры переданы корректно,
-        // дескриптор тома открыт и валиден.
-        let result = unsafe {
-            DeviceIoControl(
-                handle,
-                FSCTL_GET_NTFS_FILE_RECORD,
-                Some(&input as *const _ as *const c_void),
-                std::mem::size_of::<NTFS_FILE_RECORD_INPUT_BUFFER>() as u32,
-                Some(out.as_mut_ptr() as *mut c_void),
-                out.len() as u32,
-                Some(&mut returned),
-                None,
-            )
-        };
-        match result {
-            Ok(()) => ok += 1,
-            Err(_) => errors += 1,
-        }
-    }
-    Ok((ok, errors))
 }
 
 fn main() {
@@ -310,33 +248,6 @@ fn run() -> Result<(), String> {
             "[dump] последняя запись испорчена -> {}",
             args.out_path.display()
         );
-    }
-
-    if args.spike {
-        let letter = normalize_drive_letter(&args.drive).map_err(describe)?;
-        let volume_path = format!(r"\\.\{}:", letter);
-        let volume = File::open(&volume_path)
-            .map_err(|e| format!("открытие {volume_path} для замера (нужен администратор): {e}"))?;
-
-        println!("[spike] замер способа (б) FSCTL_GET_NTFS_FILE_RECORD...");
-        let io_started = Instant::now();
-        let (ok, errors) = read_via_ioctl(&volume, record_count, args.spike_limit)?;
-        let elapsed = io_started.elapsed();
-        let measured = args.spike_limit.unwrap_or(record_count).min(record_count);
-        let per_record_us = elapsed.as_secs_f64() * 1e6 / measured.max(1) as f64;
-        println!(
-            "[spike] способ (б): {} записей (ok={ok}, err={errors}) за {:.3} с, {:.1} мкс/запись",
-            measured,
-            elapsed.as_secs_f64(),
-            per_record_us
-        );
-        if args.spike_limit.is_some() {
-            println!(
-                "[spike] экстраполяция на все {} записей: {:.1} с",
-                record_count,
-                per_record_us * record_count as f64 / 1e6
-            );
-        }
     }
 
     println!("[done] всего {:.3} с", started.elapsed().as_secs_f64());
