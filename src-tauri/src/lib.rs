@@ -138,7 +138,10 @@ fn root_name(target: &ScanTarget) -> String {
     }
 }
 
-#[tauri::command]
+// Команда асинхронная: Win32-опрос дисков может надолго зависнуть на отключённом
+// сетевом диске и заморозить главный поток окна (Tauri по умолчанию выполняет
+// синхронные команды на нём).
+#[tauri::command(async)]
 fn list_drives() -> Vec<DriveInfo> {
     scan::list_drives()
 }
