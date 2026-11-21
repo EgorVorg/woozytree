@@ -18,6 +18,7 @@ use woozytree_lib::scan::index::ScanIndex;
 use woozytree_lib::scan::mft::{ScanDiag, scan_ntfs_reader_diag};
 use woozytree_lib::scan::volume::VolumeReader;
 use woozytree_lib::scan::{ScanSink, ScanTarget, run_scan};
+use woozytree_lib::treemap::layout::treemap_for_folder;
 
 fn describe(error: ScanError) -> String {
     match error {
@@ -240,6 +241,66 @@ impl ScanSink for LiveSink {
     }
 }
 
+/// Замер раскладки treemap на реальном индексе (`scan_bench --treemap C: 2000`).
+///
+/// Раскладка вызывается несколько раз: первый вызов прогревает кэш, дальше
+/// берём лучшее и среднее время — как в замерах таблицы файлов.
+fn bench_treemap(index: &ScanIndex, budget: usize) {
+    const RUNS: u32 = 5;
+    let mut best = Duration::MAX;
+    let mut total = Duration::ZERO;
+    let mut rects = Vec::new();
+    for _ in 0..RUNS {
+        let started = Instant::now();
+        rects = treemap_for_folder(index, index.root(), budget);
+        let elapsed = started.elapsed();
+        best = best.min(elapsed);
+        total += elapsed;
+    }
+
+    let folders = rects.iter().filter(|rect| rect.is_dir).count();
+    let other = rects
+        .iter()
+        .filter(|rect| !rect.is_dir && rect.name == "прочее")
+        .count();
+    let files = rects.len() - folders - other;
+    println!(
+        "[treemap] бюджет {budget}: прямоугольников {} (папок {folders}, файлов {files}, \
+         «прочее» {other}), лучшее {best:?}, среднее {:?}",
+        rects.len(),
+        total / RUNS
+    );
+    if !rects.is_empty() {
+        // Верхний уровень — плитки, не вложенные ни в одну более крупную: только
+        // они обязаны покрывать весь контейнер (вложенные лежат поверх родителей).
+        let mut top_level = 0usize;
+        let mut top_area = 0.0f64;
+        for (index, rect) in rects.iter().enumerate() {
+            let covered = rects.iter().enumerate().any(|(other_index, other)| {
+                if other_index == index {
+                    return false;
+                }
+                let inside = rect.x >= other.x - 1e-12
+                    && rect.y >= other.y - 1e-12
+                    && rect.x + rect.w <= other.x + other.w + 1e-12
+                    && rect.y + rect.h <= other.y + other.h + 1e-12;
+                let area = rect.w * rect.h;
+                let other_area = other.w * other.h;
+                inside && (other_area > area || (other_area == area && other_index < index))
+            });
+            if !covered {
+                top_level += 1;
+                top_area += rect.w * rect.h;
+            }
+        }
+        let big_tiles = rects.iter().filter(|rect| rect.w * rect.h >= 0.01).count();
+        println!(
+            "[treemap] верхний уровень: плиток {top_level}, площадь {top_area:.12}; \
+             плиток площадью ≥1 %: {big_tiles}"
+        );
+    }
+}
+
 /// Живой режим: скан через `run_scan` — тот же путь, что и в приложении,
 /// с таймером живых событий (топ и карта раз в секунду).
 fn run_live(drive: &str) {
@@ -310,7 +371,20 @@ fn run_live(drive: &str) {
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Режим замера раскладки: `scan_bench --treemap [буква_тома] [бюджет]`.
+    // Флаг снимается — дальше это обычный скан тома, раскладку мерим на его
+    // готовом индексе. Бюджет по умолчанию — как у живой карты (2000).
+    let treemap_mode = args.first().map(String::as_str) == Some("--treemap");
+    let treemap_budget = if treemap_mode {
+        args.remove(0);
+        args.get(1)
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(2000)
+    } else {
+        0
+    };
 
     // Живой режим: скан через run_scan с таймером событий (топ и карта).
     if args.first().map(String::as_str) == Some("--live") {
@@ -482,6 +556,10 @@ fn main() {
             child.file_count,
             child.folder_count
         );
+    }
+
+    if treemap_mode {
+        bench_treemap(&index, treemap_budget);
     }
 
     bench_files(&index, &target);

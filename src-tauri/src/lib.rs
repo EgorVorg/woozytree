@@ -2,6 +2,7 @@
 
 pub mod model;
 pub mod scan;
+pub mod treemap;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -216,6 +217,39 @@ fn get_scan_totals(state: State<'_, AppState>) -> Result<ScanTotals, String> {
         .ok_or_else(|| "Сканирование ещё не завершено.".to_string())
 }
 
+/// Сколько прямоугольников карты максимум отдаём одной командой: защита от
+/// случайно огромного ответа IPC и зависания отрисовки.
+const TREEMAP_RECTS_LIMIT: usize = 20_000;
+
+/// Раскладка карты для папки: готовые прямоугольники с нормированными 0..1
+/// координатами. Рекурсия внутрь крупных папок — до бюджета `max_rects`.
+///
+/// Команда асинхронная: раскладка 2000 прямоугольников — это единицы-десятки
+/// миллисекунд CPU, и главный поток окна не должен на них ждать.
+#[tauri::command(async)]
+fn get_treemap(
+    state: State<'_, AppState>,
+    folder_id: u32,
+    max_rects: usize,
+) -> Result<Vec<TreemapRect>, String> {
+    let index = state
+        .service
+        .index()
+        .ok_or_else(|| "Индекс ещё не готов: сначала завершите сканирование.".to_string())?;
+
+    // Идентификаторы папок выдаются по порядку (0 — корень), поэтому последний
+    // известный id равен числу папок в корне. Чужой id отсекаем без паники.
+    let max_id = index.folder_totals(index.root()).folder_count;
+    if folder_id > max_id {
+        return Err(format!("Папка с id {folder_id} не найдена."));
+    }
+
+    let max_rects = max_rects.min(TREEMAP_RECTS_LIMIT);
+    Ok(treemap::layout::treemap_for_folder(
+        &index, folder_id, max_rects,
+    ))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -227,7 +261,8 @@ pub fn run() {
             start_scan,
             cancel_scan,
             get_children,
-            get_scan_totals
+            get_scan_totals,
+            get_treemap
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -35,6 +35,10 @@ const TOP_FOLDERS_LIMIT: usize = 20;
 /// получать события на каждом батче движка, а не ждать секунду.
 const LIVE_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Бюджет прямоугольников живой карты: столько же отдаёт команда `get_treemap`
+/// для уровня корня. Больше — дороже JSON и отрисовка, меньше — теряется детализация.
+const LIVE_TREEMAP_RECTS: usize = 2000;
+
 /// Что сканировать: целый диск или отдельную папку.
 ///
 /// В JSON это `{"drive": "C"}` или `{"folder": "C:\\Temp"}`.
@@ -49,7 +53,8 @@ pub enum ScanTarget {
 pub trait ScanSink {
     fn progress(&mut self, p: &ScanProgress);
     fn top_folders(&mut self, rows: &[FolderSummary]);
-    /// Живая карта: раскладку подключает Задача 3, в Задаче 1 важен ритм.
+    /// Живая карта: те же прямоугольники, что отдаёт команда `get_treemap`,
+    /// для корня сканирования и с тем же бюджетом.
     fn treemap(&mut self, rects: &[TreemapRect]);
     fn done(&mut self, r: Result<&ScanTotals, &ScanError>);
 }
@@ -81,10 +86,14 @@ impl LiveEmitter {
     fn emit(&mut self, sink: &mut dyn ScanSink, index: &ScanIndex) {
         let rows = top_rows(index);
         sink.top_folders(&rows);
-        // Раскладку карты даст Задача 3; здесь важен ритм событий.
-        sink.treemap(&[]);
+        sink.treemap(&live_treemap(index));
         self.last_emit = Instant::now();
     }
+}
+
+/// Живая карта корня сканирования: та же раскладка, что отдаёт `get_treemap`.
+fn live_treemap(index: &ScanIndex) -> Vec<TreemapRect> {
+    crate::treemap::layout::treemap_for_folder(index, index.root(), LIVE_TREEMAP_RECTS)
 }
 
 /// Самые тяжёлые дочерние папки корня — то, что уходит в `sink.top_folders`.
@@ -200,7 +209,7 @@ fn run_scan_with_interval(
             // Итоговые события: топ и карта — ещё раз, по завершении.
             let rows = top_rows(index);
             sink.top_folders(&rows);
-            sink.treemap(&[]);
+            sink.treemap(&live_treemap(index));
             sink.done(Ok(&totals));
             Ok(totals)
         }
@@ -291,7 +300,12 @@ impl ScanService {
     }
 
     /// Сохранить результат, если этот запуск всё ещё актуален.
-    pub fn finish(&self, flag: &Arc<AtomicBool>, index: Arc<ScanIndex>, totals: Option<ScanTotals>) {
+    pub fn finish(
+        &self,
+        flag: &Arc<AtomicBool>,
+        index: Arc<ScanIndex>,
+        totals: Option<ScanTotals>,
+    ) {
         let active = self.cancel.lock().unwrap();
         let is_current = active
             .as_ref()
@@ -395,7 +409,11 @@ pub fn list_drives() -> Vec<DriveInfo> {
 
         drives.push(DriveInfo {
             letter: root.trim_end_matches('\\').to_string(),
-            label: if info_ok { from_wide(&label) } else { String::new() },
+            label: if info_ok {
+                from_wide(&label)
+            } else {
+                String::new()
+            },
             fs: if info_ok {
                 from_wide(&fs_name)
             } else {
@@ -492,7 +510,9 @@ mod tests {
         let mut fresh = ScanIndex::new("root");
         fresh.folder(fresh.root(), "fresh");
         service.finish(&current, Arc::new(fresh), None);
-        let stored = service.index().expect("результат текущего запуска должен сохраниться");
+        let stored = service
+            .index()
+            .expect("результат текущего запуска должен сохраниться");
         assert_eq!(stored.child_folders(stored.root()).len(), 1);
     }
 
