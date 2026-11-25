@@ -6,7 +6,7 @@
 // основная карта (Treemap.tsx) живёт на навигации, живых событиях и зуме,
 // которых на вкладке типов нет; общими остаются раскладка в Rust и хит-тест
 // `hit_test`. Так проще не сломать главную карту и не тащить в неё режимы.
-import { useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
@@ -218,12 +218,17 @@ export default function FileTypesPanel({
   const [hover, setHover] = useState<{ x: number; y: number; nx: number; ny: number } | null>(null);
 
   // Таблица: строки уже отсортированы ядром. Сортировка в ключе кэша — смена
-  // колонки берёт готовый ответ или пересчитывает его в ядре.
+  // колонки берёт готовый ответ или пересчитывает его в ядре. Пока ядро заново
+  // обходит поддерево (на C: — 1.26 млн имён), показываем прошлый порядок, а не
+  // пустую таблицу: иначе каждый первый клик по заголовку выглядел бы как
+  // перезагрузка вкладки. Если новый запрос упадёт, placeholder снимется и
+  // таблица честно покажет ошибку, а не старые строки.
   const typesQuery = useQuery({
     queryKey: ["file_types", scanRun, folderId, sortState.sort, sortState.desc],
     queryFn: () => getFileTypes(folderId, sortState.sort, sortState.desc),
     enabled: !scanning,
     staleTime: Number.POSITIVE_INFINITY,
+    placeholderData: keepPreviousData,
   });
 
   // Карта: бюджет плиток и раскладка — в ядре; сортировка таблицы на неё не
@@ -335,6 +340,11 @@ export default function FileTypesPanel({
     );
     if (rect) toggleSelected(tile_extension(rect.name));
   };
+
+  // Строки на экране — прошлый порядок: идёт перезапрос после смены колонки.
+  // Приглушаем их и пишем «Сортируем…», чтобы старый порядок не выдавался за
+  // новый, но и таблица не пропадала на время агрегации в ядре.
+  const reordering = typesQuery.isPlaceholderData;
 
   const tableMessage = scanning
     ? "Типы файлов появятся после завершения сканирования."
@@ -478,7 +488,7 @@ export default function FileTypesPanel({
               })}
             </tr>
           </thead>
-          <tbody>
+          <tbody className={cn(reordering && "opacity-60")}>
             {rows.length === 0 ? (
               <tr>
                 <td
@@ -527,14 +537,20 @@ export default function FileTypesPanel({
 
       <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-muted-foreground">
         <span className="tabular-nums">
-          {scanning || typesQuery.isPending
+          {scanning || typesQuery.isPending || typesQuery.error
             ? "Итого по типам: —"
             : `Итого по типам: ${formatCount(totals.count)} файлов`}
         </span>
         <span className="tabular-nums">
-          {scanning || typesQuery.isPending
+          {scanning
             ? ""
-            : `${formatSize(totals.logical)} · ${formatSize(totals.disk)} на диске`}
+            : typesQuery.error
+              ? "Ошибка загрузки типов"
+              : typesQuery.isPending
+                ? ""
+                : reordering
+                  ? "Сортируем…"
+                  : `${formatSize(totals.logical)} · ${formatSize(totals.disk)} на диске`}
         </span>
       </div>
     </section>
