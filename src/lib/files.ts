@@ -7,6 +7,8 @@ import type { Crumb, FileSort, FolderSummary } from "./types";
 export interface TreeRoot {
   name: string;
   size_on_disk: number;
+  /** Фактический размер — для режима «фактический» в настройках. */
+  size_logical: number;
   file_count: number;
   folder_count: number;
 }
@@ -18,6 +20,8 @@ export interface TreeRow {
   /** 0 — корень сканирования. */
   depth: number;
   size_on_disk: number;
+  /** Фактический размер: дерево следует настройке «на диске / фактический». */
+  size_logical: number;
   /** Файлов во всей папке (рекурсивно). */
   file_count: number;
   /** Папок внутри (рекурсивно); 0 — раскрывать нечего. */
@@ -69,6 +73,7 @@ export function flatten_tree(
     name: string,
     depth: number,
     size_on_disk: number,
+    size_logical: number,
     file_count: number,
     folder_count: number,
   ) => {
@@ -80,6 +85,7 @@ export function flatten_tree(
       name,
       depth,
       size_on_disk,
+      size_logical,
       file_count,
       folder_count,
       has_children: hasChildren,
@@ -93,6 +99,7 @@ export function flatten_tree(
         child.name,
         depth + 1,
         child.size_on_disk,
+        child.size_logical,
         child.file_count,
         child.folder_count,
       );
@@ -104,6 +111,7 @@ export function flatten_tree(
     root.name,
     0,
     root.size_on_disk,
+    root.size_logical,
     root.file_count,
     root.folder_count,
   );

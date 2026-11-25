@@ -380,6 +380,7 @@ function App() {
     () => ({
       name: path.length > 0 ? path[0].name : "",
       size_on_disk: totals?.size_on_disk ?? 0,
+      size_logical: totals?.size_logical ?? 0,
       file_count: totals?.files ?? 0,
       folder_count: totals?.folders ?? 0,
     }),
@@ -481,6 +482,7 @@ function App() {
                       root={rootSummary}
                       scanning={scanning}
                       scanRun={scanRun}
+                      sizeMode={settings.sizeMode}
                       onNavigate={handleTreeNavigate}
                     />
                     <FileTable

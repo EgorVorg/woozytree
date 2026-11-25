@@ -13,6 +13,7 @@ import type { FolderSummary } from "./types";
 const ROOT: TreeRoot = {
   name: "C:\\",
   size_on_disk: 10_000,
+  size_logical: 7_500,
   file_count: 500,
   folder_count: 4,
 };
@@ -24,12 +25,13 @@ function folder(
   size: number,
   fileCount: number,
   folderCount: number,
+  logical = size,
 ): FolderSummary {
   return {
     id,
     name,
     size_on_disk: size,
-    size_logical: size,
+    size_logical: logical,
     file_count: fileCount,
     folder_count: folderCount,
     percent_of_parent: size / ROOT.size_on_disk,
@@ -124,6 +126,29 @@ describe("flatten_tree", () => {
 
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ loading: true, expanded: true });
+  });
+
+  // Режим «фактический»: дерево обязано получать size_logical и для корня, и
+  // для детей — иначе оно всегда показывает «на диске» и расходится с таблицей.
+  it("flatten_tree_carries_logical_size_for_root_and_children", () => {
+    const rows = flatten_tree(
+      ROOT,
+      childrenMap([
+        [
+          0,
+          [
+            folder(1, "Windows", 6_000, 300, 2, 2_000),
+            folder(2, "Users", 3_000, 150, 1, 5_500),
+          ],
+        ],
+      ]),
+      new Set([0]),
+      new Set(),
+    );
+
+    expect(rows[0]).toMatchObject({ size_on_disk: 10_000, size_logical: 7_500 });
+    expect(rows[1]).toMatchObject({ size_on_disk: 6_000, size_logical: 2_000 });
+    expect(rows[2]).toMatchObject({ size_on_disk: 3_000, size_logical: 5_500 });
   });
 
   it("flatten_tree_does_not_wait_for_children_of_leaf", () => {

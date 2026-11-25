@@ -18,7 +18,8 @@ import {
 } from "@/lib/files";
 import { formatCount, formatSize } from "@/lib/format";
 import { getChildren } from "@/lib/ipc";
-import type { FolderSummary } from "@/lib/types";
+import { size_for } from "@/lib/settings";
+import type { FolderSummary, SizeMode } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 /** Высота строки дерева, px: по ней виртуализатор считает позиции. */
@@ -33,6 +34,8 @@ export interface FolderTreeProps {
   scanning: boolean;
   /** Номер скана: входит в ключ кэша, чтобы новый скан не показывал старые дети. */
   scanRun: number;
+  /** Настройка «на диске / фактический»: дерево показывает выбранный размер. */
+  sizeMode: SizeMode;
   /** Открыть папку: цепочка от корня целиком заменяет путь. */
   onNavigate: (path: TreeCrumb[]) => void;
 }
@@ -49,19 +52,24 @@ function foldersLabel(count: number): string {
   return folders_in_label(count);
 }
 
-/** Строка дерева: треугольник раскрытия, имя, размер на диске. */
+/** Строка дерева: треугольник раскрытия, имя, размер в выбранном режиме. */
 function TreeRowView({
   row,
+  sizeMode,
   selected,
   onToggle,
   onSelect,
 }: {
   row: TreeRow;
+  sizeMode: SizeMode;
   selected: boolean;
   onToggle: (id: number) => void;
   onSelect: (row: TreeRow) => void;
 }) {
-  const hint = `${row.name} · ${formatSize(row.size_on_disk)} · ${formatCount(row.file_count)} ${filesLabel(row.file_count)} в ${formatCount(row.folder_count)} ${foldersLabel(row.folder_count)}`;
+  // То же правило, что у таблицы, топа, карты и типов: режим размера меняет
+  // все экраны одинаково, а не только те, что запрашивают данные у ядра.
+  const size = size_for(sizeMode, row.size_on_disk, row.size_logical);
+  const hint = `${row.name} · ${formatSize(size)} · ${formatCount(row.file_count)} ${filesLabel(row.file_count)} в ${formatCount(row.folder_count)} ${foldersLabel(row.folder_count)}`;
   return (
     <div
       className="flex h-full items-center gap-0.5"
@@ -111,7 +119,7 @@ function TreeRowView({
         />
         <span className="min-w-0 flex-1 truncate">{row.name}</span>
         <span className="shrink-0 tabular-nums text-[11px] text-muted-foreground">
-          {formatSize(row.size_on_disk)}
+          {formatSize(size)}
         </span>
       </button>
     </div>
@@ -127,6 +135,7 @@ export default function FolderTree({
   root,
   scanning,
   scanRun,
+  sizeMode,
   onNavigate,
 }: FolderTreeProps) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -280,6 +289,7 @@ export default function FolderTree({
               >
                 <TreeRowView
                   row={row}
+                  sizeMode={sizeMode}
                   selected={row.id === selectedId}
                   onToggle={toggle}
                   onSelect={select}
@@ -302,7 +312,9 @@ export default function FolderTree({
         </p>
       ) : (
         <p className="mx-2 mb-2 text-[11px] text-muted-foreground">
-          Размер — занято на диске · треугольник — раскрыть · клик — открыть
+          Размер —{" "}
+          {sizeMode === "on_disk" ? "занято на диске" : "фактический"} ·
+          треугольник — раскрыть · клик — открыть
         </p>
       )}
     </section>
