@@ -1,7 +1,7 @@
 // Тесты форматирования размеров: одна десятичная, единицы ГиБ/МиБ/КиБ.
 import { describe, expect, it } from "vitest";
 
-import { formatPercent, formatSize } from "./format";
+import { formatDateTime, formatPercent, formatSize } from "./format";
 
 const KIB = 1024;
 const MIB = 1024 * KIB;
@@ -28,5 +28,26 @@ describe("formatPercent", () => {
   it("format_percent_uses_one_decimal", () => {
     expect(formatPercent(0.256)).toBe("25.6 %");
     expect(formatPercent(0)).toBe("0.0 %");
+  });
+});
+
+describe("formatDateTime", () => {
+  it("format_datetime_uses_day_month_year_and_time", () => {
+    // Локальное время: формат не должен зависеть от часового пояса машины.
+    const march = new Date(2024, 2, 5, 7, 8).getTime();
+    expect(formatDateTime(march)).toBe("05.03.2024 07:08");
+    const december = new Date(2023, 11, 31, 23, 59).getTime();
+    expect(formatDateTime(december)).toBe("31.12.2023 23:59");
+  });
+
+  it("format_datetime_pads_single_digits", () => {
+    const january = new Date(2025, 0, 1, 0, 0).getTime();
+    expect(formatDateTime(january)).toBe("01.01.2025 00:00");
+  });
+
+  it("format_datetime_shows_dash_for_unknown_time", () => {
+    expect(formatDateTime(0)).toBe("—");
+    expect(formatDateTime(-1)).toBe("—");
+    expect(formatDateTime(Number.NaN)).toBe("—");
   });
 });

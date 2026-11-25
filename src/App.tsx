@@ -1,9 +1,13 @@
-import { useCallback, useEffect, useState } from "react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
+import FileTable from "@/components/FileTable";
+import FolderTree from "@/components/FolderTree";
 import ScanStatus, { Breadcrumbs, type Crumb } from "@/components/ScanStatus";
 import Toolbar from "@/components/Toolbar";
 import TopFolders from "@/components/TopFolders";
 import Treemap from "@/components/Treemap";
+import type { TreeRoot } from "@/lib/files";
 import {
   cancelScan,
   listDrives,
@@ -27,6 +31,23 @@ const EMPTY_PROGRESS: ScanProgress = {
   size_on_disk: 0,
   elapsed_ms: 0,
 };
+
+/**
+ * Кэш запросов дерева и таблицы на всё время жизни окна.
+ *
+ * Данные индекса после сканирования не меняются, поэтому свежесть не
+ * протухает; ключи включают номер скана, так что новый скан не показывает
+ * папки и файлы прошлого.
+ */
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: Number.POSITIVE_INFINITY,
+      retry: false,
+      refetchOnWindowFocus: false,
+    },
+  },
+});
 
 function App() {
   const [drives, setDrives] = useState<DriveInfo[]>([]);
@@ -60,6 +81,12 @@ function App() {
   // Клик по папке на карте: имя нужно для хлебных крошек.
   const handleMapNavigate = useCallback((id: number, name?: string) => {
     setPath((current) => [...current, { id, name: name ?? `Папка ${id}` }]);
+  }, []);
+
+  // Клик в дереве: узел приносит всю цепочку предков — путь заменяется целиком,
+  // поэтому переход в соседнюю ветку не оставляет «хвоста» прежнего пути.
+  const handleTreeNavigate = useCallback((crumbs: Crumb[]) => {
+    if (crumbs.length > 0) setPath(crumbs);
   }, []);
 
   // Alt+↑ — на уровень вверх (дублирует кнопку «Вверх»).
@@ -183,67 +210,97 @@ function App() {
     });
   };
 
+  const folderId = path.length > 0 ? path[path.length - 1].id : 0;
+
+  // Корень дерева: имя из пути, итоги — из завершённого сканирования. Пока
+  // индекс не готов, дерево показывает только корень и честную подсказку.
+  const rootSummary = useMemo<TreeRoot>(
+    () => ({
+      name: path.length > 0 ? path[0].name : "",
+      size_on_disk: totals?.size_on_disk ?? 0,
+      file_count: totals?.files ?? 0,
+      folder_count: totals?.folders ?? 0,
+    }),
+    [path, totals],
+  );
+
   return (
-    <main className="min-h-screen bg-background text-foreground">
-      <div className="mx-auto flex max-w-6xl flex-col gap-4 p-6">
-        <header className="flex items-baseline justify-between gap-4">
-          <h1 className="text-xl font-semibold tracking-tight">WoozyTree</h1>
-          <span className="text-xs text-muted-foreground">
-            Быстрый анализ занятого места на диске
-          </span>
-        </header>
+    <QueryClientProvider client={queryClient}>
+      <main className="min-h-screen bg-background text-foreground">
+        <div className="mx-auto flex max-w-6xl flex-col gap-4 p-6">
+          <header className="flex items-baseline justify-between gap-4">
+            <h1 className="text-xl font-semibold tracking-tight">WoozyTree</h1>
+            <span className="text-xs text-muted-foreground">
+              Быстрый анализ занятого места на диске
+            </span>
+          </header>
 
-        <Toolbar
-          drives={drives}
-          selected={selected}
-          scanning={scanning}
-          stopping={stopping}
-          onSelect={setSelected}
-          onScan={handleScan}
-          onStop={handleStop}
-        />
+          <Toolbar
+            drives={drives}
+            selected={selected}
+            scanning={scanning}
+            stopping={stopping}
+            onSelect={setSelected}
+            onScan={handleScan}
+            onStop={handleStop}
+          />
 
-        {error ? (
-          <div
-            role="alert"
-            className="rounded-lg border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive"
-          >
-            {error}
-          </div>
-        ) : null}
+          {error ? (
+            <div
+              role="alert"
+              className="rounded-lg border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive"
+            >
+              {error}
+            </div>
+          ) : null}
 
-        {path.length === 0 ? (
-          <section className="rounded-lg border border-border bg-card px-4 py-6 text-sm text-muted-foreground">
-            Карта занятости появится здесь сразу после начала сканирования.
-          </section>
-        ) : (
-          <>
-            <Breadcrumbs
-              path={path}
-              onNavigate={handleCrumb}
-              onUp={handleUp}
-            />
-            <Treemap
-              key={scanRun}
-              folderId={path[path.length - 1].id}
-              onNavigate={handleMapNavigate}
-              scanning={scanning}
-            />
-          </>
-        )}
+          {path.length === 0 ? (
+            <section className="rounded-lg border border-border bg-card px-4 py-6 text-sm text-muted-foreground">
+              Карта занятости появится здесь сразу после начала сканирования.
+            </section>
+          ) : (
+            <>
+              <Breadcrumbs
+                path={path}
+                onNavigate={handleCrumb}
+                onUp={handleUp}
+              />
+              <Treemap
+                key={scanRun}
+                folderId={folderId}
+                onNavigate={handleMapNavigate}
+                scanning={scanning}
+              />
+              <div className="grid min-w-0 grid-cols-1 gap-4 lg:grid-cols-[minmax(240px,320px)_minmax(0,1fr)]">
+                <FolderTree
+                  path={path}
+                  root={rootSummary}
+                  scanning={scanning}
+                  scanRun={scanRun}
+                  onNavigate={handleTreeNavigate}
+                />
+                <FileTable
+                  folderId={folderId}
+                  scanning={scanning}
+                  scanRun={scanRun}
+                />
+              </div>
+            </>
+          )}
 
-        <ScanStatus
-          progress={progress}
-          percent={percent}
-          scanning={scanning}
-          stopping={stopping}
-          cancelled={cancelled}
-          skipped={totals?.skipped ?? 0}
-        />
+          <ScanStatus
+            progress={progress}
+            percent={percent}
+            scanning={scanning}
+            stopping={stopping}
+            cancelled={cancelled}
+            skipped={totals?.skipped ?? 0}
+          />
 
-        <TopFolders rows={top} />
-      </div>
-    </main>
+          <TopFolders rows={top} />
+        </div>
+      </main>
+    </QueryClientProvider>
   );
 }
 

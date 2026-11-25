@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter, State};
 
-use model::{DriveInfo, FolderSummary, ScanError, ScanProgress, ScanTotals, TreemapRect};
+use model::{
+    DriveInfo, FilePage, FileSort, FolderSummary, ScanError, ScanProgress, ScanTotals, TreemapRect,
+};
 use scan::index::ScanIndex;
 use scan::{ScanService, ScanSink, ScanTarget, drive_root, run_scan};
 
@@ -217,6 +219,55 @@ fn get_scan_totals(state: State<'_, AppState>) -> Result<ScanTotals, String> {
         .ok_or_else(|| "Сканирование ещё не завершено.".to_string())
 }
 
+/// Колонка сортировки файлов из строки окна.
+///
+/// Неизвестное имя — ошибка на русском, а не паника: окно могло сохранить
+/// старую настройку или прислать мусор, приложение должно остаться живым.
+fn file_sort_from_name(name: &str) -> Result<FileSort, String> {
+    match name {
+        "name" => Ok(FileSort::Name),
+        "size_on_disk" => Ok(FileSort::SizeOnDisk),
+        "size_logical" => Ok(FileSort::SizeLogical),
+        "modified" => Ok(FileSort::Modified),
+        other => Err(format!(
+            "Неизвестная сортировка «{other}»: ожидается name, size_on_disk, size_logical или modified."
+        )),
+    }
+}
+
+/// Страница таблицы файлов папки: сортировка и срез делает индекс.
+///
+/// Команда асинхронная: сортировка большой папки (десятки тысяч имён) — это
+/// десятки миллисекунд CPU (в debug-сборке — до сотен), а главный поток окна
+/// не должен ждать их при прокрутке и смене колонки.
+#[tauri::command(async)]
+fn get_files(
+    state: State<'_, AppState>,
+    folder_id: u32,
+    sort: String,
+    desc: bool,
+    offset: usize,
+    limit: usize,
+) -> Result<FilePage, String> {
+    let sort = file_sort_from_name(&sort)?;
+    let index = state
+        .service
+        .index()
+        .ok_or_else(|| "Индекс ещё не готов: сначала завершите сканирование.".to_string())?;
+
+    // Идентификаторы папок выдаются по порядку (0 — корень), поэтому последний
+    // известный id равен числу папок в корне. Чужой id отсекаем без паники.
+    let max_id = index.folder_totals(index.root()).folder_count;
+    if folder_id > max_id {
+        return Err(format!("Папка с id {folder_id} не найдена."));
+    }
+
+    Ok(FilePage {
+        total: index.file_count(folder_id),
+        rows: index.child_files(folder_id, sort, desc, offset, limit),
+    })
+}
+
 /// Сколько прямоугольников карты максимум отдаём одной командой: защита от
 /// случайно огромного ответа IPC и зависания отрисовки.
 const TREEMAP_RECTS_LIMIT: usize = 20_000;
@@ -261,6 +312,7 @@ pub fn run() {
             start_scan,
             cancel_scan,
             get_children,
+            get_files,
             get_scan_totals,
             get_treemap
         ])
@@ -301,6 +353,33 @@ mod tests {
         assert!(
             !text.contains("Попробуйте сканировать папку обходом"),
             "обход теперь запускается автоматически, совет вручную недостижим: {text}"
+        );
+    }
+
+    #[test]
+    fn file_sort_maps_window_column_names() {
+        assert!(matches!(file_sort_from_name("name"), Ok(FileSort::Name)));
+        assert!(matches!(
+            file_sort_from_name("size_on_disk"),
+            Ok(FileSort::SizeOnDisk)
+        ));
+        assert!(matches!(
+            file_sort_from_name("size_logical"),
+            Ok(FileSort::SizeLogical)
+        ));
+        assert!(matches!(
+            file_sort_from_name("modified"),
+            Ok(FileSort::Modified)
+        ));
+    }
+
+    #[test]
+    fn unknown_file_sort_is_a_russian_error_not_a_panic() {
+        let text = file_sort_from_name("size").expect_err("неизвестная колонка должна отвергаться");
+        assert!(text.contains("«size»"), "{text}");
+        assert!(
+            text.contains("size_on_disk") && text.contains("modified"),
+            "ошибка должна перечислять допустимые колонки: {text}"
         );
     }
 }

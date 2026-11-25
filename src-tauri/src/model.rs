@@ -57,6 +57,16 @@ pub enum FileSort {
     Modified,
 }
 
+/// DTO для фронтенда: страница файлов папки (`get_files`).
+///
+/// `total` — сколько всего файлов в папке: по нему таблица понимает, есть ли
+/// ещё страницы, не догружая их заранее.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FilePage {
+    pub rows: Vec<FileRow>,
+    pub total: u32,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ScanProgress {
     pub files: u64,

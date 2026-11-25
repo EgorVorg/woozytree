@@ -29,6 +29,23 @@ export function formatPercent(fraction: number): string {
   return `${(fraction * 100).toFixed(1)} %`;
 }
 
+/**
+ * Дата изменения файла: «дд.мм.гггг чч:мм» в местном времени (как в проводнике).
+ * Неизвестное время (0, отрицательное, NaN) — прочерк.
+ */
+export function formatDateTime(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) {
+    return "—";
+  }
+  const date = new Date(ms);
+  const time = date.getTime();
+  if (Number.isNaN(time)) {
+    return "—";
+  }
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${pad(date.getDate())}.${pad(date.getMonth() + 1)}.${date.getFullYear()} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
 /** Счётчики с разделителями разрядов: «1 234 567». */
 export function formatCount(value: number): string {
   return value.toLocaleString("ru-RU");

@@ -43,6 +43,31 @@ export interface DriveInfo {
 /** Что сканировать: `{"drive": "C:"}` или `{"folder": "C:\\Temp"}`. */
 export type ScanTarget = { drive: string } | { folder: string };
 
+/** Одна строка таблицы файлов (`FilePage.rows`). */
+export interface FileRow {
+  name: string;
+  /** Занято на диске, байт. */
+  size_on_disk: number;
+  /** Фактический размер, байт. */
+  size_logical: number;
+  /** Время изменения, Unix-мс (0 — время неизвестно). */
+  modified: number;
+  /** Доля от размера родителя: 0.0..=1.0. */
+  percent_of_parent: number;
+  /** Повторная жёсткая ссылка: размер не входит в итоги папки. */
+  hard_linked: boolean;
+}
+
+/** Страница файлов папки (`get_files`). */
+export interface FilePage {
+  rows: FileRow[];
+  /** Всего файлов в папке — по нему таблица понимает, есть ли ещё страницы. */
+  total: number;
+}
+
+/** Колонки, по которым ядро умеет сортировать таблицу файлов. */
+export type FileSort = "name" | "size_on_disk" | "size_logical" | "modified";
+
 /**
  * Прямоугольник карты (результат `get_treemap` и событие `scan://treemap`).
  *

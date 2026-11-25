@@ -20,6 +20,12 @@ export default defineConfig(() => ({
   //
   // 1. prevent Vite from obscuring rust errors
   clearScreen: false,
+  build: {
+    // Окно Tauri грузит единственный файл с локального диска: делить бандл на
+    // куски ради «сетевой» эвристики 500 кБ незачем — поднимаем порог, чтобы
+    // сборка не сыпала предупреждением о размере чанка (после TanStack ~520 кБ).
+    chunkSizeWarningLimit: 700,
+  },
   // 2. tauri expects a fixed port, fail if that port is not available
   server: {
     port: 1420,

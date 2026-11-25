@@ -4,6 +4,8 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 import type {
   DriveInfo,
+  FilePage,
+  FileSort,
   FolderSummary,
   ScanProgress,
   ScanTarget,
@@ -29,6 +31,20 @@ export function cancelScan(): Promise<void> {
 /** Дочерние папки готового индекса (по завершении сканирования). */
 export function getChildren(folderId: number): Promise<FolderSummary[]> {
   return invoke<FolderSummary[]>("get_children", { folderId });
+}
+
+/**
+ * Страница файлов папки: сортировка и срез `offset..offset+limit` — на стороне
+ * ядра, окно получает только видимый кусок.
+ */
+export function getFiles(
+  folderId: number,
+  sort: FileSort,
+  desc: boolean,
+  offset: number,
+  limit: number,
+): Promise<FilePage> {
+  return invoke<FilePage>("get_files", { folderId, sort, desc, offset, limit });
 }
 
 /** Итоги последнего завершённого сканирования. */
