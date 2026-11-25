@@ -17,8 +17,8 @@ use model::{
     CrumbDto, DeleteReport, DriveInfo, FilePage, FileSort, FileTypeRow, FolderSummary, ScanError,
     ScanProgress, ScanTotals, SearchPage, SearchQuery, SizeMode, TreemapRect, TypeSort,
 };
-use scan::index::ScanIndex;
-use scan::{ScanService, ScanSink, ScanTarget, drive_root, run_scan};
+use scan::index::{ScanIndex, valid_path_segment};
+use scan::{DisplayOptions, ScanService, ScanSink, ScanTarget, drive_root, run_scan_with_display};
 
 /// Состояние приложения: сервис сканирования живёт всё время работы окна.
 struct AppState {
@@ -186,8 +186,20 @@ fn start_scan(
     app: AppHandle,
     state: State<'_, AppState>,
     target: ScanTarget,
+    size_mode: String,
+    include_files: bool,
+    min_tile_bytes: u64,
 ) -> Result<(), String> {
     let service = Arc::clone(&state.service);
+    let size_mode = SizeMode::from_name(&size_mode)?;
+    // Настройки отображения — снимок на старте: живые карта и топ строятся по
+    // ним, а не по значениям по умолчанию (после скана карта перезапросится с
+    // актуальными настройками).
+    let display = DisplayOptions {
+        size_mode,
+        include_files,
+        min_tile_bytes,
+    };
     // Новый запуск: прошлый просим остановиться, чтобы два скана не спорили.
     let cancel = service.begin();
     let index_name = root_name(&target);
@@ -201,7 +213,7 @@ fn start_scan(
             let mut index = ScanIndex::new(&index_name);
             index.set_root_real_path(real_root);
             let mut sink = TauriSink::new(app, Arc::clone(&service), Arc::clone(&cancel));
-            let result = run_scan(&target, &mut index, &mut sink, &cancel);
+            let result = run_scan_with_display(&target, &mut index, &mut sink, &cancel, display);
             service.finish(&cancel, Arc::new(index), final_totals(&result));
             // Итоги уходят после сохранения индекса — без гонки с get_children.
             sink.emit_final();
@@ -218,11 +230,11 @@ fn cancel_scan(state: State<'_, AppState>) {
 
 /// Проверить, что папка с таким id есть в готовом индексе.
 ///
-/// Идентификаторы папок выдаются по порядку (0 — корень), поэтому последний
-/// известный id равен числу папок в корне: чужой id отсекается без паники.
+/// Раньше здесь сравнивался id с `folder_count`, то есть проверка опиралась на
+/// неявную связь «число папок = последний id». Теперь индекс отвечает прямо:
+/// есть ли узел с таким id. Чужой id отсекается без паники.
 fn check_folder_id(index: &ScanIndex, folder_id: u32) -> Result<(), String> {
-    let max_id = index.folder_totals(index.root()).folder_count;
-    if folder_id > max_id {
+    if !index.has_folder(folder_id) {
         return Err(format!("Папка с id {folder_id} не найдена."));
     }
     Ok(())
@@ -281,6 +293,17 @@ fn type_sort_from_name(name: &str) -> Result<TypeSort, String> {
     }
 }
 
+/// Сколько строк таблицы файлов отдаём одной командой максимум.
+///
+/// Окно просит 2000 строк на страницу; запас сверху — защита от случайно
+/// огромного запроса, из-за которого ответ IPC раздулся бы на сотни мегабайт.
+const FILES_ROWS_LIMIT: usize = 10_000;
+
+/// Кламп размера страницы файлов: окно не может запросить больше лимита.
+fn files_page_limit(limit: usize) -> usize {
+    limit.min(FILES_ROWS_LIMIT)
+}
+
 /// Страница таблицы файлов папки: сортировка и срез делает индекс.
 ///
 /// Команда асинхронная: сортировка большой папки (десятки тысяч имён) — это
@@ -309,6 +332,7 @@ fn get_files(
 
     check_folder_id(&index, folder_id)?;
 
+    let limit = files_page_limit(limit);
     Ok(FilePage {
         total: index.file_count(folder_id),
         rows: index.child_files(folder_id, sort, desc, offset, limit, size_mode),
@@ -493,18 +517,6 @@ fn action_path(path: &str) -> Result<PathBuf, String> {
     Ok(path_buf)
 }
 
-/// Годится ли имя файла из окна как звено пути действия.
-///
-/// Пробелы по краям не обрезаются (это испортило бы другое имя), а `.`, `..`,
-/// слэши и двоеточие недопустимы: они уводят путь из папки.
-fn index_name_ok(name: &str) -> bool {
-    !name.is_empty()
-        && name == name.trim()
-        && name != "."
-        && name != ".."
-        && !name.chars().any(|c| matches!(c, '\\' | '/' | ':'))
-}
-
 /// Путь действия, который сейчас существует: открывать и показывать нечего,
 /// если файл уже удалён или переименован.
 fn existing_action_path(path: &str) -> Result<PathBuf, String> {
@@ -561,7 +573,7 @@ fn get_file_path(
 
     check_folder_id(&index, folder_id)?;
 
-    if !index_name_ok(&file_name) {
+    if !valid_path_segment(&file_name) {
         return Err(format!("Недопустимое имя файла: «{file_name}»"));
     }
     if !index.has_file(folder_id, &file_name) {
@@ -794,18 +806,29 @@ mod tests {
         );
     }
 
+    /// Валидатор сегмента пути один на ядро: те же правила, что у
+    /// `real_path_of` и `get_file_path`.
     #[test]
-    fn index_name_validation_rejects_dots_slashes_and_spaces() {
-        assert!(index_name_ok("a.txt"));
-        assert!(index_name_ok("a b.txt"), "пробелы внутри имени легальны");
-        assert!(!index_name_ok(""), "пустое имя недопустимо");
-        assert!(!index_name_ok("."));
-        assert!(!index_name_ok(".."));
-        assert!(!index_name_ok("a\\b"));
-        assert!(!index_name_ok("a/b"));
-        assert!(!index_name_ok("x:y"));
-        assert!(!index_name_ok(" a.txt"), "пробел в начале не обрезается");
-        assert!(!index_name_ok("a.txt "), "пробел в конце не обрезается");
+    fn path_segment_validation_rejects_dots_slashes_and_spaces() {
+        assert!(valid_path_segment("a.txt"));
+        assert!(
+            valid_path_segment("a b.txt"),
+            "пробелы внутри имени легальны"
+        );
+        assert!(!valid_path_segment(""), "пустое имя недопустимо");
+        assert!(!valid_path_segment("."));
+        assert!(!valid_path_segment(".."));
+        assert!(!valid_path_segment("a\\b"));
+        assert!(!valid_path_segment("a/b"));
+        assert!(!valid_path_segment("x:y"));
+        assert!(
+            !valid_path_segment(" a.txt"),
+            "пробел в начале не обрезается"
+        );
+        assert!(
+            !valid_path_segment("a.txt "),
+            "пробел в конце не обрезается"
+        );
     }
 
     #[test]
@@ -824,9 +847,19 @@ mod tests {
 
     #[test]
     fn action_path_rejects_relative_and_drive_root() {
+        // Временная папка теста, а не жёстко прописанный C:\Temp: чистый клон
+        // не обязан иметь чужие каталоги, и тест не должен от них зависеть.
+        let dir = crate::files::test_dir();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, b"data").expect("файл создаётся");
+        let valid = file.to_string_lossy().into_owned();
         assert!(
-            action_path("C:\\Temp\\woozzytree-delete-test\\a.txt").is_ok(),
+            action_path(&valid).is_ok(),
             "абсолютный путь файла допустим"
+        );
+        assert!(
+            action_path(&dir.path().join("нет-папки").join("a.txt").to_string_lossy()).is_err(),
+            "путь в несуществующей папке отвергается"
         );
         assert!(
             action_path("относительный\\файл.txt").is_err(),
@@ -840,6 +873,19 @@ mod tests {
         assert!(
             action_path("D:/").is_err(),
             "корень диска с другим слэшем тоже"
+        );
+    }
+
+    /// Лимит страницы файлов: окно не может запросить больше защиты IPC.
+    #[test]
+    fn files_page_limit_is_clamped() {
+        assert_eq!(files_page_limit(0), 0);
+        assert_eq!(files_page_limit(2_000), 2_000);
+        assert_eq!(files_page_limit(FILES_ROWS_LIMIT), FILES_ROWS_LIMIT);
+        assert_eq!(
+            files_page_limit(FILES_ROWS_LIMIT * 3),
+            FILES_ROWS_LIMIT,
+            "запрос больше лимита урезается до защиты IPC"
         );
     }
 

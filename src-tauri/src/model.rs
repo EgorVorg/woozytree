@@ -34,6 +34,13 @@ pub struct FileMeta {
     pub size_logical: u64, // фактический размер
     pub modified: i64,     // время изменения, Unix-мс
     pub file_key: FileKey,
+    /// Имя — короткий DOS-алиас (8.3), а не длинное имя Win32.
+    ///
+    /// У NTFS-записи бывает несколько `$FILE_NAME` (Win32, DOS, POSIX); DOS-имя
+    /// вида `PROGRA~1` — второе имя того же файла. Для таблицы это отдельная
+    /// строка с подписью «короткое имя», а не «жёсткая ссылка», и безвозвратно
+    /// удалять её нельзя: исчез бы единственный файл.
+    pub is_alias: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -67,6 +74,7 @@ pub struct FileRow {
     pub modified: i64,          // Unix мс
     pub percent_of_parent: f32, // доля от размера родителя, 0.0..=1.0
     pub hard_linked: bool,      // true у повторных ссылок (в итоги не входят)
+    pub is_alias: bool,         // true у короткого DOS-имени (8.3) того же файла
 }
 
 /// Колонка, по которой сортируется таблица файлов.
@@ -198,6 +206,7 @@ pub struct SearchRow {
     pub size_logical: u64,
     pub modified: i64,
     pub hard_linked: bool,
+    pub is_alias: bool,
 }
 
 /// DTO для фронтенда: страница результатов поиска (`search_files`).

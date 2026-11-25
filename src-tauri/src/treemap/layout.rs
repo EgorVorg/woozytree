@@ -457,7 +457,9 @@ fn children(
             for row in
                 index.child_files(folder, FileSort::SizeOnDisk, true, 0, file_count, size_mode)
             {
-                if row.hard_linked {
+                if row.hard_linked || row.is_alias {
+                    // Дубликат жёсткой ссылки и короткое DOS-имя не задваивают
+                    // занятое место — на карте им делать нечего.
                     continue;
                 }
                 let size = size_mode.size(row.size_on_disk, row.size_logical);
@@ -546,6 +548,7 @@ mod tests {
                 volume_serial: 1,
                 file_index,
             },
+            is_alias: false,
         }
     }
 
@@ -561,6 +564,7 @@ mod tests {
                 volume_serial: 1,
                 file_index,
             },
+            is_alias: false,
         }
     }
 
@@ -955,8 +959,9 @@ mod tests {
         assert_eq!(after.folder_count, before.folder_count);
     }
 
-    /// «Файлы на карте» выключены — в выдаче только папки; файлы не подмешиваются
-    /// даже в «прочее», а карта по-прежнему покрывает контейнер.
+    /// «Файлы на карте» выключены — на карте только папки. Мелочь папок
+    /// по-прежнему собирается в сводную плитку «прочее» (is_dir = false), но
+    /// это единственная не-папка: настоящие файлы не подмешиваются даже в неё.
     #[test]
     fn include_files_false_shows_only_folders() {
         let mut index = ScanIndex::new("C:");
@@ -964,6 +969,12 @@ mod tests {
         let docs = index.folder(root, "Документы");
         index.add_file(docs, meta("a.bin", 2_000, 1));
         index.add_file(docs, meta("b.bin", 1_000, 2));
+        // Несколько мелких папок: каждая меньше 1 % кандидатов, поэтому они
+        // складываются в сводную плитку «прочее», а не показываются отдельно.
+        for position in 0..120u64 {
+            let small = index.folder(root, &format!("мелкая-{position:03}"));
+            index.add_file(small, meta("one.bin", 1, 100 + position));
+        }
         for position in 0..3u64 {
             index.add_file(
                 root,
@@ -981,19 +992,38 @@ mod tests {
         );
 
         let folders_only = treemap_for_folder(&index, root, 100, SizeMode::OnDisk, false, 0);
+        // Сводная плитка — не папка по контракту DTO, поэтому проверяем не
+        // `all(is_dir)`, а «все не-папки — это только сводная плитка».
+        let not_folders: Vec<&TreemapRect> =
+            folders_only.iter().filter(|rect| !rect.is_dir).collect();
+        assert_eq!(
+            not_folders.len(),
+            1,
+            "единственная не-папка — сводная плитка: {folders_only:?}"
+        );
+        assert_eq!(not_folders[0].name, "прочее");
+        assert_eq!(not_folders[0].id, 0);
         assert!(
-            folders_only.iter().all(|rect| rect.is_dir),
-            "при include_files=false на карте только папки: {folders_only:?}"
+            folders_only
+                .iter()
+                .all(|rect| rect.is_dir || rect.name == "прочее"),
+            "файловых плиток, кроме сводной, быть не должно: {folders_only:?}"
         );
         assert!(
             folders_only
                 .iter()
                 .any(|rect| rect.is_dir && rect.id == u64::from(docs)),
-            "папка обязана остаться: {folders_only:?}"
+            "крупная папка обязана остаться: {folders_only:?}"
         );
         assert!(
-            folders_only.iter().all(|rect| rect.name != "прочее"),
-            "файлы не должны попадать даже в «прочее»: {folders_only:?}"
+            folders_only.iter().all(|rect| rect.name != "root-0.bin"),
+            "настоящие файлы не должны попадать на карту: {folders_only:?}"
+        );
+        // Мелкие папки в сводную плитку попасть могут, а их *файлы* — нет.
+        let other = not_folders[0];
+        assert_eq!(
+            other.size, 120,
+            "в «прочее» — только 120 байт мелких папок, без файлов корня"
         );
         let covered: f64 = folders_only.iter().map(|rect| rect.w * rect.h).sum();
         assert!(

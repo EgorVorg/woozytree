@@ -32,8 +32,15 @@ use crate::scan::walk::walk;
 // здесь он реэкспортируется, чтобы прежние пути `scan::ScanTarget` работали.
 pub use crate::model::ScanTarget;
 
-/// Сколько самых тяжёлых папок корня показывать в топе.
-const TOP_FOLDERS_LIMIT: usize = 20;
+/// Сколько дочерних папок корня отдавать в живом топе как кандидатов.
+///
+/// Окно показывает топ-20, но сортирует его по выбранному режиму размера
+/// («на диске» или «фактический»). Если ядро пришлёт ровно 20 папок,
+/// отобранных по занятому месту, папка с большим фактическим размером, но
+/// скромным занятым может не попасть в список вовсе. Поэтому кандидатов
+/// больше — 100: их хватает, чтобы топ-20 по любому режиму был честным, а
+/// JSON живого события остаётся небольшим.
+const TOP_FOLDER_CANDIDATES: usize = 100;
 
 /// Период живых событий (топ папок и карта) в приложении — раз в секунду.
 ///
@@ -44,6 +51,29 @@ const LIVE_INTERVAL: Duration = Duration::from_secs(1);
 /// Бюджет прямоугольников живой карты: столько же отдаёт команда `get_treemap`
 /// для уровня корня. Больше — дороже JSON и отрисовка, меньше — теряется детализация.
 const LIVE_TREEMAP_RECTS: usize = 2000;
+
+/// Настройки отображения, зафиксированные на момент старта сканирования.
+///
+/// Настройки живут на фронтенде, но живую карту строит ядро по событиям скана.
+/// Снимок передаётся в `start_scan`: без него живая карта рисовалась бы с
+/// параметрами по умолчанию (размер на диске, файлы видны, без порога), а
+/// пользователь видел бы одно, пока идёт скан, и другое — после него.
+#[derive(Debug, Clone, Copy)]
+pub struct DisplayOptions {
+    pub size_mode: SizeMode,
+    pub include_files: bool,
+    pub min_tile_bytes: u64,
+}
+
+impl Default for DisplayOptions {
+    fn default() -> DisplayOptions {
+        DisplayOptions {
+            size_mode: SizeMode::OnDisk,
+            include_files: true,
+            min_tile_bytes: 0,
+        }
+    }
+}
 
 /// Приёмник событий сканирования (в приложении — отправка в окно).
 pub trait ScanSink {
@@ -60,13 +90,16 @@ pub trait ScanSink {
 struct LiveEmitter {
     interval: Duration,
     last_emit: Instant,
+    /// Снимок настроек отображения на старте скана: живая карта строится по нему.
+    display: DisplayOptions,
 }
 
 impl LiveEmitter {
-    fn new(interval: Duration) -> LiveEmitter {
+    fn new(interval: Duration, display: DisplayOptions) -> LiveEmitter {
         LiveEmitter {
             interval,
             last_emit: Instant::now(),
+            display,
         }
     }
 
@@ -91,33 +124,36 @@ impl LiveEmitter {
     fn emit(&mut self, sink: &mut dyn ScanSink, index: &ScanIndex) {
         let rows = top_rows(index);
         sink.top_folders(&rows);
-        sink.treemap(&live_treemap(index));
+        sink.treemap(&live_treemap(index, self.display));
         self.last_emit = Instant::now();
     }
 }
 
 /// Живая карта корня сканирования: та же раскладка, что отдаёт `get_treemap`.
 ///
-/// Живые события не знают настроек отображения (они живут на фронтенде), поэтому
-/// срез строится с параметрами по умолчанию: размер на диске, файлы видны, без
-/// порога. После завершения скана карта перезапрашивается командой с настройками.
-fn live_treemap(index: &ScanIndex) -> Vec<TreemapRect> {
+/// Параметры отображения — снимок [`DisplayOptions`] со старта скана: живая
+/// карта уважает выбранный размер, скрытие файлов и порог мелочи. После
+/// завершения скана карта всё равно перезапрашивается командой с актуальными
+/// настройками (они могли измениться во время скана).
+fn live_treemap(index: &ScanIndex, display: DisplayOptions) -> Vec<TreemapRect> {
     crate::treemap::layout::treemap_for_folder(
         index,
         index.root(),
         LIVE_TREEMAP_RECTS,
-        SizeMode::OnDisk,
-        true,
-        0,
+        display.size_mode,
+        display.include_files,
+        display.min_tile_bytes,
     )
 }
 
-/// Самые тяжёлые дочерние папки корня — то, что уходит в `sink.top_folders`.
+/// Дочерние папки корня для живого топа: кандидаты по занятому месту.
+///
+/// Окно само выбирает из них топ-20 по выбранному режиму размера.
 fn top_rows(index: &ScanIndex) -> Vec<FolderSummary> {
     index
         .child_folders(index.root())
         .into_iter()
-        .take(TOP_FOLDERS_LIMIT)
+        .take(TOP_FOLDER_CANDIDATES)
         .collect()
 }
 
@@ -182,7 +218,21 @@ pub fn run_scan(
     sink: &mut dyn ScanSink,
     cancel: &AtomicBool,
 ) -> Result<ScanTotals, ScanError> {
-    run_scan_with_interval(target, index, sink, cancel, LIVE_INTERVAL)
+    run_scan_with_display(target, index, sink, cancel, DisplayOptions::default())
+}
+
+/// [`run_scan`] со снимком настроек отображения для живых событий.
+///
+/// Приложение передаёт сюда настройки со старта скана: живая карта и топ
+/// строятся по ним, а не по значениям по умолчанию.
+pub fn run_scan_with_display(
+    target: &ScanTarget,
+    index: &mut ScanIndex,
+    sink: &mut dyn ScanSink,
+    cancel: &AtomicBool,
+    display: DisplayOptions,
+) -> Result<ScanTotals, ScanError> {
+    run_scan_with_interval_display(target, index, sink, cancel, LIVE_INTERVAL, display)
 }
 
 /// Сканирование нескольких корней в подпапки корня индекса («Все диски»).
@@ -204,11 +254,19 @@ pub fn run_scan_all(
     sink: &mut dyn ScanSink,
     cancel: &AtomicBool,
 ) -> Result<ScanTotals, ScanError> {
-    run_scan_all_with_interval(index, roots, sink, cancel, LIVE_INTERVAL)
+    run_scan_all_with_interval_display(
+        index,
+        roots,
+        sink,
+        cancel,
+        LIVE_INTERVAL,
+        DisplayOptions::default(),
+    )
 }
 
 /// `run_scan` с явным периодом живых событий: тесты передают `Duration::ZERO`
 /// и получают топ/карту на каждом батче, не дожидаясь секунды.
+#[cfg(test)]
 fn run_scan_with_interval(
     target: &ScanTarget,
     index: &mut ScanIndex,
@@ -216,7 +274,26 @@ fn run_scan_with_interval(
     cancel: &AtomicBool,
     live_interval: Duration,
 ) -> Result<ScanTotals, ScanError> {
-    let mut live = LiveEmitter::new(live_interval);
+    run_scan_with_interval_display(
+        target,
+        index,
+        sink,
+        cancel,
+        live_interval,
+        DisplayOptions::default(),
+    )
+}
+
+/// [`run_scan_with_interval`] со снимком настроек отображения.
+fn run_scan_with_interval_display(
+    target: &ScanTarget,
+    index: &mut ScanIndex,
+    sink: &mut dyn ScanSink,
+    cancel: &AtomicBool,
+    live_interval: Duration,
+    display: DisplayOptions,
+) -> Result<ScanTotals, ScanError> {
+    let mut live = LiveEmitter::new(live_interval, display);
 
     // «Все диски» — не один движок, а последовательность томов: каждый том
     // сканируется в свою подпапку, поэтому дальше идёт отдельный путь.
@@ -225,7 +302,14 @@ fn run_scan_with_interval(
             .iter()
             .map(|letter| (drive_folder_name(letter), ScanTarget::Drive(letter.clone())))
             .collect();
-        return run_scan_all_with_interval(index, &roots, sink, cancel, live_interval);
+        return run_scan_all_with_interval_display(
+            index,
+            &roots,
+            sink,
+            cancel,
+            live_interval,
+            display,
+        );
     }
 
     let into = index.root();
@@ -233,10 +317,11 @@ fn run_scan_with_interval(
     let result = scan_one(target, index, into, cancel, &mut report);
     drop(report);
 
-    finish_scan(result, index, sink, cancel)
+    finish_scan(result, index, sink, cancel, display)
 }
 
 /// `run_scan_all` с явным периодом живых событий (см. [`run_scan_with_interval`]).
+#[cfg(test)]
 fn run_scan_all_with_interval(
     index: &mut ScanIndex,
     roots: &[(String, ScanTarget)],
@@ -244,8 +329,27 @@ fn run_scan_all_with_interval(
     cancel: &AtomicBool,
     live_interval: Duration,
 ) -> Result<ScanTotals, ScanError> {
+    run_scan_all_with_interval_display(
+        index,
+        roots,
+        sink,
+        cancel,
+        live_interval,
+        DisplayOptions::default(),
+    )
+}
+
+/// [`run_scan_all_with_interval`] со снимком настроек отображения.
+fn run_scan_all_with_interval_display(
+    index: &mut ScanIndex,
+    roots: &[(String, ScanTarget)],
+    sink: &mut dyn ScanSink,
+    cancel: &AtomicBool,
+    live_interval: Duration,
+    display: DisplayOptions,
+) -> Result<ScanTotals, ScanError> {
     let started = Instant::now();
-    let mut live = LiveEmitter::new(live_interval);
+    let mut live = LiveEmitter::new(live_interval, display);
     let mut totals = ScanTotals {
         files: 0,
         folders: 0,
@@ -320,7 +424,7 @@ fn run_scan_all_with_interval(
 
     totals.cancelled = cancel.load(Ordering::Relaxed);
     totals.elapsed_ms = started.elapsed().as_millis() as u64;
-    finish_scan(Ok(totals), index, sink, cancel)
+    finish_scan(Ok(totals), index, sink, cancel, display)
 }
 
 /// Итоговые события сканирования: флаг частичности, топ, карта и `done`.
@@ -329,6 +433,7 @@ fn finish_scan(
     index: &ScanIndex,
     sink: &mut dyn ScanSink,
     cancel: &AtomicBool,
+    display: DisplayOptions,
 ) -> Result<ScanTotals, ScanError> {
     match result {
         Ok(mut totals) => {
@@ -338,7 +443,7 @@ fn finish_scan(
             // Итоговые события: топ и карта — ещё раз, по завершении.
             let rows = top_rows(index);
             sink.top_folders(&rows);
-            sink.treemap(&live_treemap(index));
+            sink.treemap(&live_treemap(index, display));
             sink.done(Ok(&totals));
             Ok(totals)
         }
@@ -736,6 +841,77 @@ mod tests {
                 .any(|row| row.name == "с данными" && row.file_count == 1000)),
             "живой топ обязан содержать отсканированную папку: {:?}",
             sink.tops
+        );
+    }
+
+    #[test]
+    fn live_treemap_follows_display_options_snapshot() {
+        // Настройки на старте скана: фактический размер, файлы на карте скрыты.
+        // Живая и итоговая карта обязаны строиться по этому снимку, а не по
+        // умолчаниям: иначе во время скана пользователь видел бы одно, а после —
+        // другое.
+        let dir = test_dir();
+        let sub = dir.path().join("папка");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("внутри.bin"), [1u8; 32]).unwrap();
+        std::fs::write(dir.path().join("файл.bin"), [2u8; 64]).unwrap();
+
+        let mut index = ScanIndex::new("folder");
+        let cancel = AtomicBool::new(false);
+        let mut sink = RecordingSink::default();
+        let display = DisplayOptions {
+            size_mode: SizeMode::Logical,
+            include_files: false,
+            min_tile_bytes: 0,
+        };
+        run_scan_with_display(
+            &ScanTarget::Folder(dir.path().to_path_buf()),
+            &mut index,
+            &mut sink,
+            &cancel,
+            display,
+        )
+        .expect("сканирование папки должно завершиться без ошибки");
+
+        let rects = sink.treemaps.last().expect("итоговая карта обязана прийти");
+        assert!(
+            !rects.is_empty(),
+            "у папки с файлом и подпапкой карта не пустая"
+        );
+        assert!(
+            rects
+                .iter()
+                .all(|rect| rect.is_dir || rect.name == "прочее"),
+            "при скрытых файлах на карте только папки (и сводная плитка): {rects:?}"
+        );
+        // В фактическом режиме размер плитки — логический (32 байта), а не
+        // занятый на диске.
+        let nested = rects
+            .iter()
+            .find(|rect| rect.name == "папка")
+            .expect("подпапка обязана быть плиткой");
+        assert_eq!(nested.size, 32, "размер плитки — фактический: {rects:?}");
+    }
+
+    /// Живой топ отдаёт больше 20 кандидатов: окно выбирает из них топ-20 по
+    /// выбранному режиму размера, а не только по занятому месту.
+    #[test]
+    fn top_rows_sends_more_candidates_than_the_window_shows() {
+        let mut index = ScanIndex::new("C:");
+        let root = index.root();
+        for position in 0..(TOP_FOLDER_CANDIDATES + 20) {
+            index.folder(root, &format!("папка-{position:03}"));
+        }
+
+        let rows = top_rows(&index);
+        assert_eq!(
+            rows.len(),
+            TOP_FOLDER_CANDIDATES,
+            "ядро обязано присылать запас кандидатов для пересортировки"
+        );
+        assert!(
+            TOP_FOLDER_CANDIDATES > 20,
+            "кандидатов заведомо больше, чем строк в таблице"
         );
     }
 

@@ -31,6 +31,9 @@ struct FileRecord {
     /// списка и списков папок (в отладочных сборках).
     parent: FolderId,
     hard_linked: bool,
+    /// Имя — короткий DOS-алиас (8.3): то же, что `hard_linked` для запрета
+    /// безвозвратного удаления, но с отдельной подписью в таблице.
+    is_alias: bool,
 }
 
 struct Node {
@@ -82,12 +85,14 @@ fn is_drive_segment(name: &str) -> bool {
 
 /// Годится ли имя из индекса как звено реального пути.
 ///
-/// Индекс хранит имена, а не пути: имя `..` или с обратным слэшом/двоеточием
-/// увело бы склейку из папки (и `remove_dir_all` по такому «пути» стёр бы
-/// чужой каталог). Поэтому такие имена реального пути не дают вовсе, а команды
-/// действий отвергают пустой путь. Пробелы по краям не обрезаются: «a.txt » —
-/// другое имя, чем «a.txt», и молча менять его нельзя.
-fn valid_path_segment(name: &str) -> bool {
+/// Одна проверка на два вызова: [`ScanIndex::real_path_of`] (имена папок из
+/// MFT) и команду `get_file_path` (имя файла из окна). Индекс хранит имена, а не
+/// пути: имя `..` или с обратным слэшом/двоеточием увело бы склейку из папки (и
+/// `remove_dir_all` по такому «пути» стёр бы чужой каталог). Поэтому такие имена
+/// реального пути не дают вовсе, а команды действий отвергают пустой путь.
+/// Пробелы по краям не обрезаются: «a.txt » — другое имя, чем «a.txt», и молча
+/// менять его нельзя.
+pub(crate) fn valid_path_segment(name: &str) -> bool {
     !name.is_empty()
         && name == name.trim()
         && name != "."
@@ -515,6 +520,7 @@ impl ScanIndex {
             size_logical,
             modified,
             file_key,
+            is_alias,
         } = meta;
         let outcome = if self.seen_files.insert(file_key, ()).is_some() {
             AddOutcome::HardLinkDuplicate
@@ -533,6 +539,7 @@ impl ScanIndex {
             modified,
             parent,
             hard_linked: !counted,
+            is_alias,
         });
         self.nodes[parent as usize].files.push(position);
 
@@ -552,6 +559,16 @@ impl ScanIndex {
 
     pub fn folder_totals(&self, id: FolderId) -> FolderTotals {
         self.nodes[id as usize].totals.clone()
+    }
+
+    /// Есть ли папка с таким id в индексе.
+    ///
+    /// Идентификаторы выдаются по порядку (0 — корень), но проверять диапазон
+    /// «id <= folder_count» недостаточно: это неявная связь между счётчиком и
+    /// нумерацией. Явная проверка существования узла не паникует на чужом id и
+    /// не зависит от того, как считается `folder_count`.
+    pub fn has_folder(&self, id: FolderId) -> bool {
+        (id as usize) < self.nodes.len()
     }
 
     /// Число файлов-ссылок непосредственно в папке — для пагинации таблицы.
@@ -618,8 +635,9 @@ impl ScanIndex {
                 let file_size = size_mode.size(file.size_on_disk, file.size_logical);
                 // У дубликата жёсткой ссылки, чья первая копия лежит в другой
                 // папке, размер не входит в итог этой папки — отношение могло бы
-                // превысить 1.0. Контракт DTO — 0.0..=1.0, его и держим.
-                let percent_of_parent = if parent_size == 0 {
+                // превысить 1.0. Такой строке честно показываем 0.0: её вклад в
+                // занятое место папки — ноль, а не «100 % родителя».
+                let percent_of_parent = if parent_size == 0 || file.hard_linked {
                     0.0
                 } else {
                     (file_size as f32 / parent_size as f32).min(1.0)
@@ -631,6 +649,7 @@ impl ScanIndex {
                     modified: file.modified,
                     percent_of_parent,
                     hard_linked: file.hard_linked,
+                    is_alias: file.is_alias,
                 }
             })
             .collect()
@@ -748,6 +767,7 @@ impl ScanIndex {
                     size_logical: file.size_logical,
                     modified: file.modified,
                     hard_linked: file.hard_linked,
+                    is_alias: file.is_alias,
                 }
             })
             .collect();
@@ -887,6 +907,25 @@ mod tests {
         modified: i64,
         file_index: u64,
     ) -> FileMeta {
+        meta_alias(
+            name,
+            size_on_disk,
+            size_logical,
+            modified,
+            file_index,
+            false,
+        )
+    }
+
+    /// Файл, у которого имя — короткий DOS-алиас (8.3).
+    fn meta_alias(
+        name: &str,
+        size_on_disk: u64,
+        size_logical: u64,
+        modified: i64,
+        file_index: u64,
+        is_alias: bool,
+    ) -> FileMeta {
         FileMeta {
             name: name.to_string(),
             size_on_disk,
@@ -896,6 +935,7 @@ mod tests {
                 volume_serial: 1,
                 file_index,
             },
+            is_alias,
         }
     }
 
@@ -1356,11 +1396,10 @@ mod tests {
         );
     }
 
-    /// Дубликат жёсткой ссылки, чья первая копия лежит в другой папке: размер
-    /// второй ссылки не входит в итог этой папки, поэтому доля от родителя
-    /// арифметически превысила бы 1.0. Инвариант DTO — 0.0..=1.0, его держим.
+    /// Дубликат жёсткой ссылки — не вклад в занятое место папки. Строка видна
+    /// в таблице, но честно показывает 0.0 %, а не «100 % родителя».
     #[test]
-    fn hard_linked_percent_stays_within_one() {
+    fn hard_linked_rows_show_zero_percent() {
         let mut index = ScanIndex::new("C:");
         let root = index.root();
         let first = index.folder(root, "first");
@@ -1380,11 +1419,56 @@ mod tests {
         let alias = rows.iter().find(|row| row.name == "alias.bin").unwrap();
         assert!(alias.hard_linked);
         assert_eq!(
-            alias.percent_of_parent, 1.0,
-            "доля ограничена единицей: иначе полоска в UI вылезет за строку"
+            alias.percent_of_parent, 0.0,
+            "у дубликата жёсткой ссылки доля — 0.0: его вклад в папку нулевой"
         );
         let small = rows.iter().find(|row| row.name == "small.bin").unwrap();
         assert_eq!(small.percent_of_parent, 0.1);
+    }
+
+    /// Короткое DOS-имя (8.3) — отдельная строка с собственным признаком
+    /// `is_alias`: подпись в таблице другая, а безвозвратное удаление запрещено
+    /// так же, как для жёсткой ссылки. Размер такого имени в итоги не входит.
+    #[test]
+    fn dos_alias_rows_are_marked_separately() {
+        let mut index = ScanIndex::new("C:");
+        let root = index.root();
+        let folder = index.folder(root, "links");
+
+        assert!(matches!(
+            index.add_file(folder, meta("Program Files", 0, 7)),
+            AddOutcome::Counted
+        ));
+        assert!(matches!(
+            index.add_file(folder, meta_alias("PROGRA~1", 0, 0, 0, 7, true),),
+            AddOutcome::HardLinkDuplicate
+        ));
+
+        let rows = index.child_files(folder, FileSort::Name, false, 0, 10, SizeMode::OnDisk);
+        let long = rows.iter().find(|row| row.name == "Program Files").unwrap();
+        let short = rows.iter().find(|row| row.name == "PROGRA~1").unwrap();
+        assert!(!long.is_alias, "длинное имя — не алиас");
+        assert!(
+            short.is_alias,
+            "DOS-имя обязано нести отдельный признак, а не только hard_linked"
+        );
+        assert!(short.hard_linked, "размер алиаса не входит в итоги");
+        assert_eq!(short.percent_of_parent, 0.0);
+        assert_eq!(index.folder_totals(folder).file_count, 2);
+    }
+
+    /// Явная проверка существования папки не паникует на чужом id и не путает
+    /// «id меньше числа папок» с «узел есть».
+    #[test]
+    fn has_folder_checks_existing_node() {
+        let mut index = ScanIndex::new("C:");
+        let root = index.root();
+        let child = index.folder(root, "child");
+
+        assert!(index.has_folder(root));
+        assert!(index.has_folder(child));
+        assert!(!index.has_folder(child + 1));
+        assert!(!index.has_folder(9999));
     }
 
     /// Поиск: 30 файлов с разными именами, размерами и датами — проверяем
@@ -1927,5 +2011,36 @@ mod tests {
         let empty = index.folder(root, "empty");
         assert!(index.types_treemap(empty, 10, SizeMode::OnDisk).is_empty());
         assert!(index.types_treemap(root, 0, SizeMode::OnDisk).is_empty());
+    }
+
+    /// Карта типов в режиме «фактический»: площадь и порядок плиток считаются
+    /// по логическому размеру, а не по занятому месту. У расширений размеры
+    /// намеренно противоположны, чтобы режимы дали разные первые плитки.
+    #[test]
+    fn types_treemap_follows_logical_size_mode() {
+        let mut index = ScanIndex::new("C:");
+        let root = index.root();
+        // disk / logical: txt сжат сильно, bin — слабо.
+        index.add_file(root, meta_full("a.txt", 100, 900, 0, 1));
+        index.add_file(root, meta_full("b.bin", 900, 100, 0, 2));
+        assert_eq!(index.folder_totals(root).size_on_disk, 1_000);
+        assert_eq!(index.folder_totals(root).size_logical, 1_000);
+
+        let disk = index.types_treemap(root, 10, SizeMode::OnDisk);
+        assert_eq!(disk[0].name, "bin", "на диске крупнее bin: {disk:?}");
+        assert_eq!(disk[0].size, 900);
+        assert!((disk[0].w * disk[0].h - 0.9).abs() < 1e-9);
+        assert_eq!(disk[1].name, "txt");
+        assert_eq!(disk[1].size, 100);
+
+        let logical = index.types_treemap(root, 10, SizeMode::Logical);
+        assert_eq!(
+            logical[0].name, "txt",
+            "фактически крупнее txt: {logical:?}"
+        );
+        assert_eq!(logical[0].size, 900);
+        assert!((logical[0].w * logical[0].h - 0.9).abs() < 1e-9);
+        assert_eq!(logical[1].name, "bin");
+        assert_eq!(logical[1].size, 100);
     }
 }

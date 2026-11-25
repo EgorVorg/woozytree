@@ -89,6 +89,8 @@ pub struct MftFileInfo {
     /// `file_index` — номер записи MFT, `volume_serial` заполняет сканер.
     pub file_key: FileKey,
     pub is_directory: bool,
+    /// Имя — короткий DOS-алиас (namespace 2): `PROGRA~1`, а не `Program Files`.
+    pub is_alias: bool,
 }
 
 /// Разбивка [`ScanTotals::skipped`] по причинам.
@@ -432,7 +434,8 @@ fn parse_record_with_stride(record: &[u8], stride: usize, buf: &mut Vec<u8>) -> 
 
     // Длинное имя (Win32) ставим впереди короткого DOS-алиаса «8.3»: сканер
     // крепит детей папки к первому имени записи, и дерево должно показывать
-    // «Program Files», а не «PROGRA~1». Оба имени при этом остаются в выдаче.
+    // «Program Files», а не «PROGRA~1». Оба имени при этом остаются в выдаче:
+    // алиас несёт отдельный признак и в таблице подписан «короткое имя».
     names.sort_by_key(|value| value.namespace == 2);
 
     let infos = names
@@ -449,6 +452,9 @@ fn parse_record_with_stride(record: &[u8], stride: usize, buf: &mut Vec<u8>) -> 
                 file_index: record_number,
             },
             is_directory,
+            // Namespace 2 — DOS-алиас (8.3); 3 — Win32 и DOS одним именем, это
+            // обычное длинное имя, а не алиас.
+            is_alias: name.namespace == 2,
         })
         .collect();
 
@@ -808,7 +814,18 @@ impl<'a> TreeBuilder<'a> {
         stream_extra: u64,
         parsed_on_disk: &mut u64,
     ) {
+        // Есть ли у этой записи длинное имя папки: тогда DOS-алиас папки —
+        // лишь второе имя уже созданного узла, а не отдельная папка.
+        let has_long_directory_name = infos.iter().any(|info| info.is_directory && !info.is_alias);
         for mut info in infos {
+            // Папка с длинным именем и DOS-алиасом — один узел дерева, а не
+            // два: короткое имя «PROGRA~1» не должно висеть в дереве и топе
+            // пустой папкой. Дети и так крепятся к длинному имени. Если запись
+            // содержит ТОЛЬКО алиас (длинное имя потеряно), узел создаём —
+            // иначе папка исчезла бы из индекса совсем.
+            if info.is_directory && info.is_alias && has_long_directory_name {
+                continue;
+            }
             info.file_key.volume_serial = volume_serial;
             // Номер записи — её позиция в $MFT: это надёжнее поля 0x2C,
             // которого может не быть в старых версиях NTFS.
@@ -879,6 +896,7 @@ impl<'a> TreeBuilder<'a> {
             size_logical,
             modified: entry.modified,
             file_key: entry.file_key.clone(),
+            is_alias: entry.is_alias,
         };
         if matches!(self.index.add_file(parent, meta), AddOutcome::Counted) {
             self.size_on_disk += size_on_disk;
@@ -995,6 +1013,7 @@ fn collect_streams(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{FileSort, SizeMode};
     use crate::scan::test_support::{
         DataSpec, RecordSpec, SAMPLE_FILE_COUNT, SAMPLE_FOLDER_COUNT, SAMPLE_RECORD_COUNT,
         SAMPLE_SIZE_LOGICAL, SAMPLE_SIZE_ON_DISK, SAMPLE_SKIPPED, fixture, make_record, test_dir,
@@ -1128,7 +1147,15 @@ mod tests {
         let infos = parse_record(&record);
         assert_eq!(infos.len(), 2, "оба имени остаются в выдаче");
         assert_eq!(infos[0].name, "Program Files");
+        assert!(
+            !infos[0].is_alias,
+            "длинное имя Win32 не должно помечаться алиасом"
+        );
         assert_eq!(infos[1].name, "PROGRA~1");
+        assert!(
+            infos[1].is_alias,
+            "DOS-имя обязано нести признак is_alias (namespace 2)"
+        );
     }
 
     #[test]
@@ -1315,6 +1342,15 @@ mod tests {
         let names: Vec<&str> = children.iter().map(|child| child.name.as_str()).collect();
         assert!(names.contains(&"Program Files"), "дети корня: {names:?}");
         assert!(names.contains(&"$Recycle.Bin"), "дети корня: {names:?}");
+        assert!(
+            !names.contains(&"PROGRA~1"),
+            "DOS-алиас папки не должен создавать отдельный узел: {names:?}"
+        );
+        assert_eq!(
+            children.len(),
+            4,
+            "в корне четыре настоящие папки, без алиасов: {names:?}"
+        );
         // Дети папки крепятся к длинному имени, а не к DOS-алиасу «PROGRA~1».
         let program_files = children
             .iter()
@@ -1388,6 +1424,99 @@ mod tests {
         assert_eq!(totals.size_on_disk, 4096);
         assert_eq!(totals.files, 2);
         assert_eq!(totals.skipped, 0, "родители разрешимы");
+    }
+
+    #[test]
+    fn test_scan_ntfs_keeps_folder_with_only_dos_alias() {
+        // Запись с одним коротким именем папки (длинное имя потерялось): узел
+        // обязан остаться, иначе папка исчезла бы из индекса совсем.
+        let dir = test_dir();
+        let fixture_path = dir.path().join("only-alias-folder.mft");
+        let mut bytes: Vec<u8> = Vec::new();
+        for _ in 0..ROOT_RECORD {
+            bytes.extend_from_slice(&[0u8; 1024]);
+        }
+        bytes.extend_from_slice(&make_record(
+            RecordSpec::new(5, RECORD_FLAG_IN_USE | RECORD_FLAG_DIRECTORY).name(".", ROOT_RECORD),
+        ));
+        bytes.extend_from_slice(&make_record(
+            RecordSpec::new(6, RECORD_FLAG_IN_USE | RECORD_FLAG_DIRECTORY).name_ns(
+                "ONLYAL~1",
+                ROOT_RECORD,
+                2,
+            ),
+        ));
+        std::fs::write(&fixture_path, &bytes).expect("не удалось записать слепок");
+
+        let reader =
+            VolumeReader::from_fixture(&fixture_path, 1024).expect("слепок должен открываться");
+        let mut index = ScanIndex::new("C:");
+        let cancel = AtomicBool::new(false);
+        let totals = scan_reader_into_root(&reader, &mut index, &cancel, &mut |_, _| {})
+            .expect("сканирование слепка не должно падать");
+
+        assert_eq!(
+            totals.folders, 1,
+            "папка с одним алиасом остаётся в индексе"
+        );
+        let children = index.child_folders(index.root());
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].name, "ONLYAL~1");
+    }
+
+    #[test]
+    fn test_scan_ntfs_marks_dos_alias_rows() {
+        // Один файл с длинным именем и DOS-алиасом 8.3: обе строки видимы, но
+        // алиас помечен отдельно и не задваивает занятое место.
+        let dir = test_dir();
+        let fixture_path = dir.path().join("dos-alias.mft");
+        let mut bytes: Vec<u8> = Vec::new();
+        for _ in 0..ROOT_RECORD {
+            bytes.extend_from_slice(&[0u8; 1024]);
+        }
+        bytes.extend_from_slice(&make_record(
+            RecordSpec::new(5, RECORD_FLAG_IN_USE | RECORD_FLAG_DIRECTORY)
+                .name(".", ROOT_RECORD)
+                .modified_ms(1_700_000_000_000),
+        ));
+        bytes.extend_from_slice(&make_record(
+            RecordSpec::new(6, RECORD_FLAG_IN_USE)
+                .name("Long Name.txt", ROOT_RECORD)
+                .name_ns("LONGNA~1.TXT", ROOT_RECORD, 2)
+                .data(DataSpec::NonResident {
+                    allocated: 4096,
+                    real: 1000,
+                })
+                .modified_ms(1_700_000_000_000),
+        ));
+        std::fs::write(&fixture_path, &bytes).expect("не удалось записать слепок");
+
+        let reader = VolumeReader::from_fixture(&fixture_path, 1024)
+            .expect("слепок с DOS-алиасом должен открываться");
+        let mut index = ScanIndex::new("C:");
+        let cancel = AtomicBool::new(false);
+        let totals = scan_reader_into_root(&reader, &mut index, &cancel, &mut |_, _| {})
+            .expect("сканирование слепка не должно падать");
+
+        assert_eq!(totals.files, 2, "оба имени видны");
+        let root_totals = index.folder_totals(index.root());
+        assert_eq!(root_totals.size_on_disk, 4096, "байты учтены один раз");
+
+        let rows = index.child_files(index.root(), FileSort::Name, false, 0, 10, SizeMode::OnDisk);
+        let long = rows
+            .iter()
+            .find(|row| row.name == "Long Name.txt")
+            .expect("длинное имя обязано быть");
+        let short = rows
+            .iter()
+            .find(|row| row.name == "LONGNA~1.TXT")
+            .expect("DOS-алиас обязан быть");
+        assert!(!long.is_alias && !long.hard_linked);
+        assert!(
+            short.is_alias && short.hard_linked,
+            "алиас помечен и исключён из итогов"
+        );
+        assert_eq!(short.percent_of_parent, 0.0);
     }
 
     #[test]
@@ -1862,6 +1991,7 @@ mod tests {
                     size_logical: entry.size_logical,
                     modified: entry.modified,
                     file_key: entry.file_key,
+                    is_alias: entry.is_alias,
                 },
             );
         }

@@ -142,6 +142,7 @@ fn run_files_bench(count: usize) {
                     volume_serial: 1,
                     file_index: number,
                 },
+                is_alias: false,
             },
         );
     }

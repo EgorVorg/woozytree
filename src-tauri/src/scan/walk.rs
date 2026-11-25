@@ -167,6 +167,9 @@ pub fn walk(
                     size_logical: meta.len(),
                     modified: modified_ms(&meta),
                     file_key,
+                    // Обход идёт по реальным именам каталога: DOS-алиасы он не
+                    // порождает, это свойство разбора $FILE_NAME в MFT.
+                    is_alias: false,
                 },
             );
             // Повторный FileKey — жёсткая ссылка: индекс не задваивает байты,

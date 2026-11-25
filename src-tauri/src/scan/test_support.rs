@@ -29,9 +29,10 @@ pub const SAMPLE_RECORD_COUNT: u64 = 2000;
 /// 9 имён: exe, readme, две у жёсткой ссылки, юникод-файл, ADS-файл,
 /// сирота, `большой.bin` и `last.bin`.
 pub const SAMPLE_FILE_COUNT: u64 = 9;
-/// Папок шесть: `Program Files` и её DOS-алиас `PROGRA~1` сканер создаёт
-/// отдельными узлами (дети при этом крепятся к длинному имени).
-pub const SAMPLE_FOLDER_COUNT: u64 = 6;
+/// Папок пять: `Program Files`, `Users`, `документы`, `$Recycle.Bin` и
+/// `WoozyTree`. DOS-алиас `PROGRA~1` — второе имя `Program Files`, отдельного
+/// узла не создаёт (дети крепятся к длинному имени).
+pub const SAMPLE_FOLDER_COUNT: u64 = 5;
 /// Сумма нерезидентных `$DATA`: 8192 (exe) + 4096 (жёсткая ссылка) + 8192
 /// (юникод) + 4096 (ADS) + 8192 (`большой.bin` из extension-записи) + 4096
 /// (`last.bin`).
@@ -197,14 +198,12 @@ fn sample_records() -> Vec<Vec<u8>> {
             .with_attribute_list()
             .modified_ms(SAMPLE_MODIFIED_MS),
     );
-    records[18] = make_record(
-        RecordSpec::new(18, IN_USE)
-            .base_record(17)
-            .data(DataSpec::NonResident {
-                allocated: 8192,
-                real: 5000,
-            }),
-    );
+    records[18] = make_record(RecordSpec::new(18, IN_USE).base_record(17).data(
+        DataSpec::NonResident {
+            allocated: 8192,
+            real: 5000,
+        },
+    ));
     // №19 — extension-запись с именем: имя теряется (нет разбора $ATTRIBUTE_LIST).
     records[19] = make_record(
         RecordSpec::new(19, IN_USE)
@@ -475,7 +474,11 @@ pub fn make_record(spec: RecordSpec<'_>) -> Vec<u8> {
         let time = unix_ms_to_filetime(modified_ms);
         let value_len = 0x48;
         write_u32(&mut record, off, ATTR_STANDARD_INFORMATION);
-        write_u32(&mut record, off + 0x04, align8(ATTR_HEADER_LEN + value_len) as u32);
+        write_u32(
+            &mut record,
+            off + 0x04,
+            align8(ATTR_HEADER_LEN + value_len) as u32,
+        );
         record[off + 0x08] = 0; // резидентный
         record[off + 0x0A..off + 0x0C].copy_from_slice(&(ATTR_HEADER_LEN as u16).to_le_bytes());
         write_u16(&mut record, off + 0x0E, 1);
@@ -492,7 +495,11 @@ pub fn make_record(spec: RecordSpec<'_>) -> Vec<u8> {
     if spec.attribute_list {
         let value_len = 0x20;
         write_u32(&mut record, off, ATTR_ATTRIBUTE_LIST);
-        write_u32(&mut record, off + 0x04, align8(ATTR_HEADER_LEN + value_len) as u32);
+        write_u32(
+            &mut record,
+            off + 0x04,
+            align8(ATTR_HEADER_LEN + value_len) as u32,
+        );
         record[off + 0x08] = 0;
         write_u16(&mut record, off + 0x0E, 2);
         write_u32(&mut record, off + 0x10, value_len as u32);
@@ -505,7 +512,11 @@ pub fn make_record(spec: RecordSpec<'_>) -> Vec<u8> {
         let units: Vec<u16> = name_spec.name.encode_utf16().collect();
         let value_len = 0x42 + units.len() * 2;
         write_u32(&mut record, off, ATTR_FILE_NAME);
-        write_u32(&mut record, off + 0x04, align8(ATTR_HEADER_LEN + value_len) as u32);
+        write_u32(
+            &mut record,
+            off + 0x04,
+            align8(ATTR_HEADER_LEN + value_len) as u32,
+        );
         record[off + 0x08] = 0; // резидентный
         write_u16(&mut record, off + 0x0E, 3);
         write_u32(&mut record, off + 0x10, value_len as u32);
@@ -542,7 +553,11 @@ pub fn make_record(spec: RecordSpec<'_>) -> Vec<u8> {
         DataSpec::Resident(len) => {
             let value_len = len as usize;
             write_u32(&mut record, off, ATTR_DATA);
-            write_u32(&mut record, off + 0x04, align8(ATTR_HEADER_LEN + value_len) as u32);
+            write_u32(
+                &mut record,
+                off + 0x04,
+                align8(ATTR_HEADER_LEN + value_len) as u32,
+            );
             record[off + 0x08] = 0; // резидентный
             write_u16(&mut record, off + 0x0E, 4);
             write_u32(&mut record, off + 0x10, value_len as u32);
@@ -563,8 +578,7 @@ pub fn make_record(spec: RecordSpec<'_>) -> Vec<u8> {
             write_u64(&mut record, off + 0x28, allocated);
             write_u64(&mut record, off + 0x30, real);
             write_u64(&mut record, off + 0x38, real);
-            record[off + ATTR_NONRESIDENT_HEADER_LEN..off + attr_len]
-                .copy_from_slice(&runlist);
+            record[off + ATTR_NONRESIDENT_HEADER_LEN..off + attr_len].copy_from_slice(&runlist);
             off += align8(attr_len);
         }
     }
