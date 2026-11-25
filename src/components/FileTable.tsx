@@ -26,8 +26,14 @@ import { getFiles } from "@/lib/ipc";
 import type { FileRow, FileSort } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
-/** Размер страницы: столько строк просим у ядра за один раз. */
-const PAGE_SIZE = 10_000;
+/**
+ * Размер страницы: столько строк просим у ядра за один раз.
+ *
+ * 2000, а не 10 000: страница — это один JSON-ответ IPC (~0.36 МБ против
+ * 1.8 МБ), поэтому смена сортировки и вход в папку заметно быстрее, а
+ * «догрузить ещё» срабатывает раньше.
+ */
+const PAGE_SIZE = 2_000;
 /** Высота строки, px: виртуализатор считает позиции по ней. */
 const ROW_HEIGHT = 26;
 /** За сколько строк до конца начинаем догрузку следующей страницы. */
@@ -235,6 +241,10 @@ export default function FileTable({
 
   const firstPending = query.isPending;
   const isEmpty = !firstPending && total === 0;
+  // Строки на экране — прошлый порядок: идёт перезапрос после смены колонки.
+  // Приглушаем их и честно пишем «Сортируем…», чтобы старый порядок не
+  // выдавался за новый.
+  const reordering = query.isPlaceholderData;
   const message = scanning
     ? "Таблица файлов появится после завершения сканирования."
     : firstPending
@@ -292,7 +302,7 @@ export default function FileTable({
               </tr>
             ))}
           </thead>
-          <tbody>
+          <tbody className={cn(reordering && "opacity-60")}>
             {padTop > 0 ? (
               <tr aria-hidden="true">
                 <td colSpan={columns.length} style={{ height: padTop, padding: 0 }} />
@@ -363,13 +373,15 @@ export default function FileTable({
               ? "Ошибка загрузки"
               : firstPending
                 ? "Загружаем файлы…"
-                : isFetchingNextPage
-                  ? "Загружаем следующую страницу…"
-                  : hasNextPage
-                    ? "Прокрутите вниз — догрузим ещё"
-                    : isEmpty
-                      ? "Папка пуста"
-                      : "Это все файлы папки"}
+                : reordering
+                  ? "Сортируем…"
+                  : isFetchingNextPage
+                    ? "Загружаем следующую страницу…"
+                    : hasNextPage
+                      ? "Прокрутите вниз — догрузим ещё"
+                      : isEmpty
+                        ? "Папка пуста"
+                        : "Это все файлы папки"}
         </span>
       </div>
     </section>
