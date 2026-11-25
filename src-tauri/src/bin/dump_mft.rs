@@ -205,7 +205,8 @@ fn run() -> Result<(), String> {
     drop(out);
 
     let bytes_read = read * record_size as u64;
-    let mib_per_second = bytes_read as f64 / (1u64 << 20) as f64 / read_elapsed.as_secs_f64().max(1e-9);
+    let mib_per_second =
+        bytes_read as f64 / (1u64 << 20) as f64 / read_elapsed.as_secs_f64().max(1e-9);
     println!(
         "[dump] прочитано {} записей ({} байт) за {:.3} с ({:.1} МиБ/с)",
         read,

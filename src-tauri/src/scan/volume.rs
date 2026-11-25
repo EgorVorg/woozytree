@@ -144,14 +144,22 @@ impl VolumeReader {
             return Err(ScanError::Parse("нулевой размер записи MFT".into()));
         }
         let file = File::open(path).map_err(|e| {
-            ScanError::Io(format!("не удалось открыть слепок MFT {}: {e}", path.display()))
+            ScanError::Io(format!(
+                "не удалось открыть слепок MFT {}: {e}",
+                path.display()
+            ))
         })?;
         let len = file
             .metadata()
-            .map_err(|e| ScanError::Io(format!("не удалось узнать размер {}: {e}", path.display())))?
+            .map_err(|e| {
+                ScanError::Io(format!("не удалось узнать размер {}: {e}", path.display()))
+            })?
             .len();
         if len == 0 {
-            return Err(ScanError::Parse(format!("слепок MFT {} пуст", path.display())));
+            return Err(ScanError::Parse(format!(
+                "слепок MFT {} пуст",
+                path.display()
+            )));
         }
         if len % record_size as u64 != 0 {
             return Err(ScanError::Parse(format!(
@@ -195,16 +203,9 @@ impl VolumeReader {
         sink: &mut dyn FnMut(&[u8]),
     ) -> Result<u64, ScanError> {
         match &self.source {
-            Source::Fixture {
-                file,
-                record_count,
-            } => read_fixture(
-                file,
-                *record_count,
-                self.record_size,
-                cancel,
-                sink,
-            ),
+            Source::Fixture { file, record_count } => {
+                read_fixture(file, *record_count, self.record_size, cancel, sink)
+            }
             Source::Volume {
                 file,
                 extents,
@@ -569,8 +570,7 @@ fn parse_mft_data(record: &[u8]) -> Result<(Vec<Extent>, u64), ScanError> {
                 )));
             }
             let run_off = u16::from_le_bytes([record[off + 0x20], record[off + 0x21]]) as usize;
-            let real_size =
-                u64::from_le_bytes(record[off + 0x30..off + 0x38].try_into().unwrap());
+            let real_size = u64::from_le_bytes(record[off + 0x30..off + 0x38].try_into().unwrap());
             let runlist_start = off + run_off;
             if run_off < 0x40 || runlist_start >= off + attr_len {
                 return Err(ScanError::Parse(
