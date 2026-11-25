@@ -19,7 +19,7 @@ import {
 import { formatCount, formatPercent, formatSize } from "@/lib/format";
 import { getFileTypes, getTypesTreemap } from "@/lib/ipc";
 import { hit_test } from "@/lib/treemap";
-import type { FileTypeRow, TreemapRect, TypeSort } from "@/lib/types";
+import type { FileTypeRow, SizeMode, TreemapRect, TypeSort } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 /** Бюджет плиток карты типов: крупнейшие расширения; остальные — в таблице. */
@@ -191,6 +191,8 @@ const COLUMNS: readonly ColumnDef[] = [
 export interface FileTypesPanelProps {
   /** Папка, чьи типы показываем: 0 — корень сканирования. */
   folderId: number;
+  /** Настройка отображения: по ней считаются плитки и доля «%». */
+  sizeMode: SizeMode;
   /** Идёт сканирование: индекс ядра ещё не готов, запросы не уходят. */
   scanning: boolean;
   /** Номер скана: входит в ключ кэша, чтобы новый скан не показывал старые типы. */
@@ -206,6 +208,7 @@ export interface FileTypesPanelProps {
  */
 export default function FileTypesPanel({
   folderId,
+  sizeMode,
   scanning,
   scanRun,
 }: FileTypesPanelProps) {
@@ -232,10 +235,11 @@ export default function FileTypesPanel({
   });
 
   // Карта: бюджет плиток и раскладка — в ядре; сортировка таблицы на неё не
-  // влияет, поэтому ключ без `sort`.
+  // влияет, поэтому ключ без `sort`. Режим размера — настройка отображения:
+  // смена перезапрашивает раскладку по выбранному размеру.
   const mapQuery = useQuery({
-    queryKey: ["types_treemap", scanRun, folderId],
-    queryFn: () => getTypesTreemap(folderId, MAX_RECTS),
+    queryKey: ["types_treemap", scanRun, folderId, sizeMode],
+    queryFn: () => getTypesTreemap(folderId, MAX_RECTS, sizeMode),
     enabled: !scanning,
     staleTime: Number.POSITIVE_INFINITY,
   });
@@ -255,6 +259,15 @@ export default function FileTypesPanel({
       ),
     [rows],
   );
+
+  // Размер выбранного режима — база процентов и заливки карты. Сумма строк
+  // равна итогу папки в этом режиме (дубликаты жёстких ссылок не входят ни туда,
+  // ни туда), поэтому доля считается без дополнительного запроса.
+  const selectedTotal = sizeMode === "on_disk" ? totals.disk : totals.logical;
+  const percentOf = (row: FileTypeRow): number => {
+    const value = sizeMode === "on_disk" ? row.size_on_disk : row.size_logical;
+    return selectedTotal > 0 ? Math.min(1, value / selectedTotal) : 0;
+  };
 
   // Размер canvas в CSS-пикселях: devicePixelRatio учитывается при отрисовке.
   useEffect(() => {
@@ -294,9 +307,9 @@ export default function FileTypesPanel({
       rects,
       selected,
       hoveredRect,
-      totals.disk,
+      selectedTotal,
     );
-  }, [size, rects, selected, hoveredRect, totals.disk]);
+  }, [size, rects, selected, hoveredRect, selectedTotal]);
 
   // Выбранная строка могла уехать за пределы прокрутки таблицы — показываем её,
   // прокручивая только контейнер таблицы. `scrollIntoView` здесь не годится:
@@ -370,7 +383,7 @@ export default function FileTypesPanel({
     ? rows.find((row) => row.extension === tile_extension(hoveredRect.name))
     : undefined;
   const hoverShare =
-    hoveredRect && totals.disk > 0 ? hoveredRect.size / totals.disk : 0;
+    hoveredRect && selectedTotal > 0 ? hoveredRect.size / selectedTotal : 0;
   const tooltip = hoveredRect
     ? (() => {
         const tooltipWidth = 220;
@@ -525,7 +538,7 @@ export default function FileTypesPanel({
                       {formatSize(row.size_on_disk)}
                     </td>
                     <td className="px-2 py-1 text-right tabular-nums">
-                      {formatPercent(row.percent_of_parent)}
+                      {formatPercent(percentOf(row))}
                     </td>
                   </tr>
                 );

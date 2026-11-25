@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use woozytree_lib::model::{
     FileKey, FileMeta, FileSort, FolderId, FolderSummary, ScanError, ScanProgress, ScanTotals,
-    SearchQuery, TreemapRect,
+    SearchQuery, SizeMode, TreemapRect,
 };
 use woozytree_lib::scan::index::ScanIndex;
 use woozytree_lib::scan::mft::{ScanDiag, scan_ntfs_reader_diag};
@@ -68,7 +68,9 @@ fn time_pages(index: &ScanIndex, folder: FolderId, count: u32) {
         let mut rows = 0;
         for _ in 0..3 {
             let started = Instant::now();
-            rows = index.child_files(folder, sort, true, 0, 100).len();
+            rows = index
+                .child_files(folder, sort, true, 0, 100, SizeMode::OnDisk)
+                .len();
             best = best.min(started.elapsed());
         }
         println!(
@@ -80,7 +82,14 @@ fn time_pages(index: &ScanIndex, folder: FolderId, count: u32) {
     // весь список папки.
     let offset = (count as usize).saturating_sub(100);
     let started = Instant::now();
-    let rows = index.child_files(folder, FileSort::SizeOnDisk, true, offset, 100);
+    let rows = index.child_files(
+        folder,
+        FileSort::SizeOnDisk,
+        true,
+        offset,
+        100,
+        SizeMode::OnDisk,
+    );
     let elapsed = started.elapsed();
     let sum: u64 = rows.iter().map(|row| row.size_on_disk).sum();
     println!(
@@ -253,7 +262,7 @@ fn bench_treemap(index: &ScanIndex, budget: usize) {
     let mut rects = Vec::new();
     for _ in 0..RUNS {
         let started = Instant::now();
-        rects = treemap_for_folder(index, index.root(), budget);
+        rects = treemap_for_folder(index, index.root(), budget, SizeMode::OnDisk, true, 0);
         let elapsed = started.elapsed();
         best = best.min(elapsed);
         total += elapsed;

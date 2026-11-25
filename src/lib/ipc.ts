@@ -16,6 +16,7 @@ import type {
   ScanTotals,
   SearchPage,
   SearchQuery,
+  SizeMode,
   TreemapRect,
   TypeSort,
 } from "./types";
@@ -57,6 +58,9 @@ export function getChildren(folderId: number): Promise<FolderSummary[]> {
 /**
  * Страница файлов папки: сортировка и срез `offset..offset+limit` — на стороне
  * ядра, окно получает только видимый кусок.
+ *
+ * `sizeMode` — настройка отображения: по ней ядро считает колонку `%` (доля от
+ * выбранного размера родителя). Сортировка по-прежнему любая (`sort`).
  */
 export function getFiles(
   folderId: number,
@@ -64,8 +68,16 @@ export function getFiles(
   desc: boolean,
   offset: number,
   limit: number,
+  sizeMode: SizeMode,
 ): Promise<FilePage> {
-  return invoke<FilePage>("get_files", { folderId, sort, desc, offset, limit });
+  return invoke<FilePage>("get_files", {
+    folderId,
+    sort,
+    desc,
+    offset,
+    limit,
+    sizeMode,
+  });
 }
 
 /** Итоги последнего завершённого сканирования. */
@@ -93,12 +105,25 @@ export function getPathCrumbs(folderId: number): Promise<Crumb[]> {
 /**
  * Прямоугольники карты для папки (нормированные 0..1). `maxRects` — бюджет
  * раскладки, ядро клампит его 20 000.
+ *
+ * Параметры отображения — настройки фронтенда: `sizeMode` (что считать
+ * размером), `includeFiles` (показывать ли файлы) и `minTileBytes` (порог
+ * мелочи: плитки мельче уходят в «прочее»; итоги не меняются).
  */
 export function getTreemap(
   folderId: number,
   maxRects: number,
+  sizeMode: SizeMode,
+  includeFiles: boolean,
+  minTileBytes: number,
 ): Promise<TreemapRect[]> {
-  return invoke<TreemapRect[]>("get_treemap", { folderId, maxRects });
+  return invoke<TreemapRect[]>("get_treemap", {
+    folderId,
+    maxRects,
+    sizeMode,
+    includeFiles,
+    minTileBytes,
+  });
 }
 
 /**
@@ -117,13 +142,19 @@ export function getFileTypes(
 
 /**
  * Плоские плитки карты типов: расширения в нормированном контейнере 0..1.
- * `maxRects` — бюджет раскладки, ядро клампит его 5000.
+ * `maxRects` — бюджет раскладки, ядро клампит его 5000. `sizeMode` — настройка
+ * отображения: порядок и площадь плиток считаются по выбранному размеру.
  */
 export function getTypesTreemap(
   folderId: number,
   maxRects: number,
+  sizeMode: SizeMode,
 ): Promise<TreemapRect[]> {
-  return invoke<TreemapRect[]>("get_types_treemap", { folderId, maxRects });
+  return invoke<TreemapRect[]>("get_types_treemap", {
+    folderId,
+    maxRects,
+    sizeMode,
+  });
 }
 
 export function onProgress(cb: (p: ScanProgress) => void): Promise<UnlistenFn> {

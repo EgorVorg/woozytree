@@ -26,7 +26,7 @@ import {
   formatSize,
 } from "@/lib/format";
 import { getFiles } from "@/lib/ipc";
-import type { DeleteReport, FileRow, FileSort } from "@/lib/types";
+import type { DeleteReport, FileRow, FileSort, SizeMode } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 /**
@@ -49,6 +49,11 @@ const emptyRows: FileRow[] = [];
 /** Числовая колонка: размер в байтах с одним знаком после запятой. */
 function sizeCell(value: number) {
   return <span className="tabular-nums">{formatSize(value)}</span>;
+}
+
+/** Колонка, по которой таблица сортирует по умолчанию в выбранном режиме. */
+function defaultSortColumn(sizeMode: SizeMode): FileSort {
+  return sizeMode === "logical" ? "size_logical" : "size_on_disk";
 }
 
 const columns = columnHelper.columns([
@@ -131,6 +136,8 @@ function SortMark({ direction }: { direction: false | "asc" | "desc" }) {
 export interface FileTableProps {
   /** Папка, чьи файлы показываем; 0 — корень сканирования. */
   folderId: number;
+  /** Настройка отображения: что считать размером (и сортировка по умолчанию). */
+  sizeMode: SizeMode;
   /** Идёт сканирование: индекс ядра ещё недоступен. */
   scanning: boolean;
   /** Номер скана: входит в ключ кэша, чтобы новый скан не показывал старые файлы. */
@@ -149,6 +156,7 @@ export interface FileTableProps {
  */
 export default function FileTable({
   folderId,
+  sizeMode,
   scanning,
   scanRun,
   onFileDeleted,
@@ -156,20 +164,37 @@ export default function FileTable({
   onNotice,
 }: FileTableProps) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
-  const [sorting, setSorting] = useState<SortingState>([
-    { id: "size_on_disk", desc: true },
+  const [sorting, setSorting] = useState<SortingState>(() => [
+    { id: defaultSortColumn(sizeMode), desc: true },
   ]);
   // Файл под правым кликом: меню действий открывается им же.
   const [menuTarget, setMenuTarget] = useState<FileActionTarget | null>(null);
+
+  // Режим размера сменился — колонка «по размеру» следует за ним. Колонку,
+  // выбранную пользователем вручную (имя, дата), не трогаем: клик по заголовку
+  // по-прежнему выбирает любую колонку.
+  useEffect(() => {
+    setSorting((current) => {
+      const first = current[0];
+      if (
+        !first ||
+        (first.id !== "size_on_disk" && first.id !== "size_logical")
+      ) {
+        return current;
+      }
+      const target = defaultSortColumn(sizeMode);
+      return first.id === target ? current : [{ id: target, desc: first.desc }];
+    });
+  }, [sizeMode]);
 
   const first = sorting[0];
   const sort: FileSort = first && is_file_sort(first.id) ? first.id : "size_on_disk";
   const desc = first ? first.desc : true;
 
   const query = useInfiniteQuery({
-    queryKey: ["files", scanRun, folderId, sort, desc],
+    queryKey: ["files", scanRun, folderId, sort, desc, sizeMode],
     queryFn: ({ pageParam }) =>
-      getFiles(folderId, sort, desc, pageParam, PAGE_SIZE),
+      getFiles(folderId, sort, desc, pageParam, PAGE_SIZE, sizeMode),
     initialPageParam: 0,
     getNextPageParam: (lastPage, allPages) => {
       const loaded = allPages.reduce((sum, page) => sum + page.rows.length, 0);

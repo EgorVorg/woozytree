@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use crate::model::{
     FileKey, FileMeta, FileRow, FileSort, FileTypeRow, FolderId, FolderSummary, FolderTotals,
-    SearchQuery, SearchRow, TreemapRect, TypeSort,
+    SearchQuery, SearchRow, SizeMode, TreemapRect, TypeSort,
 };
 use crate::treemap::layout::{Rect, TreemapItem, layout_treemap};
 
@@ -579,6 +579,9 @@ impl ScanIndex {
     /// список — плоские индексы по 4 байта (100 тыс. файлов — 400 КБ копии).
     /// Кэш отсортированных порядков не держим, чтобы не платить памятью за все
     /// папки сразу и не ломать инварианты при живом сканировании.
+    ///
+    /// `size_mode` — настройка отображения: по ней считается колонка `%`
+    /// (доля от выбранного размера родителя), а не только размер строки.
     pub fn child_files(
         &self,
         folder: FolderId,
@@ -586,6 +589,7 @@ impl ScanIndex {
         desc: bool,
         offset: usize,
         limit: usize,
+        size_mode: SizeMode,
     ) -> Vec<FileRow> {
         if limit == 0 {
             return Vec::new();
@@ -603,7 +607,7 @@ impl ScanIndex {
         });
 
         let end = offset.saturating_add(limit).min(order.len());
-        let parent_size = node.totals.size_on_disk;
+        let parent_size = size_mode.size(node.totals.size_on_disk, node.totals.size_logical);
         order[offset..end]
             .iter()
             .map(|&position| {
@@ -611,13 +615,14 @@ impl ScanIndex {
                 // Плоский список и список папки обязаны совпадать: расхождение
                 // означало бы, что страница показывает чужой файл.
                 debug_assert_eq!(file.parent, folder);
+                let file_size = size_mode.size(file.size_on_disk, file.size_logical);
                 // У дубликата жёсткой ссылки, чья первая копия лежит в другой
                 // папке, размер не входит в итог этой папки — отношение могло бы
                 // превысить 1.0. Контракт DTO — 0.0..=1.0, его и держим.
                 let percent_of_parent = if parent_size == 0 {
                     0.0
                 } else {
-                    (file.size_on_disk as f32 / parent_size as f32).min(1.0)
+                    (file_size as f32 / parent_size as f32).min(1.0)
                 };
                 FileRow {
                     name: file.name.clone(),
@@ -650,6 +655,7 @@ impl ScanIndex {
                     id: child,
                     name: child_node.name.clone(),
                     size_on_disk: child_node.totals.size_on_disk,
+                    size_logical: child_node.totals.size_logical,
                     file_count: child_node.totals.file_count,
                     folder_count: child_node.totals.folder_count,
                     percent_of_parent,
@@ -802,12 +808,27 @@ impl ScanIndex {
     /// ограничивает число плиток: на диске расширений тысячи, а окну хватает
     /// крупнейших — остальные видны в таблице ниже. Группы нулевого размера
     /// (пустые файлы) на карту не попадают: площади у них нет.
-    pub fn types_treemap(&self, folder: FolderId, max_rects: usize) -> Vec<TreemapRect> {
+    ///
+    /// `size_mode` — настройка отображения: и порядок плиток, и их площадь
+    /// считаются по выбранному размеру (на диске или фактическому).
+    pub fn types_treemap(
+        &self,
+        folder: FolderId,
+        max_rects: usize,
+        size_mode: SizeMode,
+    ) -> Vec<TreemapRect> {
         if max_rects == 0 {
             return Vec::new();
         }
         let mut rows = self.file_types(folder, TypeSort::SizeOnDisk, true);
-        rows.retain(|row| row.size_on_disk > 0);
+        rows.retain(|row| size_mode.size(row.size_on_disk, row.size_logical) > 0);
+        rows.sort_by(|left, right| {
+            let left_size = size_mode.size(left.size_on_disk, left.size_logical);
+            let right_size = size_mode.size(right.size_on_disk, right.size_logical);
+            right_size
+                .cmp(&left_size)
+                .then_with(|| compare_names(&left.extension, &right.extension))
+        });
         rows.truncate(max_rects);
         if rows.is_empty() {
             return Vec::new();
@@ -823,7 +844,7 @@ impl ScanIndex {
                 } else {
                     row.extension.clone()
                 },
-                size: row.size_on_disk,
+                size: size_mode.size(row.size_on_disk, row.size_logical),
                 is_dir: false,
             })
             .collect();
@@ -856,7 +877,7 @@ impl ScanIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{FileKey, FileMeta, FileSort, SearchQuery, SearchRow, TypeSort};
+    use crate::model::{FileKey, FileMeta, FileSort, SearchQuery, SearchRow, SizeMode, TypeSort};
 
     /// Файл с полным набором полей: размер на диске, логический размер и время.
     fn meta_full(
@@ -1014,7 +1035,7 @@ mod tests {
         }
 
         assert_eq!(index.file_count(folder), 25);
-        let rows = index.child_files(folder, FileSort::SizeOnDisk, true, 10, 10);
+        let rows = index.child_files(folder, FileSort::SizeOnDisk, true, 10, 10, SizeMode::OnDisk);
         let names: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
         assert_eq!(
             names,
@@ -1032,6 +1053,36 @@ mod tests {
     }
 
     #[test]
+    fn file_rows_percent_uses_selected_size() {
+        let mut index = ScanIndex::new("C:");
+        let root = index.root();
+        let folder = index.folder(root, "mixed");
+        // Занятое место и фактический размер противоположны: процент строки
+        // обязан считаться от выбранного размера родителя, а не всегда от диска.
+        index.add_file(folder, meta_full("a.bin", 100, 900, 0, 1));
+        index.add_file(folder, meta_full("b.bin", 900, 100, 0, 2));
+        assert_eq!(index.folder_totals(folder).size_on_disk, 1_000);
+        assert_eq!(index.folder_totals(folder).size_logical, 1_000);
+
+        let disk = index.child_files(folder, FileSort::SizeOnDisk, true, 0, 10, SizeMode::OnDisk);
+        assert_eq!(disk[0].name, "b.bin");
+        assert!((disk[0].percent_of_parent - 0.9).abs() <= f32::EPSILON);
+        assert!((disk[1].percent_of_parent - 0.1).abs() <= f32::EPSILON);
+
+        let logical = index.child_files(
+            folder,
+            FileSort::SizeLogical,
+            true,
+            0,
+            10,
+            SizeMode::Logical,
+        );
+        assert_eq!(logical[0].name, "a.bin");
+        assert!((logical[0].percent_of_parent - 0.9).abs() <= f32::EPSILON);
+        assert!((logical[1].percent_of_parent - 0.1).abs() <= f32::EPSILON);
+    }
+
+    #[test]
     fn get_files_respects_limit_offset() {
         let mut index = ScanIndex::new("C:");
         let root = index.root();
@@ -1043,24 +1094,24 @@ mod tests {
         // offset за пределами папки — страницы нет.
         assert!(
             index
-                .child_files(folder, FileSort::Name, false, 10, 10)
+                .child_files(folder, FileSort::Name, false, 10, 10, SizeMode::OnDisk)
                 .is_empty()
         );
         // limit = 0 — пусто даже при корректном offset.
         assert!(
             index
-                .child_files(folder, FileSort::Name, false, 0, 0)
+                .child_files(folder, FileSort::Name, false, 0, 0, SizeMode::OnDisk)
                 .is_empty()
         );
         // limit больше числа файлов — отдаём всё, что есть.
         assert_eq!(
             index
-                .child_files(folder, FileSort::Name, false, 0, 100)
+                .child_files(folder, FileSort::Name, false, 0, 100, SizeMode::OnDisk)
                 .len(),
             5
         );
         // Хвост страницы: offset 3 при большом limit — только две последние строки.
-        let tail = index.child_files(folder, FileSort::Name, false, 3, 100);
+        let tail = index.child_files(folder, FileSort::Name, false, 3, 100, SizeMode::OnDisk);
         let names: Vec<&str> = tail.iter().map(|row| row.name.as_str()).collect();
         assert_eq!(names, ["f3", "f4"]);
 
@@ -1069,14 +1120,14 @@ mod tests {
         assert_eq!(index.file_count(empty), 0);
         assert!(
             index
-                .child_files(empty, FileSort::Name, false, 0, 10)
+                .child_files(empty, FileSort::Name, false, 0, 10, SizeMode::OnDisk)
                 .is_empty()
         );
 
         // Нулевой родитель (файлы нулевого размера): доля 0.0, а не NaN.
         let zeros = index.folder(root, "zeros");
         index.add_file(zeros, meta_full("empty.bin", 0, 0, 0, 100));
-        let zero_rows = index.child_files(zeros, FileSort::Name, false, 0, 10);
+        let zero_rows = index.child_files(zeros, FileSort::Name, false, 0, 10, SizeMode::OnDisk);
         assert_eq!(zero_rows.len(), 1);
         assert_eq!(zero_rows[0].percent_of_parent, 0.0);
         assert!(!zero_rows[0].percent_of_parent.is_nan());
@@ -1100,7 +1151,7 @@ mod tests {
 
         let names = |sort: FileSort, desc: bool| -> Vec<String> {
             index
-                .child_files(folder, sort, desc, 0, 100)
+                .child_files(folder, sort, desc, 0, 100, SizeMode::OnDisk)
                 .iter()
                 .map(|row| row.name.clone())
                 .collect()
@@ -1158,7 +1209,7 @@ mod tests {
             AddOutcome::HardLinkDuplicate
         ));
 
-        let rows = index.child_files(folder, FileSort::Name, false, 0, 10);
+        let rows = index.child_files(folder, FileSort::Name, false, 0, 10, SizeMode::OnDisk);
         let names: Vec<&str> = rows.iter().map(|row| row.name.as_str()).collect();
         assert_eq!(names, ["first.txt", "second.txt"]);
         assert!(
@@ -1210,7 +1261,7 @@ mod tests {
 
         let names = |sort: FileSort, desc: bool| -> Vec<String> {
             index
-                .child_files(folder, sort, desc, 0, 10)
+                .child_files(folder, sort, desc, 0, 10, SizeMode::OnDisk)
                 .iter()
                 .map(|row| row.name.clone())
                 .collect()
@@ -1242,7 +1293,7 @@ mod tests {
         }
 
         let names: Vec<String> = index
-            .child_files(folder, FileSort::Name, false, 0, 10)
+            .child_files(folder, FileSort::Name, false, 0, 10, SizeMode::OnDisk)
             .iter()
             .map(|row| row.name.clone())
             .collect();
@@ -1275,7 +1326,7 @@ mod tests {
 
         let names = |sort: FileSort, desc: bool| -> Vec<String> {
             index
-                .child_files(folder, sort, desc, 0, 10)
+                .child_files(folder, sort, desc, 0, 10, SizeMode::OnDisk)
                 .iter()
                 .map(|row| row.name.clone())
                 .collect()
@@ -1325,7 +1376,7 @@ mod tests {
         let totals = index.folder_totals(second);
         assert_eq!(totals.size_on_disk, 1000, "дубликат в итог папки не входит");
 
-        let rows = index.child_files(second, FileSort::Name, false, 0, 10);
+        let rows = index.child_files(second, FileSort::Name, false, 0, 10, SizeMode::OnDisk);
         let alias = rows.iter().find(|row| row.name == "alias.bin").unwrap();
         assert!(alias.hard_linked);
         assert_eq!(
@@ -1844,7 +1895,7 @@ mod tests {
 
         // Полная выдача: четыре расширения (txt, rs, bin и «(нет)»), доли от
         // 1000 байт.
-        let rects = index.types_treemap(root, 10);
+        let rects = index.types_treemap(root, 10, SizeMode::OnDisk);
         assert_eq!(rects.len(), 4);
         assert_eq!(
             rects
@@ -1859,7 +1910,7 @@ mod tests {
         assert!((txt.w * txt.h - 0.8).abs() < 1e-9, "800 из 1000 байт");
 
         // Бюджет: не больше max_rects плиток, и они покрывают контейнер.
-        let limited = index.types_treemap(root, 3);
+        let limited = index.types_treemap(root, 3, SizeMode::OnDisk);
         assert_eq!(limited.len(), 3);
         let covered: f64 = limited.iter().map(|rect| rect.w * rect.h).sum();
         assert!(
@@ -1874,7 +1925,7 @@ mod tests {
 
         // Нет файлов или бюджет 0 — пусто, без паники.
         let empty = index.folder(root, "empty");
-        assert!(index.types_treemap(empty, 10).is_empty());
-        assert!(index.types_treemap(root, 0).is_empty());
+        assert!(index.types_treemap(empty, 10, SizeMode::OnDisk).is_empty());
+        assert!(index.types_treemap(root, 0, SizeMode::OnDisk).is_empty());
     }
 }

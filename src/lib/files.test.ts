@@ -29,6 +29,7 @@ function folder(
     id,
     name,
     size_on_disk: size,
+    size_logical: size,
     file_count: fileCount,
     folder_count: folderCount,
     percent_of_parent: size / ROOT.size_on_disk,

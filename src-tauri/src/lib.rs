@@ -15,7 +15,7 @@ use tauri::{AppHandle, Emitter, State};
 use files::ops;
 use model::{
     CrumbDto, DeleteReport, DriveInfo, FilePage, FileSort, FileTypeRow, FolderSummary, ScanError,
-    ScanProgress, ScanTotals, SearchPage, SearchQuery, TreemapRect, TypeSort,
+    ScanProgress, ScanTotals, SearchPage, SearchQuery, SizeMode, TreemapRect, TypeSort,
 };
 use scan::index::ScanIndex;
 use scan::{ScanService, ScanSink, ScanTarget, drive_root, run_scan};
@@ -286,6 +286,10 @@ fn type_sort_from_name(name: &str) -> Result<TypeSort, String> {
 /// Команда асинхронная: сортировка большой папки (десятки тысяч имён) — это
 /// десятки миллисекунд CPU (в debug-сборке — до сотен), а главный поток окна
 /// не должен ждать их при прокрутке и смене колонки.
+///
+/// `size_mode` — настройка отображения с фронтенда: по ней считается колонка
+/// `%` (доля строки от выбранного размера родителя). Сортировка приходит
+/// отдельным параметром: клик по заголовку выбирает любую колонку.
 #[tauri::command(async)]
 fn get_files(
     state: State<'_, AppState>,
@@ -294,8 +298,10 @@ fn get_files(
     desc: bool,
     offset: usize,
     limit: usize,
+    size_mode: String,
 ) -> Result<FilePage, String> {
     let sort = file_sort_from_name(&sort)?;
+    let size_mode = SizeMode::from_name(&size_mode)?;
     let index = state
         .service
         .index()
@@ -305,7 +311,7 @@ fn get_files(
 
     Ok(FilePage {
         total: index.file_count(folder_id),
-        rows: index.child_files(folder_id, sort, desc, offset, limit),
+        rows: index.child_files(folder_id, sort, desc, offset, limit, size_mode),
     })
 }
 
@@ -363,12 +369,21 @@ const TREEMAP_RECTS_LIMIT: usize = 20_000;
 ///
 /// Команда асинхронная: раскладка 2000 прямоугольников — это единицы-десятки
 /// миллисекунд CPU, и главный поток окна не должен на них ждать.
+///
+/// Параметры отображения (`size_mode`, `include_files`, `min_tile_bytes`) —
+/// осознанное расширение сигнатуры Плана 2: настройки живут на фронтенде и
+/// приходят аргументами. Порог мелочи влияет ТОЛЬКО на карту, итоги папки не
+/// меняются.
 #[tauri::command(async)]
 fn get_treemap(
     state: State<'_, AppState>,
     folder_id: u32,
     max_rects: usize,
+    size_mode: String,
+    include_files: bool,
+    min_tile_bytes: u64,
 ) -> Result<Vec<TreemapRect>, String> {
+    let size_mode = SizeMode::from_name(&size_mode)?;
     let index = state
         .service
         .index()
@@ -378,7 +393,12 @@ fn get_treemap(
 
     let max_rects = max_rects.min(TREEMAP_RECTS_LIMIT);
     Ok(treemap::layout::treemap_for_folder(
-        &index, folder_id, max_rects,
+        &index,
+        folder_id,
+        max_rects,
+        size_mode,
+        include_files,
+        min_tile_bytes,
     ))
 }
 
@@ -414,13 +434,16 @@ fn get_file_types(
 ///
 /// Раскладка — общий `layout_treemap`, поэтому плитки покрывают контейнер без
 /// пересечений. Команда асинхронная: сортировка тысяч групп и раскладка — это
-/// единицы-десятки миллисекунд CPU.
+/// единицы-десятки миллисекунд CPU. `size_mode` — настройка отображения: и
+/// порядок плиток, и их площадь считаются по выбранному размеру.
 #[tauri::command(async)]
 fn get_types_treemap(
     state: State<'_, AppState>,
     folder_id: u32,
     max_rects: usize,
+    size_mode: String,
 ) -> Result<Vec<TreemapRect>, String> {
+    let size_mode = SizeMode::from_name(&size_mode)?;
     let index = state
         .service
         .index()
@@ -429,7 +452,7 @@ fn get_types_treemap(
     check_folder_id(&index, folder_id)?;
 
     let max_rects = max_rects.min(TYPES_RECTS_LIMIT);
-    Ok(index.types_treemap(folder_id, max_rects))
+    Ok(index.types_treemap(folder_id, max_rects, size_mode))
 }
 
 /// Проверить путь действия из окна.

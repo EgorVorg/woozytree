@@ -22,7 +22,7 @@ use windows::Win32::Storage::FileSystem::{
 use windows::core::PCWSTR;
 
 use crate::model::{
-    DriveInfo, FolderId, FolderSummary, ScanError, ScanProgress, ScanTotals, TreemapRect,
+    DriveInfo, FolderId, FolderSummary, ScanError, ScanProgress, ScanTotals, SizeMode, TreemapRect,
 };
 use crate::scan::index::ScanIndex;
 use crate::scan::mft::scan_ntfs;
@@ -97,8 +97,19 @@ impl LiveEmitter {
 }
 
 /// Живая карта корня сканирования: та же раскладка, что отдаёт `get_treemap`.
+///
+/// Живые события не знают настроек отображения (они живут на фронтенде), поэтому
+/// срез строится с параметрами по умолчанию: размер на диске, файлы видны, без
+/// порога. После завершения скана карта перезапрашивается командой с настройками.
 fn live_treemap(index: &ScanIndex) -> Vec<TreemapRect> {
-    crate::treemap::layout::treemap_for_folder(index, index.root(), LIVE_TREEMAP_RECTS)
+    crate::treemap::layout::treemap_for_folder(
+        index,
+        index.root(),
+        LIVE_TREEMAP_RECTS,
+        SizeMode::OnDisk,
+        true,
+        0,
+    )
 }
 
 /// Самые тяжёлые дочерние папки корня — то, что уходит в `sink.top_folders`.

@@ -50,6 +50,9 @@ pub struct FolderSummary {
     pub id: FolderId,
     pub name: String,
     pub size_on_disk: u64,
+    /// Фактический размер поддерева — для режима «фактический» в настройках
+    /// отображения (топ папок показывает выбранный размер без перезапроса).
+    pub size_logical: u64,
     pub file_count: u32,
     pub folder_count: u32,
     pub percent_of_parent: f32, // доля от размера родителя, 0.0..=1.0
@@ -73,6 +76,43 @@ pub enum FileSort {
     SizeOnDisk,
     SizeLogical,
     Modified,
+}
+
+/// Что считать размером элемента при отображении: занятое на диске или
+/// фактический размер файла.
+///
+/// Настройка живёт на фронтенде (`localStorage`, ключ `woozytree.settings`) и
+/// приходит в команды карты/таблицы параметром `size_mode`:
+/// `"on_disk"` | `"logical"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SizeMode {
+    OnDisk,
+    Logical,
+}
+
+impl SizeMode {
+    /// Разобрать режим из строки окна.
+    ///
+    /// Неизвестное значение — ошибка на русском, а не паника: окно могло
+    /// сохранить старую настройку или прислать мусор.
+    pub fn from_name(name: &str) -> Result<SizeMode, String> {
+        match name {
+            "on_disk" => Ok(SizeMode::OnDisk),
+            "logical" => Ok(SizeMode::Logical),
+            other => Err(format!(
+                "Неизвестный режим размера «{other}»: ожидается on_disk или logical."
+            )),
+        }
+    }
+
+    /// Размер элемента в выбранном режиме.
+    pub fn size(self, on_disk: u64, logical: u64) -> u64 {
+        match self {
+            SizeMode::OnDisk => on_disk,
+            SizeMode::Logical => logical,
+        }
+    }
 }
 
 /// Строка таблицы типов файлов: агрегат по расширению в поддереве папки.

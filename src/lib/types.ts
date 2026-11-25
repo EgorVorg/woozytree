@@ -5,9 +5,11 @@ export interface FolderSummary {
   id: number;
   name: string;
   size_on_disk: number;
+  /** Фактический размер поддерева — для режима «фактический» в настройках. */
+  size_logical: number;
   file_count: number;
   folder_count: number;
-  /** Доля от размера родителя: 0.0..=1.0. */
+  /** Доля от размера родителя: 0.0..=1.0 (считается от размера на диске). */
   percent_of_parent: number;
 }
 
@@ -87,6 +89,12 @@ export interface DeleteReport {
 
 /** Колонки, по которым ядро умеет сортировать таблицу файлов. */
 export type FileSort = "name" | "size_on_disk" | "size_logical" | "modified";
+
+/**
+ * Что считать размером при отображении: занятое на диске или фактический
+ * размер. Настройка фронтенда, уходит в команды параметром `size_mode`.
+ */
+export type SizeMode = "on_disk" | "logical";
 
 /** Строка таблицы типов файлов (`get_file_types`). */
 export interface FileTypeRow {

@@ -4,7 +4,7 @@
 //! убыв., контейнер делится на ряды вдоль короткой стороны, ряд растёт, пока
 //! «неквадратность» его плиток уменьшается. Координаты — нормированные 0..1.
 
-use crate::model::{FileSort, FolderId, TreemapRect};
+use crate::model::{FileSort, FolderId, SizeMode, TreemapRect};
 use crate::scan::index::ScanIndex;
 
 /// Прямоугольник в нормированных координатах контейнера (0..1).
@@ -250,10 +250,20 @@ fn worst_aspect(areas: &[f64], sum: f64, side: f64) -> f64 {
 /// половины родителя (все дети мелкие или один крупный и сотни мелких),
 /// отдельными плитками показываются крупнейшие дети (до `FALLBACK_TILES`), чтобы
 /// зум не упирался в одну серую плитку. Файлы получают id = 0.
+///
+/// Параметры отображения — осознанное расширение Плана 2 (настройки живут на
+/// фронтенде и приходят аргументами команды):
+/// - `size_mode` — раскладывать по занятому месту или по фактическому размеру;
+/// - `include_files` — `false` оставляет на карте только папки;
+/// - `min_tile_bytes` — плитки мельче порога складываются в «прочее» (это
+///   ТОЛЬКО отображение: итоги, счётчики и проценты папки не меняются).
 pub fn treemap_for_folder(
     index: &ScanIndex,
     folder: FolderId,
     max_rects: usize,
+    size_mode: SizeMode,
+    include_files: bool,
+    min_tile_bytes: u64,
 ) -> Vec<TreemapRect> {
     let mut rects = Vec::with_capacity(max_rects.min(4096));
     if max_rects == 0 {
@@ -266,7 +276,16 @@ pub fn treemap_for_folder(
         w: 1.0,
         h: 1.0,
     };
-    expand_folder(index, folder, root, &mut budget, &mut rects);
+    expand_folder(
+        index,
+        folder,
+        root,
+        &mut budget,
+        &mut rects,
+        size_mode,
+        include_files,
+        min_tile_bytes,
+    );
     rects
 }
 
@@ -277,16 +296,20 @@ fn expand_folder(
     rect: Rect,
     budget: &mut usize,
     out: &mut Vec<TreemapRect>,
+    size_mode: SizeMode,
+    include_files: bool,
+    min_tile_bytes: u64,
 ) {
     if *budget == 0 {
         return;
     }
-    let parent_size = index.folder_totals(folder).size_on_disk;
+    let totals = index.folder_totals(folder);
+    let parent_size = size_mode.size(totals.size_on_disk, totals.size_logical);
     if parent_size == 0 {
         return;
     }
 
-    let mut items = children(index, folder);
+    let mut items = children(index, folder, size_mode, include_files);
     if items.is_empty() {
         return;
     }
@@ -301,24 +324,32 @@ fn expand_folder(
     });
 
     let total_items = items.len();
-    // Дети мельче 1 % родителя (и всё, что не влезло в бюджет) уходят в «прочее».
+    // Сумма размеров всех кандидатов: база и для порога видимости, и для
+    // «прочего». При включённых файлах она совпадает с итогом папки (дубликаты
+    // жёстких ссылок и нулевые размеры не входят ни туда, ни туда), при
+    // выключенных — содержит только папки: файлы не подмешиваются в «прочее».
+    let item_total: u64 = items.iter().map(|item| item.size).sum();
+    // Дети мельче 1 % кандидатов (и всё, что не влезло в бюджет) уходят в
+    // «прочее». Порог пользователя (`min_tile_bytes`) — абсолютный: он важнее
+    // доли, поэтому настройка «не показывать мельче N» режет и крупных соседей.
     let visible = items
         .iter()
-        .take_while(|item| is_visible(item.size, parent_size))
+        .take_while(|item| item.size >= min_tile_bytes && is_visible(item.size, item_total))
         .count();
     let mut shown = visible;
     let mut collapses = shown < total_items;
     // «Прочее» не должно быть главной плиткой папки: если в нём остаётся больше
-    // половины родителя (например, у папки один крупный ребёнок, а сотни мелких),
-    // показываем крупнейших детей отдельными плитками до FALLBACK_TILES.
-    if collapses {
+    // половины (например, у папки один крупный ребёнок, а сотни мелких),
+    // показываем крупнейших детей отдельными плитками до FALLBACK_TILES. Явный
+    // порог отключает эту эвристику: пользователь сам попросил спрятать мелочь.
+    if collapses && min_tile_bytes == 0 {
         let shown_size: u64 = items.iter().take(shown).map(|item| item.size).sum();
-        let other_size = parent_size.saturating_sub(shown_size);
-        if other_size.saturating_mul(2) > parent_size {
+        let other_size = item_total.saturating_sub(shown_size);
+        if other_size.saturating_mul(2) > item_total {
             shown = total_items.min(FALLBACK_TILES).max(shown);
         }
     }
-    if shown == 0 {
+    if shown == 0 && min_tile_bytes == 0 {
         shown = total_items.min(FALLBACK_TILES);
     }
     collapses = shown < total_items;
@@ -333,7 +364,7 @@ fn expand_folder(
     let mut layout_items: Vec<TreemapItem> = items.into_iter().take(shown).collect();
     let shown_size: u64 = layout_items.iter().map(|item| item.size).sum();
     let other_size = if collapses {
-        parent_size.saturating_sub(shown_size)
+        item_total.saturating_sub(shown_size)
     } else {
         0
     };
@@ -382,36 +413,64 @@ fn expand_folder(
         if *budget == 0 {
             break;
         }
-        expand_folder(index, id, tile, budget, out);
+        expand_folder(
+            index,
+            id,
+            tile,
+            budget,
+            out,
+            size_mode,
+            include_files,
+            min_tile_bytes,
+        );
     }
 }
 
-/// Дети папки одним списком: папки и файлы. Дубликаты жёстких ссылок не входят
-/// в итоги родителя, поэтому и на карте не показываются.
-fn children(index: &ScanIndex, folder: FolderId) -> Vec<TreemapItem> {
+/// Дети папки одним списком: папки и, если включено, файлы. Дубликаты жёстких
+/// ссылок не входят в итоги родителя, поэтому и на карте не показываются.
+///
+/// Размер элемента и фильтр нулевых — в выбранном режиме: в «фактическом»
+/// разрежённый файл может занимать 0 байт на диске, но иметь ненулевой
+/// фактический размер, и наоборот.
+fn children(
+    index: &ScanIndex,
+    folder: FolderId,
+    size_mode: SizeMode,
+    include_files: bool,
+) -> Vec<TreemapItem> {
     let mut items = Vec::new();
     for child in index.child_folders(folder) {
-        if child.size_on_disk > 0 {
-            items.push(TreemapItem {
-                id: u64::from(child.id),
-                name: child.name,
-                size: child.size_on_disk,
-                is_dir: true,
-            });
+        let size = size_mode.size(child.size_on_disk, child.size_logical);
+        if size == 0 {
+            continue;
         }
+        items.push(TreemapItem {
+            id: u64::from(child.id),
+            name: child.name,
+            size,
+            is_dir: true,
+        });
     }
-    let file_count = index.file_count(folder) as usize;
-    if file_count > 0 {
-        for row in index.child_files(folder, FileSort::SizeOnDisk, true, 0, file_count) {
-            if row.hard_linked || row.size_on_disk == 0 {
-                continue;
+    if include_files {
+        let file_count = index.file_count(folder) as usize;
+        if file_count > 0 {
+            for row in
+                index.child_files(folder, FileSort::SizeOnDisk, true, 0, file_count, size_mode)
+            {
+                if row.hard_linked {
+                    continue;
+                }
+                let size = size_mode.size(row.size_on_disk, row.size_logical);
+                if size == 0 {
+                    continue;
+                }
+                items.push(TreemapItem {
+                    id: 0,
+                    name: row.name,
+                    size,
+                    is_dir: false,
+                });
             }
-            items.push(TreemapItem {
-                id: 0,
-                name: row.name,
-                size: row.size_on_disk,
-                is_dir: false,
-            });
         }
     }
     items
@@ -452,7 +511,7 @@ fn push_rect(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{FileKey, FileMeta};
+    use crate::model::{FileKey, FileMeta, SizeMode};
     use crate::scan::index::ScanIndex;
 
     /// Набор плиток: размеры по убыванию, id — позиция, чётные — «папки».
@@ -482,6 +541,21 @@ mod tests {
             name: name.to_string(),
             size_on_disk: size,
             size_logical: size,
+            modified: 0,
+            file_key: FileKey {
+                volume_serial: 1,
+                file_index,
+            },
+        }
+    }
+
+    /// Файл, у которого занятое место и фактический размер различаются:
+    /// сжатие/разрежённые файлы дают разный порядок в двух режимах.
+    fn meta_sized(name: &str, on_disk: u64, logical: u64, file_index: u64) -> FileMeta {
+        FileMeta {
+            name: name.to_string(),
+            size_on_disk: on_disk,
+            size_logical: logical,
             modified: 0,
             file_key: FileKey {
                 volume_serial: 1,
@@ -654,7 +728,7 @@ mod tests {
             );
         }
 
-        let rects = treemap_for_folder(&index, root, 10);
+        let rects = treemap_for_folder(&index, root, 10, SizeMode::OnDisk, true, 0);
 
         assert!(rects.len() <= 10, "бюджет 10 превышен: {}", rects.len());
         assert_eq!(
@@ -728,7 +802,7 @@ mod tests {
             );
         }
 
-        let rects = treemap_for_folder(&index, folder, 200);
+        let rects = treemap_for_folder(&index, folder, 200, SizeMode::OnDisk, true, 0);
         let files: Vec<&TreemapRect> = rects
             .iter()
             .filter(|rect| !rect.is_dir && rect.name != "прочее")
@@ -753,7 +827,7 @@ mod tests {
         assert_eq!(rects.len(), FALLBACK_TILES + 1);
 
         // Тот же случай с тесным бюджетом: «прочее» резервируется, файлов — на 1 меньше.
-        let tight = treemap_for_folder(&index, folder, 10);
+        let tight = treemap_for_folder(&index, folder, 10, SizeMode::OnDisk, true, 0);
         assert_eq!(tight.len(), 10, "бюджет 10 превышен: {tight:?}");
         assert_eq!(
             tight
@@ -781,7 +855,7 @@ mod tests {
 
         // 100 000 + 150 * 2 000 = 400 000 Б: крупный файл — 25 % (видим), мелочь —
         // 75 %, и без fallback она стала бы одной плиткой «прочее» на 3/4 карты.
-        let rects = treemap_for_folder(&index, folder, 300);
+        let rects = treemap_for_folder(&index, folder, 300, SizeMode::OnDisk, true, 0);
         let files: Vec<&TreemapRect> = rects
             .iter()
             .filter(|rect| !rect.is_dir && rect.name != "прочее")
@@ -810,6 +884,165 @@ mod tests {
         assert_eq!(rects.len(), FALLBACK_TILES + 1);
     }
 
+    /// Порог мелочи складывает всё, что меньше `min_tile_bytes`, в «прочее»:
+    /// крупные элементы остаются отдельными плитками, суммы площадей и итоги
+    /// папки при этом не меняются (порог — только отображение).
+    #[test]
+    fn min_tile_threshold_lumps_small_into_other() {
+        let mut index = ScanIndex::new("C:");
+        let root = index.root();
+        for position in 0..5u64 {
+            index.add_file(
+                root,
+                meta(&format!("big-{position}.bin"), 1_000, position + 1),
+            );
+        }
+        for position in 0..5u64 {
+            index.add_file(
+                root,
+                meta(&format!("small-{position}.bin"), 100, 100 + position),
+            );
+        }
+        let before = index.folder_totals(root);
+        assert_eq!(before.size_on_disk, 5_500);
+
+        let rects = treemap_for_folder(&index, root, 100, SizeMode::OnDisk, true, 500);
+
+        // 5 крупных файлов отдельными плитками + одна сводная «прочее».
+        assert_eq!(
+            rects.len(),
+            6,
+            "мелочь обязана собраться в одну плитку: {rects:?}"
+        );
+        assert_eq!(rects.iter().filter(|rect| rect.name == "прочее").count(), 1);
+        let other = rects
+            .iter()
+            .find(|rect| rect.name == "прочее")
+            .expect("сводная плитка обязана быть");
+        assert_eq!(other.size, 500, "в «прочее» — ровно 5 файлов по 100 Б");
+        assert!(!other.is_dir && other.id == 0);
+        let bigs: Vec<&TreemapRect> = rects
+            .iter()
+            .filter(|rect| rect.name.starts_with("big-"))
+            .collect();
+        assert_eq!(bigs.len(), 5);
+        assert!(bigs.iter().all(|rect| rect.size == 1_000));
+
+        // Сумма площадей плиток — весь контейнер, включая «прочее».
+        let covered: f64 = rects.iter().map(|rect| rect.w * rect.h).sum();
+        assert!(
+            (covered - 1.0).abs() <= 1e-9,
+            "площадь карты {covered} != 1.0: порог не должен терять байты"
+        );
+        // Сумма размеров плиток верхнего уровня — итог папки: отображение не
+        // переписывает данные.
+        let shown: u64 = rects.iter().map(|rect| rect.size).sum();
+        assert_eq!(
+            shown, before.size_on_disk,
+            "сумма плиток обязана совпасть с итогом папки"
+        );
+
+        // Без порога те же 10 элементов видны отдельно: контраст доказывает,
+        // что дело именно в пороге.
+        let without = treemap_for_folder(&index, root, 100, SizeMode::OnDisk, true, 0);
+        assert_eq!(without.len(), 10);
+
+        // Итоги после раскладки не изменились ни на байт.
+        let after = index.folder_totals(root);
+        assert_eq!(after.size_on_disk, before.size_on_disk);
+        assert_eq!(after.size_logical, before.size_logical);
+        assert_eq!(after.file_count, before.file_count);
+        assert_eq!(after.folder_count, before.folder_count);
+    }
+
+    /// «Файлы на карте» выключены — в выдаче только папки; файлы не подмешиваются
+    /// даже в «прочее», а карта по-прежнему покрывает контейнер.
+    #[test]
+    fn include_files_false_shows_only_folders() {
+        let mut index = ScanIndex::new("C:");
+        let root = index.root();
+        let docs = index.folder(root, "Документы");
+        index.add_file(docs, meta("a.bin", 2_000, 1));
+        index.add_file(docs, meta("b.bin", 1_000, 2));
+        for position in 0..3u64 {
+            index.add_file(
+                root,
+                meta(&format!("root-{position}.bin"), 900, 10 + position),
+            );
+        }
+        let before = index.folder_totals(root);
+
+        let with_files = treemap_for_folder(&index, root, 100, SizeMode::OnDisk, true, 0);
+        assert!(
+            with_files
+                .iter()
+                .any(|rect| !rect.is_dir && rect.name == "root-0.bin"),
+            "с включёнными файлами они обязаны быть на карте: {with_files:?}"
+        );
+
+        let folders_only = treemap_for_folder(&index, root, 100, SizeMode::OnDisk, false, 0);
+        assert!(
+            folders_only.iter().all(|rect| rect.is_dir),
+            "при include_files=false на карте только папки: {folders_only:?}"
+        );
+        assert!(
+            folders_only
+                .iter()
+                .any(|rect| rect.is_dir && rect.id == u64::from(docs)),
+            "папка обязана остаться: {folders_only:?}"
+        );
+        assert!(
+            folders_only.iter().all(|rect| rect.name != "прочее"),
+            "файлы не должны попадать даже в «прочее»: {folders_only:?}"
+        );
+        let covered: f64 = folders_only.iter().map(|rect| rect.w * rect.h).sum();
+        assert!(
+            (covered - 1.0).abs() <= 1e-9,
+            "карта обязана покрыть контейнер: {covered}"
+        );
+
+        let after = index.folder_totals(root);
+        assert_eq!(after.size_on_disk, before.size_on_disk);
+        assert_eq!(after.file_count, before.file_count);
+    }
+
+    /// Режим размера меняет раскладку: с «на диске» первой идёт одна плитка,
+    /// с «фактическим» — другая, и площадь каждой соответствует выбранному размеру.
+    #[test]
+    fn size_mode_logical_changes_layout() {
+        let mut index = ScanIndex::new("C:");
+        let root = index.root();
+        let folder = index.folder(root, "Смешанная");
+        index.add_file(folder, meta_sized("a.bin", 100, 900, 1));
+        index.add_file(folder, meta_sized("b.bin", 900, 100, 2));
+        let before = index.folder_totals(folder);
+        assert_eq!(before.size_on_disk, 1_000);
+        assert_eq!(before.size_logical, 1_000);
+
+        let disk = treemap_for_folder(&index, folder, 10, SizeMode::OnDisk, true, 0);
+        assert_eq!(disk[0].name, "b.bin", "на диске крупнее b.bin: {disk:?}");
+        assert_eq!(disk[0].size, 900);
+        assert!((disk[0].w * disk[0].h - 0.9).abs() <= 1e-9);
+        assert_eq!(disk[1].name, "a.bin");
+        assert_eq!(disk[1].size, 100);
+
+        let logical = treemap_for_folder(&index, folder, 10, SizeMode::Logical, true, 0);
+        assert_eq!(
+            logical[0].name, "a.bin",
+            "фактически крупнее a.bin: {logical:?}"
+        );
+        assert_eq!(logical[0].size, 900);
+        assert!((logical[0].w * logical[0].h - 0.9).abs() <= 1e-9);
+        assert_eq!(logical[1].name, "b.bin");
+        assert_eq!(logical[1].size, 100);
+
+        // Раскладка — только отображение: итоги папки не пересчитаны.
+        let after = index.folder_totals(folder);
+        assert_eq!(after.size_on_disk, before.size_on_disk);
+        assert_eq!(after.size_logical, before.size_logical);
+        assert_eq!(after.file_count, before.file_count);
+    }
+
     /// Дубликат жёсткой ссылки не входит в итоги папки, поэтому и на карте его
     /// быть не должно: иначе площадь плиток перестала бы соответствовать
     /// занятому месту.
@@ -821,7 +1054,7 @@ mod tests {
         index.add_file(links, meta("first.bin", 4096, 7));
         index.add_file(links, meta("alias.bin", 4096, 7));
 
-        let rects = treemap_for_folder(&index, root, 10);
+        let rects = treemap_for_folder(&index, root, 10, SizeMode::OnDisk, true, 0);
         assert_eq!(rects.len(), 2, "папка + один учтённый файл: {rects:?}");
         assert!(rects[0].is_dir);
         let file = rects

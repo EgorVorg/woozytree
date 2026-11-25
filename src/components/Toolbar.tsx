@@ -1,3 +1,4 @@
+import SettingsPopover from "@/components/SettingsPopover";
 import { Button } from "@/components/ui/button";
 import {
   Select,
@@ -6,6 +7,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import type { DisplaySettings } from "@/lib/settings";
 import type { DriveInfo, ScanChoice } from "@/lib/types";
 
 /** Значения служебных пунктов селектора: «Все диски» и «Папка…». */
@@ -28,6 +30,10 @@ interface ToolbarProps {
   onStop: () => void;
   /** Перезапросить `list_drives` (подключили или вынули диск). */
   onRefreshDrives: () => void;
+  /** Настройки отображения: режим размера, файлы на карте, порог мелочи. */
+  settings: DisplaySettings;
+  /** Новые настройки — применяются сразу и сохраняются в localStorage. */
+  onSettingsChange: (settings: DisplaySettings) => void;
 }
 
 /** Верхняя панель: выбор охвата, обновление списка дисков и кнопки пуска/остановки. */
@@ -43,6 +49,8 @@ export default function Toolbar({
   onScan,
   onStop,
   onRefreshDrives,
+  settings,
+  onSettingsChange,
 }: ToolbarProps) {
   // «Все диски» — первым пунктом, как в WizTree; «Папка…» — последним, потому
   // что он открывает диалог, а не выбирает готовое значение.
@@ -130,6 +138,7 @@ export default function Toolbar({
       </div>
 
       <div className="ml-auto flex items-center gap-2">
+        <SettingsPopover settings={settings} onChange={onSettingsChange} />
         <Button onClick={onScan} disabled={scanning || !canScan}>
           Сканировать
         </Button>

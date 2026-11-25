@@ -15,6 +15,7 @@ import FileActionsMenu, {
 } from "@/components/FileActionsMenu";
 import { formatCount, formatPercent, formatSize } from "@/lib/format";
 import { getTreemap, onTreemap } from "@/lib/ipc";
+import type { DisplaySettings } from "@/lib/settings";
 import {
   analyze_rects,
   crumbs_for_tile,
@@ -53,6 +54,8 @@ export interface TreemapProps {
   folderId: number;
   /** Путь до открытой папки: карта дополняет его предками кликнутой плитки. */
   path: readonly Crumb[];
+  /** Настройки отображения: режим размера, файлы на карте, порог мелочи. */
+  settings: DisplaySettings;
   /** Перейти по полному пути `crumbs` (как клик в дереве), а не на один уровень. */
   onNavigate: (crumbs: Crumb[]) => void;
   /** Идёт сканирование: индекс ядра ещё недоступен, ждём живые события. */
@@ -367,6 +370,7 @@ function tileKind(rect: TreemapRect): string {
 export default function Treemap({
   folderId,
   path,
+  settings,
   onNavigate,
   scanning = false,
   cancelled = false,
@@ -390,6 +394,11 @@ export default function Treemap({
   const liveRef = useRef<TreemapRect[] | null>(null);
   const folderIdRef = useRef(folderId);
   folderIdRef.current = folderId;
+  // Живой поток корня актуален только во время сканирования: после него карта
+  // перезапрашивается командой с настройками отображения, и запоздавшее
+  // событие не должно перетереть уже применённые настройки.
+  const scanningRef = useRef(scanning);
+  scanningRef.current = scanning;
   // Данные на момент клика: клик всегда применяется к тому, что нарисовано.
   const rectsRef = useRef(rects);
   rectsRef.current = rects;
@@ -445,7 +454,7 @@ export default function Treemap({
     let unlisten: (() => void) | undefined;
     void onTreemap((next) => {
       liveRef.current = next;
-      if (folderIdRef.current === 0) {
+      if (folderIdRef.current === 0 && scanningRef.current) {
         setRects(next);
         setError(null);
         setNotice(null);
@@ -471,8 +480,10 @@ export default function Treemap({
     setSelectedFile(null);
     setMenuTarget(null);
 
-    // Корень во время скана (и после него) показывает последний живой срез.
-    if (folderId === 0 && liveRef.current) {
+    // Во время скана корень показывает последний живой срез: индекс ядра ещё
+    // недоступен, а поток рисует происходящее раз в секунду. Живые события не
+    // знают настроек отображения — после скана карта перезапросится с ними.
+    if (folderId === 0 && scanning && liveRef.current) {
       setRects(liveRef.current);
       setLoading(false);
       setError(null);
@@ -502,7 +513,13 @@ export default function Treemap({
     setLoading(true);
     setError(null);
     setNotice(null);
-    void getTreemap(folderId, MAX_RECTS)
+    void getTreemap(
+      folderId,
+      MAX_RECTS,
+      settings.sizeMode,
+      settings.showFilesOnMap,
+      settings.minTileBytes,
+    )
       .then((next) => {
         if (!alive) return;
         setRects(next);
@@ -516,7 +533,13 @@ export default function Treemap({
     return () => {
       alive = false;
     };
-  }, [folderId, scanning]);
+  }, [
+    folderId,
+    scanning,
+    settings.sizeMode,
+    settings.showFilesOnMap,
+    settings.minTileBytes,
+  ]);
 
   // Отрисовка: canvas масштабируется под devicePixelRatio.
   useEffect(() => {

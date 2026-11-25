@@ -24,6 +24,11 @@ import {
   startScan,
 } from "@/lib/ipc";
 import { scanPercent } from "@/lib/progress";
+import {
+  load_settings,
+  save_settings,
+  type DisplaySettings,
+} from "@/lib/settings";
 import { root_crumb_name } from "@/lib/treemap";
 import type {
   DeleteReport,
@@ -146,6 +151,16 @@ function App() {
   const [stale, setStale] = useState(false);
   // Нейтральное сообщение о действии с файлом (например, путь скопирован).
   const [notice, setNotice] = useState<string | null>(null);
+  // Настройки отображения: режим размера, файлы на карте, порог мелочи.
+  // Читаются из localStorage при открытии окна и пишутся туда при изменении.
+  const [settings, setSettings] = useState<DisplaySettings>(() =>
+    load_settings(),
+  );
+
+  const handleSettingsChange = useCallback((next: DisplaySettings) => {
+    setSettings(next);
+    save_settings(next);
+  }, []);
 
   /** Удаление состоялось: данные устарели, предлагаем пересканировать. */
   const handleFileDeleted = useCallback((report: DeleteReport) => {
@@ -391,6 +406,8 @@ function App() {
             onScan={handleScan}
             onStop={handleStop}
             onRefreshDrives={handleRefreshDrives}
+            settings={settings}
+            onSettingsChange={handleSettingsChange}
           />
 
           {stale ? (
@@ -447,6 +464,7 @@ function App() {
                     key={scanRun}
                     folderId={folderId}
                     path={path}
+                    settings={settings}
                     onNavigate={handleMapNavigate}
                     scanning={scanning}
                     cancelled={cancelled}
@@ -464,6 +482,7 @@ function App() {
                     />
                     <FileTable
                       folderId={folderId}
+                      sizeMode={settings.sizeMode}
                       scanning={scanning}
                       scanRun={scanRun}
                       onFileDeleted={handleFileDeleted}
@@ -482,6 +501,7 @@ function App() {
               ) : (
                 <FileTypesPanel
                   folderId={folderId}
+                  sizeMode={settings.sizeMode}
                   scanning={scanning}
                   scanRun={scanRun}
                 />
@@ -506,7 +526,17 @@ function App() {
             skipped={totals?.skipped ?? 0}
           />
 
-          <TopFolders rows={top} />
+          <TopFolders
+            rows={top}
+            sizeMode={settings.sizeMode}
+            rootSize={
+              totals
+                ? settings.sizeMode === "on_disk"
+                  ? totals.size_on_disk
+                  : totals.size_logical
+                : 0
+            }
+          />
         </div>
       </main>
     </QueryClientProvider>
