@@ -77,6 +77,8 @@ interface ScanStatusProps {
   stopping: boolean;
   /** Скан остановлен: цифры ниже — частичный срез, а не полный итог. */
   cancelled: boolean;
+  /** Скан завершился ошибкой: прогресс и итоги очищены, показываем «Ошибка». */
+  failed: boolean;
   /** Сколько записей не попало в индекс (0 — пропусков не было). */
   skipped: number;
 }
@@ -88,6 +90,7 @@ export default function ScanStatus({
   scanning,
   stopping,
   cancelled,
+  failed,
   skipped,
 }: ScanStatusProps) {
   const files = progress?.files ?? 0;
@@ -99,11 +102,13 @@ export default function ScanStatus({
     ? "Остановка…"
     : scanning
       ? "Сканирование…"
-      : cancelled
-        ? "Остановлено"
-        : progress
-          ? "Готово"
-          : "Ожидание";
+      : failed
+        ? "Ошибка"
+        : cancelled
+          ? "Остановлено"
+          : progress
+            ? "Готово"
+            : "Ожидание";
 
   return (
     <section className="space-y-3 rounded-lg border border-border bg-card p-4">
@@ -153,6 +158,15 @@ export default function ScanStatus({
           className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive"
         >
           Данные частичные: сканирование остановлено до завершения.
+        </p>
+      ) : null}
+
+      {failed ? (
+        <p
+          role="alert"
+          className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+        >
+          Сканирование завершилось ошибкой: данные не собраны.
         </p>
       ) : null}
     </section>

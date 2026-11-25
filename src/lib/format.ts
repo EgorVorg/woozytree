@@ -5,10 +5,11 @@ const GIB = 1024 ** 3;
 const MIB = 1024 ** 2;
 const KIB = 1024;
 
-/** Размер на диске: «12.3 ГиБ», «456.7 МиБ» или «0.5 КиБ», всегда с одним знаком. */
+/** Размер на диске: «12.3 ГиБ», «456.7 МиБ», «0.5 КиБ» или «0 Б», всегда с одним знаком. */
 export function formatSize(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) {
-    return "0.0 КиБ";
+    // Пустой файл — ровно ноль: «0 Б», а не «0.0 КиБ» (ноль не во что делить).
+    return "0 Б";
   }
   if (bytes >= GIB) {
     return `${(bytes / GIB).toFixed(1)} ГиБ`;

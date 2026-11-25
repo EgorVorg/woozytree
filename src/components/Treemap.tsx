@@ -19,6 +19,7 @@ import {
   type TreemapTile,
 } from "@/lib/treemap";
 import type { TreemapRect } from "@/lib/types";
+import { cn } from "@/lib/utils";
 
 /** Бюджет раскладки: столько же, сколько у живой карты корня в Rust. */
 const MAX_RECTS = 2000;
@@ -48,6 +49,8 @@ export interface TreemapProps {
   onNavigate: (id: number, name?: string) => void;
   /** Идёт сканирование: индекс ядра ещё недоступен, ждём живые события. */
   scanning?: boolean;
+  /** Скан остановлен: карта показывает частичный срез и помечается плашкой. */
+  cancelled?: boolean;
 }
 
 interface CanvasSize {
@@ -351,6 +354,7 @@ export default function Treemap({
   folderId,
   onNavigate,
   scanning = false,
+  cancelled = false,
 }: TreemapProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [size, setSize] = useState<CanvasSize>({ width: 0, height: 0 });
@@ -606,7 +610,12 @@ export default function Treemap({
         </span>
       </header>
 
-      <div className="relative mx-4 mb-3 h-[440px] overflow-hidden border border-border bg-[#141014]">
+      <div
+        className={cn(
+          "relative mx-4 mb-3 h-[440px] overflow-hidden border bg-[#141014]",
+          cancelled ? "border-dashed border-destructive/60" : "border-border",
+        )}
+      >
         <canvas
           ref={canvasRef}
           className="block h-full w-full"
@@ -616,6 +625,15 @@ export default function Treemap({
           onPointerLeave={() => setHover(null)}
           onClick={handleClick}
         />
+
+        {cancelled ? (
+          <div
+            role="status"
+            className="pointer-events-none absolute top-2 right-2 z-10 rounded-md border border-destructive/50 bg-[#141014]/90 px-2 py-1 text-[11px] text-destructive"
+          >
+            Данные частичные
+          </div>
+        ) : null}
 
         {tooltip && tooltipTile ? (
           <div

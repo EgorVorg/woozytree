@@ -17,6 +17,7 @@ import {
   onTop,
   startScan,
 } from "@/lib/ipc";
+import { scanPercent } from "@/lib/progress";
 import { root_crumb_name } from "@/lib/treemap";
 import type {
   DriveInfo,
@@ -31,6 +32,19 @@ const EMPTY_PROGRESS: ScanProgress = {
   size_on_disk: 0,
   elapsed_ms: 0,
 };
+
+/** Диск по умолчанию: системный C:, иначе первый в списке. */
+function preferredLetter(drives: DriveInfo[]): string {
+  const preferred =
+    drives.find((drive) => drive.letter.toUpperCase() === "C:") ?? drives[0];
+  return preferred?.letter ?? "";
+}
+
+/** Занятое место диска: столько байт индекс может покрыть в лучшем случае. */
+function usedBytes(drive: DriveInfo | undefined): number {
+  if (!drive) return 0;
+  return Math.max(0, drive.total_bytes - drive.free_bytes);
+}
 
 /**
  * Кэш запросов дерева и таблицы на всё время жизни окна.
@@ -51,6 +65,7 @@ const queryClient = new QueryClient({
 
 function App() {
   const [drives, setDrives] = useState<DriveInfo[]>([]);
+  const [drivesBusy, setDrivesBusy] = useState(false);
   const [selected, setSelected] = useState("");
   const [scanning, setScanning] = useState(false);
   const [stopping, setStopping] = useState(false);
@@ -59,6 +74,12 @@ function App() {
   const [totals, setTotals] = useState<ScanTotals | null>(null);
   const [top, setTop] = useState<FolderSummary[]>([]);
   const [error, setError] = useState<string | null>(null);
+  // Скан завершился ошибкой: прогресс и итоги очищены, статус — «Ошибка».
+  const [scanError, setScanError] = useState(false);
+  // Занятое место диска на момент старта скана. Проценты считаются от него, а
+  // не от текущего выбранного диска: иначе смена диска после остановки
+  // пересчитывала бы процент уже отсканированного объёма.
+  const [scanUsed, setScanUsed] = useState(0);
   // Путь от корня сканирования до открытой папки; последний элемент — текущая.
   const [path, setPath] = useState<Crumb[]>([]);
   // Номер запуска сканирования: смена ключа сбрасывает карту к новому скану.
@@ -100,24 +121,27 @@ function App() {
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [handleUp]);
 
-  // Список дисков — один раз при открытии окна.
-  useEffect(() => {
-    let alive = true;
+  // Перечитать список дисков: кнопка в тулбаре и первичная загрузка. Выбранный
+  // диск сохраняется, если он ещё существует; иначе — C: или первый доступный.
+  const handleRefreshDrives = useCallback(() => {
+    setDrivesBusy(true);
     listDrives()
       .then((list) => {
-        if (!alive) return;
         setDrives(list);
-        const preferred =
-          list.find((drive) => drive.letter.toUpperCase() === "C:") ?? list[0];
-        if (preferred) setSelected(preferred.letter);
+        setSelected((current) =>
+          list.some((drive) => drive.letter === current)
+            ? current
+            : preferredLetter(list),
+        );
       })
-      .catch((err: unknown) => {
-        if (alive) setError(String(err));
-      });
-    return () => {
-      alive = false;
-    };
+      .catch((err: unknown) => setError(String(err)))
+      .finally(() => setDrivesBusy(false));
   }, []);
+
+  // Список дисков — при открытии окна и по кнопке «Обновить список дисков».
+  useEffect(() => {
+    handleRefreshDrives();
+  }, [handleRefreshDrives]);
 
   // Подписка на события сканирования; отписка — при закрытии окна.
   useEffect(() => {
@@ -142,6 +166,7 @@ function App() {
     subscribe(onDone, (result) => {
       setTotals(result);
       setCancelled(result.cancelled);
+      setScanError(false);
       setProgress({
         files: result.files,
         folders: result.folders,
@@ -153,6 +178,15 @@ function App() {
     });
     subscribe(onError, (message) => {
       setError(message);
+      // Ошибка — не «Готово»: недостоверные прогресс и итоги убираем, статус
+      // показывает «Ошибка», а не последний удачный результат. Карту и панели
+      // тоже прячем: иначе под «данные не собраны» остались бы строки прошлого
+      // индекса, а корень дерева уже показывал бы 0 Б.
+      setScanError(true);
+      setProgress(null);
+      setTotals(null);
+      setTop([]);
+      setPath([]);
       setCancelled(false);
       setScanning(false);
       setStopping(false);
@@ -165,37 +199,40 @@ function App() {
   }, []);
 
   // Заполненность бара — доля занятого места диска, уже попавшая в индекс.
-  // У остановленного скана остаётся частичное значение: 100 % означало бы,
-  // что данные полные, а их такими показывать нельзя.
-  const percent = (() => {
-    const drive = drives.find((item) => item.letter === selected);
-    const used = drive ? drive.total_bytes - drive.free_bytes : 0;
-    const live =
-      used > 0 && progress
-        ? Math.min(99, Math.round((progress.size_on_disk / used) * 100))
-        : 0;
-    if (cancelled) return live;
-    if (!scanning) {
-      return totals ? 100 : 0;
-    }
-    return live;
-  })();
+  // База (`scanUsed`) зафиксирована на старте скана: смена выбранного диска
+  // после остановки не должна пересчитывать процент уже собранных данных.
+  const percent = scanPercent({
+    scannedBytes: progress?.size_on_disk ?? 0,
+    scannedUsed: scanUsed,
+    scanning,
+    cancelled,
+    finished: totals !== null,
+  });
 
   const handleScan = () => {
     if (!selected) return;
     setError(null);
+    setScanError(false);
     setTotals(null);
     setTop([]);
     setProgress(EMPTY_PROGRESS);
     setCancelled(false);
     setScanning(true);
     setStopping(false);
+    // База процентов — выбранный сейчас диск; дальше она не меняется, даже
+    // если пользователь переключит селектор после остановки скана.
+    setScanUsed(usedBytes(drives.find((drive) => drive.letter === selected)));
     // Новая карта начинается с корня выбранного диска:
     // «C:» → «C:\» (без двойного двоеточия).
     setPath([{ id: 0, name: root_crumb_name(selected) }]);
     setScanRun((run) => run + 1);
     startScan({ drive: selected }).catch((err: unknown) => {
       setError(String(err));
+      setScanError(true);
+      setProgress(null);
+      setTotals(null);
+      setTop([]);
+      setPath([]);
       setScanning(false);
       setStopping(false);
     });
@@ -240,9 +277,11 @@ function App() {
             selected={selected}
             scanning={scanning}
             stopping={stopping}
+            refreshing={drivesBusy}
             onSelect={setSelected}
             onScan={handleScan}
             onStop={handleStop}
+            onRefreshDrives={handleRefreshDrives}
           />
 
           {error ? (
@@ -270,6 +309,7 @@ function App() {
                 folderId={folderId}
                 onNavigate={handleMapNavigate}
                 scanning={scanning}
+                cancelled={cancelled}
               />
               <div className="grid min-w-0 grid-cols-1 gap-4 lg:grid-cols-[minmax(240px,320px)_minmax(0,1fr)]">
                 <FolderTree
@@ -294,6 +334,7 @@ function App() {
             scanning={scanning}
             stopping={stopping}
             cancelled={cancelled}
+            failed={scanError}
             skipped={totals?.skipped ?? 0}
           />
 

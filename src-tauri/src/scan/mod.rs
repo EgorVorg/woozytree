@@ -76,8 +76,17 @@ impl LiveEmitter {
 
     /// Прогресс уходит всегда, топ и карта — по таймеру. При нулевом интервале
     /// (тесты) событие приходит на каждом батче движка.
+    ///
+    /// Размер для экрана берём из индекса, а не из цифры движка: движок считает
+    /// «сырые» байты, где повторные жёсткие ссылки учтены дважды. Индекс их
+    /// дедуплицирует, поэтому прогресс на экране совпадает с живым топом и
+    /// итогами, а не расходится с ними на десятки процентов.
     fn on_progress(&mut self, sink: &mut dyn ScanSink, progress: &ScanProgress, index: &ScanIndex) {
-        sink.progress(progress);
+        let live = ScanProgress {
+            size_on_disk: index.folder_totals(index.root()).size_on_disk,
+            ..progress.clone()
+        };
+        sink.progress(&live);
         if self.interval.is_zero() || self.last_emit.elapsed() >= self.interval {
             self.emit(sink, index);
         }
@@ -611,6 +620,39 @@ mod tests {
             sink.done.as_ref().is_some_and(|done| done.is_ok()),
             "по завершении sink должен получить итоги: {:?}",
             sink.done
+        );
+    }
+
+    #[test]
+    fn progress_size_comes_from_index_without_hard_link_doubles() {
+        let dir = test_dir();
+        let first = dir.path().join("first.bin");
+        std::fs::write(&first, vec![0u8; 4096]).unwrap();
+        std::fs::hard_link(&first, dir.path().join("second.bin"))
+            .expect("NTFS должен поддерживать жёсткие ссылки");
+
+        let mut index = ScanIndex::new("folder");
+        let cancel = AtomicBool::new(false);
+        let mut sink = RecordingSink::default();
+        let totals = run_scan(
+            &ScanTarget::Folder(dir.path().to_path_buf()),
+            &mut index,
+            &mut sink,
+            &cancel,
+        )
+        .expect("сканирование папки должно завершиться без ошибки");
+
+        assert_eq!(totals.files, 2, "обе жёсткие ссылки — отдельные имена");
+        let indexed = index.folder_totals(index.root()).size_on_disk;
+        assert_eq!(
+            totals.size_on_disk, indexed,
+            "итоги не должны задваивать жёсткую ссылку"
+        );
+        let live = sink.progress.last().expect("прогресс обязан прийти");
+        assert_eq!(
+            live.size_on_disk, indexed,
+            "прогресс не должен показывать сырые байты движка: на экране он \
+             обязан совпадать с живым топом и итогами"
         );
     }
 

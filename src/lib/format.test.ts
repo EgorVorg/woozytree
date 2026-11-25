@@ -18,9 +18,17 @@ describe("formatSize", () => {
     expect(formatSize(3.2 * GIB)).toBe("3.2 ГиБ");
   });
 
-  it("format_size_keeps_one_decimal_for_zero_and_invalid", () => {
-    expect(formatSize(0)).toBe("0.0 КиБ");
-    expect(formatSize(Number.NaN)).toBe("0.0 КиБ");
+  it("format_size_shows_zero_bytes_without_decimals", () => {
+    expect(formatSize(0)).toBe("0 Б");
+    expect(formatSize(Number.NaN)).toBe("0 Б");
+    expect(formatSize(-1)).toBe("0 Б");
+  });
+
+  it("format_size_uses_kib_for_sizes_below_one_mib", () => {
+    expect(formatSize(1)).toBe("0.0 КиБ");
+    expect(formatSize(KIB)).toBe("1.0 КиБ");
+    expect(formatSize(MIB - 1024)).toBe("1023.0 КиБ");
+    expect(formatSize(MIB)).toBe("1.0 МиБ");
   });
 });
 
