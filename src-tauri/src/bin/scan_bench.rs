@@ -430,6 +430,7 @@ fn main() {
     let target = args.first().cloned().unwrap_or_else(|| "C:".to_string());
 
     let mut index = ScanIndex::new(&target);
+    let into = index.root();
     let cancel = AtomicBool::new(false);
     let mut progress_calls = 0u64;
     let mut last_progress = ScanProgress {
@@ -452,12 +453,17 @@ fn main() {
         VolumeReader::from_fixture(Path::new(path), 1024)
             .map_err(describe)
             .and_then(|reader| {
-                let scanned =
-                    scan_ntfs_reader_diag(&reader, &mut index, &cancel, &mut |progress, _index| {
+                let scanned = scan_ntfs_reader_diag(
+                    &reader,
+                    &mut index,
+                    into,
+                    &cancel,
+                    &mut |progress, _index| {
                         progress_calls += 1;
                         last_progress = progress.clone();
-                    })
-                    .map_err(describe);
+                    },
+                )
+                .map_err(describe);
                 if let Ok((_, breakdown)) = &scanned {
                     diag = Some(*breakdown);
                 }
@@ -481,12 +487,17 @@ fn main() {
                 .boot_sector()
                 .map_or(0, |boot| boot.volume_serial as u32)
         );
-        let scanned =
-            scan_ntfs_reader_diag(&reader, &mut index, &cancel, &mut |progress, _index| {
+        let scanned = scan_ntfs_reader_diag(
+            &reader,
+            &mut index,
+            into,
+            &cancel,
+            &mut |progress, _index| {
                 progress_calls += 1;
                 last_progress = progress.clone();
-            })
-            .map_err(describe);
+            },
+        )
+        .map_err(describe);
         if let Ok((_, breakdown)) = &scanned {
             diag = Some(*breakdown);
         }

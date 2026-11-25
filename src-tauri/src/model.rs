@@ -1,6 +1,24 @@
 //! Модель данных сканера: идентификаторы папок, ключи файлов, DTO для фронтенда.
 
+use std::path::PathBuf;
+
 pub type FolderId = u32;
+
+/// Что сканировать: целый диск, отдельную папку или все диски разом.
+///
+/// serde externally-tagged (по умолчанию для enum, `snake_case` — для имён
+/// вариантов): `{"drive": "C"}` | `{"folder": "C:\\Temp"}` |
+/// `{"all_drives": ["C:", "D:"]}`. Все варианты — объекты, поэтому TS-тип
+/// `ScanTarget` простой (см. `src/lib/types.ts`).
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanTarget {
+    Drive(String),
+    Folder(PathBuf),
+    /// Буквы томов от фронтенда (`list_drives`); каждый том сканируется в свою
+    /// подпапку корня индекса.
+    AllDrives(Vec<String>),
+}
 
 /// Уникальный ключ файла на диске (номер тома + файловая запись).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

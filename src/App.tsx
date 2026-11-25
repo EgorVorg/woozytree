@@ -15,6 +15,7 @@ import {
   onError,
   onProgress,
   onTop,
+  pickFolder,
   startScan,
 } from "@/lib/ipc";
 import { scanPercent } from "@/lib/progress";
@@ -22,7 +23,9 @@ import { root_crumb_name } from "@/lib/treemap";
 import type {
   DriveInfo,
   FolderSummary,
+  ScanChoice,
   ScanProgress,
+  ScanTarget,
   ScanTotals,
 } from "@/lib/types";
 
@@ -47,6 +50,52 @@ function usedBytes(drive: DriveInfo | undefined): number {
 }
 
 /**
+ * Занятое место всего выбранного охвата на момент старта — база процентов.
+ *
+ * Для папки базы нет (её размер заранее неизвестен), поэтому делить не на что:
+ * бар покажет 0 % до завершения и 100 % по итогам.
+ */
+function scanBaseBytes(choice: ScanChoice, drives: DriveInfo[]): number {
+  if (choice.kind === "folder") return 0;
+  if (choice.kind === "all") {
+    return drives.reduce((sum, drive) => sum + usedBytes(drive), 0);
+  }
+  return usedBytes(drives.find((drive) => drive.letter === choice.letter));
+}
+
+/**
+ * Имя корневой хлебной крошки: «C:\» для диска, «Все диски» для общего охвата,
+ * путь папки — для сканирования папки.
+ */
+function rootCrumb(choice: ScanChoice): string {
+  switch (choice.kind) {
+    case "all":
+      return "Все диски";
+    case "folder":
+      // Корень диска («C:\») не обрезаем, у остальных путей убираем хвостовой
+      // разделитель — иначе крошка выглядела бы как «C:\Temp\».
+      return choice.path.length > 3
+        ? choice.path.replace(/[\\/]+$/, "")
+        : choice.path;
+    default:
+      return root_crumb_name(choice.letter);
+  }
+}
+
+/** Цель сканирования для ядра по выбору в тулбаре. */
+function scanTargetOf(choice: ScanChoice, drives: DriveInfo[]): ScanTarget {
+  switch (choice.kind) {
+    case "all":
+      // «Все диски» — буквы из list_drives: ядро развернёт их в подпапки.
+      return { all_drives: drives.map((drive) => drive.letter) };
+    case "folder":
+      return { folder: choice.path };
+    default:
+      return { drive: choice.letter };
+  }
+}
+
+/**
  * Кэш запросов дерева и таблицы на всё время жизни окна.
  *
  * Данные индекса после сканирования не меняются, поэтому свежесть не
@@ -66,7 +115,7 @@ const queryClient = new QueryClient({
 function App() {
   const [drives, setDrives] = useState<DriveInfo[]>([]);
   const [drivesBusy, setDrivesBusy] = useState(false);
-  const [selected, setSelected] = useState("");
+  const [choice, setChoice] = useState<ScanChoice | null>(null);
   const [scanning, setScanning] = useState(false);
   const [stopping, setStopping] = useState(false);
   const [cancelled, setCancelled] = useState(false);
@@ -125,16 +174,20 @@ function App() {
 
   // Перечитать список дисков: кнопка в тулбаре и первичная загрузка. Выбранный
   // диск сохраняется, если он ещё существует; иначе — C: или первый доступный.
+  // «Все диски» и папка от списка не зависят и сохраняются как есть.
   const handleRefreshDrives = useCallback(() => {
     setDrivesBusy(true);
     listDrives()
       .then((list) => {
         setDrives(list);
-        setSelected((current) =>
-          list.some((drive) => drive.letter === current)
+        setChoice((current) => {
+          if (current === null || current.kind !== "drive") {
+            return current ?? { kind: "drive", letter: preferredLetter(list) };
+          }
+          return list.some((drive) => drive.letter === current.letter)
             ? current
-            : preferredLetter(list),
-        );
+            : { kind: "drive", letter: preferredLetter(list) };
+        });
       })
       .catch((err: unknown) => setError(String(err)))
       .finally(() => setDrivesBusy(false));
@@ -211,8 +264,26 @@ function App() {
     finished: totals !== null,
   });
 
+  const handleSelectDrive = useCallback((letter: string) => {
+    setChoice({ kind: "drive", letter });
+  }, []);
+
+  const handleSelectAllDrives = useCallback(() => {
+    setChoice({ kind: "all" });
+  }, []);
+
+  // «Папка…»: системный диалог; отмена диалога оставляет прежний выбор.
+  const handlePickFolder = useCallback(() => {
+    pickFolder()
+      .then((path) => {
+        if (path) setChoice({ kind: "folder", path });
+      })
+      .catch((err: unknown) => setError(String(err)));
+  }, []);
+
   const handleScan = () => {
-    if (!selected) return;
+    if (choice === null) return;
+    const target = scanTargetOf(choice, drives);
     setError(null);
     setScanError(false);
     setTotals(null);
@@ -221,14 +292,13 @@ function App() {
     setCancelled(false);
     setScanning(true);
     setStopping(false);
-    // База процентов — выбранный сейчас диск; дальше она не меняется, даже
+    // База процентов — занятое место всего охвата; дальше она не меняется, даже
     // если пользователь переключит селектор после остановки скана.
-    setScanUsed(usedBytes(drives.find((drive) => drive.letter === selected)));
-    // Новая карта начинается с корня выбранного диска:
-    // «C:» → «C:\» (без двойного двоеточия).
-    setPath([{ id: 0, name: root_crumb_name(selected) }]);
+    setScanUsed(scanBaseBytes(choice, drives));
+    // Новая карта начинается с корня охвата: «C:\», «Все диски» или путь папки.
+    setPath([{ id: 0, name: rootCrumb(choice) }]);
     setScanRun((run) => run + 1);
-    startScan({ drive: selected }).catch((err: unknown) => {
+    startScan(target).catch((err: unknown) => {
       setError(String(err));
       setScanError(true);
       setProgress(null);
@@ -276,11 +346,13 @@ function App() {
 
           <Toolbar
             drives={drives}
-            selected={selected}
+            choice={choice}
             scanning={scanning}
             stopping={stopping}
             refreshing={drivesBusy}
-            onSelect={setSelected}
+            onSelectDrive={handleSelectDrive}
+            onSelectAllDrives={handleSelectAllDrives}
+            onPickFolder={handlePickFolder}
             onScan={handleScan}
             onStop={handleStop}
             onRefreshDrives={handleRefreshDrives}

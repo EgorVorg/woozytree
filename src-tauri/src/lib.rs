@@ -133,7 +133,7 @@ fn error_text(err: &ScanError) -> String {
     }
 }
 
-/// Имя корневой папки индекса: буква диска или имя выбранной папки.
+/// Имя корневой папки индекса: буква диска, имя выбранной папки или «Все диски».
 fn root_name(target: &ScanTarget) -> String {
     match target {
         ScanTarget::Drive(letter) => drive_root(letter),
@@ -141,6 +141,8 @@ fn root_name(target: &ScanTarget) -> String {
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string()),
+        // «Все диски» — общий корень: в нём лежат подпапки с именами томов.
+        ScanTarget::AllDrives(_) => "Все диски".to_string(),
     }
 }
 
@@ -304,6 +306,8 @@ fn get_treemap(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Системные диалоги: выбор папки для сканирования (и сохранение CSV).
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState {
             service: Arc::new(ScanService::new()),
         })
@@ -381,5 +385,27 @@ mod tests {
             text.contains("size_on_disk") && text.contains("modified"),
             "ошибка должна перечислять допустимые колонки: {text}"
         );
+    }
+
+    #[test]
+    fn root_name_of_all_drives_is_shared_root() {
+        let target = ScanTarget::AllDrives(vec!["C:".to_string(), "D:".to_string()]);
+        assert_eq!(root_name(&target), "Все диски");
+        // У одиночного диска имя корня прежнее — буква с обратным слэшем.
+        assert_eq!(root_name(&ScanTarget::Drive("C:".to_string())), "C:\\");
+    }
+
+    #[test]
+    fn all_drives_target_comes_from_frontend_as_object() {
+        // Внешняя разметка serde: все варианты — объекты, имена — snake_case.
+        let target: ScanTarget =
+            serde_json::from_str(r#"{"all_drives":["C:","D:"]}"#).expect("all_drives из окна");
+        match target {
+            ScanTarget::AllDrives(letters) => assert_eq!(letters, ["C:", "D:"]),
+            other => panic!("ожидался AllDrives, получено {other:?}"),
+        }
+        let folder: ScanTarget =
+            serde_json::from_str(r#"{"folder":"C:\\Temp"}"#).expect("папка из окна");
+        assert!(matches!(folder, ScanTarget::Folder(path) if path.ends_with("Temp")));
     }
 }

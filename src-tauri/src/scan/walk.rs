@@ -52,13 +52,18 @@ fn is_skippable_reparse(is_dir: bool, attributes: u32) -> bool {
     is_dir && attributes & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
 }
 
-/// Обойти папку `root` и сложить найденное в `index`.
+/// Обойти папку `root` и сложить найденное в `index` под папку `into`.
+///
+/// `into` — узел индекса, в который попадают записи корня обхода: для одиночного
+/// диска или папки это корень индекса, для тома в «Все диски» — подпапка с
+/// именем диска. Своё имя корень обхода узла не создаёт.
 ///
 /// Обход итеративный (явный стек), поэтому глубокая вложенность не переполняет стек.
 /// Ошибки отдельных записей не прерывают обход — они попадают в [`WalkStats::skipped`].
 pub fn walk(
     root: &Path,
     index: &mut ScanIndex,
+    into: FolderId,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(&ScanProgress, &ScanIndex),
 ) -> Result<WalkStats, ScanError> {
@@ -71,8 +76,7 @@ pub fn walk(
     let mut bytes = 0u64;
     let mut next_report_at = PROGRESS_EVERY_FILES;
 
-    let root_id = index.root();
-    let mut stack: Vec<(PathBuf, FolderId, bool)> = vec![(root.to_path_buf(), root_id, true)];
+    let mut stack: Vec<(PathBuf, FolderId, bool)> = vec![(root.to_path_buf(), into, true)];
 
     'walk: while let Some((dir_path, dir_id, is_root)) = stack.pop() {
         if cancel.load(Ordering::Relaxed) {
@@ -174,7 +178,7 @@ pub fn walk(
             bytes += size_on_disk;
 
             if files >= next_report_at {
-                report(progress, index, files, bytes, started);
+                report(progress, index, into, files, bytes, started);
                 next_report_at += PROGRESS_EVERY_FILES;
                 if cancel.load(Ordering::Relaxed) {
                     break 'walk;
@@ -184,20 +188,23 @@ pub fn walk(
     }
 
     // Итоговый отчёт нужен и после отмены: UI должен увидеть, сколько успели.
-    report(progress, index, files, bytes, started);
+    report(progress, index, into, files, bytes, started);
     Ok(stats)
 }
 
 fn report(
     progress: &mut dyn FnMut(&ScanProgress, &ScanIndex),
     index: &ScanIndex,
+    into: FolderId,
     files: u64,
     size_on_disk: u64,
     started: Instant,
 ) {
     // Папки берём из индекса, а не из локального счётчика: обход создаёт узлы
     // дерева сразу, поэтому счётчик живой и совпадает с итогами сканирования.
-    let folders = u64::from(index.folder_totals(index.root()).folder_count);
+    // Считаем именно `into`, а не корень индекса: у «Все диски» в корне лежат
+    // ещё и подпапки других томов, их сюда включать нельзя.
+    let folders = u64::from(index.folder_totals(into).folder_count);
     progress(
         &ScanProgress {
             files,
@@ -276,9 +283,10 @@ mod tests {
 
     fn walk_index(root: &Path) -> (ScanIndex, WalkStats) {
         let mut index = ScanIndex::new("root");
+        let into = index.root();
         let cancel = AtomicBool::new(false);
         let mut reports = Vec::new();
-        let stats = walk(root, &mut index, &cancel, &mut |progress, _index| {
+        let stats = walk(root, &mut index, into, &cancel, &mut |progress, _index| {
             reports.push(progress.clone())
         })
         .expect("walk должен завершиться без ошибки");
@@ -380,8 +388,9 @@ mod tests {
         // Без префикса Windows может отклонить длинный путь — это допустимо, но
         // walk обязан вернуть Ok, а недоступное — учесть в skipped.
         let mut plain_index = ScanIndex::new("root");
+        let into = plain_index.root();
         let cancel = AtomicBool::new(false);
-        let plain_stats = walk(root, &mut plain_index, &cancel, &mut |_, _| {})
+        let plain_stats = walk(root, &mut plain_index, into, &cancel, &mut |_, _| {})
             .expect("walk без префикса обязан вернуть Ok даже при недоступных путях");
         let plain_totals = plain_index.folder_totals(plain_index.root());
         if plain_totals.file_count != 2 || plain_totals.size_logical != 7 + 11 {
@@ -455,7 +464,10 @@ mod tests {
             .status();
 
         let totals = index.folder_totals(index.root());
-        assert_eq!(totals.file_count, 1, "файл с закрытыми данными должен быть учтён");
+        assert_eq!(
+            totals.file_count, 1,
+            "файл с закрытыми данными должен быть учтён"
+        );
         assert_eq!(totals.size_logical, 64);
         assert!(totals.size_on_disk >= 64);
         assert_eq!(stats.skipped, 0, "пропусков быть не должно: {:?}", stats);
@@ -629,8 +641,9 @@ mod tests {
         std::fs::remove_dir_all(&target).unwrap(); // цель удалена — ссылка «в никуда»
 
         let mut index = ScanIndex::new("root");
+        let into = index.root();
         let cancel = AtomicBool::new(false);
-        let result = walk(dir.path(), &mut index, &cancel, &mut |_, _| {});
+        let result = walk(dir.path(), &mut index, into, &cancel, &mut |_, _| {});
         std::fs::remove_dir(&junction).ok();
 
         let stats = result.expect("висячий junction не должен ронять обход");
@@ -650,10 +663,17 @@ mod tests {
         }
 
         let mut index = ScanIndex::new("root");
+        let into = index.root();
         let cancel = AtomicBool::new(false);
-        walk(dir.path(), &mut index, &cancel, &mut |_progress, _index| {
-            cancel.store(true, Ordering::Relaxed);
-        })
+        walk(
+            dir.path(),
+            &mut index,
+            into,
+            &cancel,
+            &mut |_progress, _index| {
+                cancel.store(true, Ordering::Relaxed);
+            },
+        )
         .expect("отмена — не ошибка");
 
         let totals = index.folder_totals(index.root());

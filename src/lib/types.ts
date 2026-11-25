@@ -40,8 +40,17 @@ export interface DriveInfo {
   free_bytes: number;
 }
 
-/** Что сканировать: `{"drive": "C:"}` или `{"folder": "C:\\Temp"}`. */
-export type ScanTarget = { drive: string } | { folder: string };
+/** Что сканировать: `{"drive": "C:"}`, `{"folder": "C:\\Temp"}` или `{"all_drives": ["C:", "D:"]}`. */
+export type ScanTarget =
+  | { drive: string }
+  | { folder: string }
+  | { all_drives: string[] };
+
+/** Выбор в селекторе тулбара: все диски, конкретный диск или отдельная папка. */
+export type ScanChoice =
+  | { kind: "all" }
+  | { kind: "drive"; letter: string }
+  | { kind: "folder"; path: string };
 
 /** Одна строка таблицы файлов (`FilePage.rows`). */
 export interface FileRow {

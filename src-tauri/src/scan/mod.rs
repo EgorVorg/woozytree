@@ -11,7 +11,7 @@ pub mod walk;
 #[cfg(test)]
 mod test_support;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -21,10 +21,16 @@ use windows::Win32::Storage::FileSystem::{
 };
 use windows::core::PCWSTR;
 
-use crate::model::{DriveInfo, FolderSummary, ScanError, ScanProgress, ScanTotals, TreemapRect};
+use crate::model::{
+    DriveInfo, FolderId, FolderSummary, ScanError, ScanProgress, ScanTotals, TreemapRect,
+};
 use crate::scan::index::ScanIndex;
 use crate::scan::mft::scan_ntfs;
 use crate::scan::walk::walk;
+
+// Что сканировать, — часть модели данных: `ScanTarget` живёт в `model.rs`,
+// здесь он реэкспортируется, чтобы прежние пути `scan::ScanTarget` работали.
+pub use crate::model::ScanTarget;
 
 /// Сколько самых тяжёлых папок корня показывать в топе.
 const TOP_FOLDERS_LIMIT: usize = 20;
@@ -38,16 +44,6 @@ const LIVE_INTERVAL: Duration = Duration::from_secs(1);
 /// Бюджет прямоугольников живой карты: столько же отдаёт команда `get_treemap`
 /// для уровня корня. Больше — дороже JSON и отрисовка, меньше — теряется детализация.
 const LIVE_TREEMAP_RECTS: usize = 2000;
-
-/// Что сканировать: целый диск или отдельную папку.
-///
-/// В JSON это `{"drive": "C"}` или `{"folder": "C:\\Temp"}`.
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ScanTarget {
-    Drive(String),
-    Folder(PathBuf),
-}
 
 /// Приёмник событий сканирования (в приложении — отправка в окно).
 pub trait ScanSink {
@@ -178,6 +174,23 @@ pub fn run_scan(
     run_scan_with_interval(target, index, sink, cancel, LIVE_INTERVAL)
 }
 
+/// Сканирование нескольких корней в подпапки корня индекса («Все диски»).
+///
+/// `roots` — пары «имя подпапки → цель сканирования»: каждый том получает в
+/// корне индекса собственную папку (например, «C:»), а его записи достраиваются
+/// уже в неё. Итоги складываются, прогресс — общий счётчик по всем томам.
+///
+/// Имя корня индекса задаёт вызывающий (`ScanIndex::new`): для приложения это
+/// «Все диски» (см. `crate::root_name`).
+pub fn run_scan_all(
+    index: &mut ScanIndex,
+    roots: &[(String, ScanTarget)],
+    sink: &mut dyn ScanSink,
+    cancel: &AtomicBool,
+) -> Result<ScanTotals, ScanError> {
+    run_scan_all_with_interval(index, roots, sink, cancel, LIVE_INTERVAL)
+}
+
 /// `run_scan` с явным периодом живых событий: тесты передают `Duration::ZERO`
 /// и получают топ/карту на каждом батче, не дожидаясь секунды.
 fn run_scan_with_interval(
@@ -188,28 +201,101 @@ fn run_scan_with_interval(
     live_interval: Duration,
 ) -> Result<ScanTotals, ScanError> {
     let mut live = LiveEmitter::new(live_interval);
-    let result = match target {
-        // NTFS-том читаем напрямую; всё остальное — обходом.
-        ScanTarget::Drive(letter) if is_ntfs(letter) => {
-            let fast = {
-                let mut report =
-                    |p: &ScanProgress, current: &ScanIndex| live.on_progress(sink, p, current);
-                scan_ntfs(letter, index, cancel, &mut report)
-            };
-            // Нет прав на том — не тупик: тот же охват обходом, без ошибки в окне.
-            with_walk_fallback(fast, || {
-                let mut report =
-                    |p: &ScanProgress, current: &ScanIndex| live.on_progress(sink, p, current);
-                walk_target(target, index, cancel, &mut report)
-            })
-        }
-        _ => {
-            let mut report =
-                |p: &ScanProgress, current: &ScanIndex| live.on_progress(sink, p, current);
-            walk_target(target, index, cancel, &mut report)
-        }
-    };
 
+    // «Все диски» — не один движок, а последовательность томов: каждый том
+    // сканируется в свою подпапку, поэтому дальше идёт отдельный путь.
+    if let ScanTarget::AllDrives(letters) = target {
+        let roots: Vec<(String, ScanTarget)> = letters
+            .iter()
+            .map(|letter| (drive_folder_name(letter), ScanTarget::Drive(letter.clone())))
+            .collect();
+        return run_scan_all_with_interval(index, &roots, sink, cancel, live_interval);
+    }
+
+    let into = index.root();
+    let mut report = |p: &ScanProgress, current: &ScanIndex| live.on_progress(sink, p, current);
+    let result = scan_one(target, index, into, cancel, &mut report);
+    drop(report);
+
+    finish_scan(result, index, sink, cancel)
+}
+
+/// `run_scan_all` с явным периодом живых событий (см. [`run_scan_with_interval`]).
+fn run_scan_all_with_interval(
+    index: &mut ScanIndex,
+    roots: &[(String, ScanTarget)],
+    sink: &mut dyn ScanSink,
+    cancel: &AtomicBool,
+    live_interval: Duration,
+) -> Result<ScanTotals, ScanError> {
+    let started = Instant::now();
+    let mut live = LiveEmitter::new(live_interval);
+    let mut totals = ScanTotals {
+        files: 0,
+        folders: 0,
+        size_on_disk: 0,
+        size_logical: 0,
+        skipped: 0,
+        cancelled: false,
+        elapsed_ms: 0,
+    };
+    // Сколько уже собрано с завершённых томов: прогресс следующего тома
+    // продолжается с общей суммы, а не начинается с нуля.
+    let mut done_files = 0u64;
+    let mut done_folders = 0u64;
+
+    for (name, target) in roots {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Подпапка тома создаётся до сканирования: в неё движок достраивает
+        // записи, поэтому даже пустой том виден в корне.
+        let into = index.folder(index.root(), name);
+        let volume = {
+            let mut report = |p: &ScanProgress, current: &ScanIndex| {
+                let progress = ScanProgress {
+                    files: done_files.saturating_add(p.files),
+                    folders: done_folders.saturating_add(p.folders),
+                    size_on_disk: p.size_on_disk,
+                    elapsed_ms: started.elapsed().as_millis() as u64,
+                };
+                live.on_progress(sink, &progress, current);
+            };
+            scan_one(target, index, into, cancel, &mut report)
+        };
+
+        match volume {
+            Ok(volume) => {
+                done_files = done_files.saturating_add(volume.files);
+                done_folders = done_folders.saturating_add(volume.folders);
+                totals.files = totals.files.saturating_add(volume.files);
+                totals.folders = totals.folders.saturating_add(volume.folders);
+                totals.size_on_disk = totals.size_on_disk.saturating_add(volume.size_on_disk);
+                totals.size_logical = totals.size_logical.saturating_add(volume.size_logical);
+                totals.skipped = totals.skipped.saturating_add(volume.skipped);
+            }
+            // Ошибка одного тома прерывает весь скан, как и у одиночной цели:
+            // молча пропустить диск значило бы показать неполные итоги как полные.
+            Err(err) => {
+                sink.done(Err(&err));
+                return Err(err);
+            }
+        }
+    }
+
+    totals.cancelled = cancel.load(Ordering::Relaxed);
+    totals.elapsed_ms = started.elapsed().as_millis() as u64;
+    finish_scan(Ok(totals), index, sink, cancel)
+}
+
+/// Итоговые события сканирования: флаг частичности, топ, карта и `done`.
+fn finish_scan(
+    result: Result<ScanTotals, ScanError>,
+    index: &ScanIndex,
+    sink: &mut dyn ScanSink,
+    cancel: &AtomicBool,
+) -> Result<ScanTotals, ScanError> {
     match result {
         Ok(mut totals) => {
             // Флаг отмены — единственный достоверный признак частичности на момент
@@ -229,21 +315,51 @@ fn run_scan_with_interval(
     }
 }
 
-/// Скан папки (или не-NTFS диска) обходом: итоги собираются из корня индекса.
-fn walk_target(
+/// Сканирование одной цели в папку `into`: выбор движка и запасной обход.
+///
+/// `into` — узел индекса, под который достраиваются записи (для одиночного
+/// диска и папки — корень индекса, для «Все диски» — подпапка с именем тома).
+fn scan_one(
     target: &ScanTarget,
     index: &mut ScanIndex,
+    into: FolderId,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(&ScanProgress, &ScanIndex),
 ) -> Result<ScanTotals, ScanError> {
-    let root = match target {
-        ScanTarget::Folder(path) => path.clone(),
-        ScanTarget::Drive(letter) => PathBuf::from(drive_root(letter)),
-    };
+    match target {
+        // NTFS-том читаем напрямую; всё остальное — обходом.
+        ScanTarget::Drive(letter) if is_ntfs(letter) => {
+            let fast = scan_ntfs(letter, index, into, cancel, progress);
+            // Нет прав на том — не тупик: тот же охват обходом, без ошибки в окне.
+            let root = PathBuf::from(drive_root(letter));
+            with_walk_fallback(fast, move || {
+                scan_folder_into(&root, index, into, cancel, progress)
+            })
+        }
+        ScanTarget::Drive(letter) => {
+            let root = PathBuf::from(drive_root(letter));
+            scan_folder_into(&root, index, into, cancel, progress)
+        }
+        ScanTarget::Folder(path) => scan_folder_into(path, index, into, cancel, progress),
+        // «Все диски» — не отдельная цель движка, а набор томов; вложение этого
+        // варианта в подпапку было бы ошибкой вызывающего кода.
+        ScanTarget::AllDrives(_) => Err(ScanError::Io(
+            "«Все диски» нельзя сканировать во вложенную папку".to_string(),
+        )),
+    }
+}
 
+/// Скан папки (или не-NTFS диска) обходом в папку `into`.
+fn scan_folder_into(
+    root: &Path,
+    index: &mut ScanIndex,
+    into: FolderId,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(&ScanProgress, &ScanIndex),
+) -> Result<ScanTotals, ScanError> {
     let started = Instant::now();
-    let stats = walk(&root, index, cancel, progress)?;
-    let totals = index.folder_totals(index.root());
+    let stats = walk(root, index, into, cancel, progress)?;
+    let totals = index.folder_totals(into);
 
     Ok(ScanTotals {
         files: u64::from(totals.file_count),
@@ -341,6 +457,13 @@ impl ScanService {
 pub(crate) fn drive_root(drive_letter: &str) -> String {
     let letter = drive_letter.trim_end_matches('\\').trim_end_matches(':');
     format!("{letter}:\\")
+}
+
+/// Имя подпапки тома в корне «Все диски»: `C`/`C:`/`C:\` → `C:`.
+///
+/// WizTree называет диски в корне «Все диски» как «C:», «D:» — так же и здесь.
+fn drive_folder_name(drive_letter: &str) -> String {
+    drive_root(drive_letter).trim_end_matches('\\').to_string()
 }
 
 /// Лежит ли на диске файловая система NTFS.
@@ -665,9 +788,16 @@ mod tests {
 
         // Эталон: прямой обход той же папки.
         let mut direct = ScanIndex::new("folder");
+        let direct_into = direct.root();
         let cancel = AtomicBool::new(false);
-        let stats = walk::walk(dir.path(), &mut direct, &cancel, &mut |_, _| {})
-            .expect("прямой обход должен пройти без ошибки");
+        let stats = walk::walk(
+            dir.path(),
+            &mut direct,
+            direct_into,
+            &cancel,
+            &mut |_, _| {},
+        )
+        .expect("прямой обход должен пройти без ошибки");
         let direct_totals = direct.folder_totals(direct.root());
 
         let mut index = ScanIndex::new("folder");
@@ -786,6 +916,226 @@ mod tests {
             }
             other => panic!("ожидалась VolumeAccess с обеими причинами, получено {other:?}"),
         }
+    }
+
+    /// Приёмник-обёртка: просит отмену, как только общий прогресс перевалил за
+    /// заданное число файлов. Нужен тесту «Все диски»: отмена должна случиться
+    /// на втором томе, а не до первого.
+    struct CancelOnProgress {
+        cancel: Arc<AtomicBool>,
+        cancel_above_files: u64,
+        inner: RecordingSink,
+    }
+
+    impl ScanSink for CancelOnProgress {
+        fn progress(&mut self, p: &ScanProgress) {
+            if p.files > self.cancel_above_files {
+                self.cancel.store(true, Ordering::Relaxed);
+            }
+            self.inner.progress(p);
+        }
+
+        fn top_folders(&mut self, rows: &[FolderSummary]) {
+            self.inner.top_folders(rows);
+        }
+
+        fn treemap(&mut self, rects: &[TreemapRect]) {
+            self.inner.treemap(rects);
+        }
+
+        fn done(&mut self, r: Result<&ScanTotals, &ScanError>) {
+            self.inner.done(r);
+        }
+    }
+
+    #[test]
+    fn scan_into_subfolder_aggregates_under_target() {
+        let dir = test_dir();
+        let nested = dir.path().join("вложенная");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(dir.path().join("верхний.bin"), [1u8; 100]).unwrap();
+        std::fs::write(nested.join("вложенный.bin"), [2u8; 32]).unwrap();
+
+        let mut index = ScanIndex::new("корень");
+        let into = index.folder(index.root(), "Цель");
+        let cancel = AtomicBool::new(false);
+        walk::walk(dir.path(), &mut index, into, &cancel, &mut |_, _| {})
+            .expect("обход в подпапку должен пройти без ошибки");
+
+        // Файлы и папки обязаны лежать под папкой назначения, а не в корне.
+        let target = index.folder_totals(into);
+        assert_eq!(target.file_count, 2, "файлы должны попасть в подпапку");
+        assert_eq!(target.folder_count, 1, "вложенная папка — тоже под целью");
+        assert_eq!(target.size_logical, 132);
+
+        assert_eq!(
+            index.file_count(index.root()),
+            0,
+            "прямо в корне файлов быть не должно"
+        );
+        let root = index.folder_totals(index.root());
+        assert_eq!(
+            root.file_count, target.file_count,
+            "корень обязан агрегировать подпапку"
+        );
+        assert_eq!(
+            root.folder_count,
+            target.folder_count + 1,
+            "корень считает саму папку назначения и всех её потомков"
+        );
+
+        let children = index.child_folders(index.root());
+        assert_eq!(children.len(), 1, "корень содержит только папку-цель");
+        assert_eq!(children[0].name, "Цель");
+        assert_eq!(children[0].file_count, 2);
+    }
+
+    #[test]
+    fn all_drives_scan_uses_drive_subfolders() {
+        let first = test_dir();
+        std::fs::write(first.path().join("a.bin"), [0u8; 10]).unwrap();
+        std::fs::write(first.path().join("b.bin"), [0u8; 20]).unwrap();
+        let second = test_dir();
+        std::fs::write(second.path().join("c.bin"), [0u8; 40]).unwrap();
+
+        let roots = vec![
+            (
+                "A:".to_string(),
+                ScanTarget::Folder(first.path().to_path_buf()),
+            ),
+            (
+                "B:".to_string(),
+                ScanTarget::Folder(second.path().to_path_buf()),
+            ),
+        ];
+        let mut index = ScanIndex::new("Все диски");
+        let cancel = AtomicBool::new(false);
+        let mut sink = RecordingSink::default();
+
+        let totals =
+            run_scan_all_with_interval(&mut index, &roots, &mut sink, &cancel, Duration::ZERO)
+                .expect("скан всех дисков должен завершиться без ошибки");
+
+        let children = index.child_folders(index.root());
+        assert_eq!(
+            children.len(),
+            2,
+            "корень «Все диски» содержит по подпапке на том: {children:?}"
+        );
+        let by_name = |name: &str| {
+            children
+                .iter()
+                .find(|child| child.name == name)
+                .unwrap_or_else(|| panic!("в корне нет подпапки {name}: {children:?}"))
+                .clone()
+        };
+        let a = by_name("A:");
+        let b = by_name("B:");
+        assert_eq!(a.file_count, 2, "итоги первого тома — независимые");
+        assert_eq!(b.file_count, 1, "итоги второго тома — независимые");
+
+        let root = index.folder_totals(index.root());
+        assert_eq!(root.file_count, 3, "корень суммирует файлы всех томов");
+        assert_eq!(root.folder_count, 2, "два тома — две подпапки корня");
+        assert_eq!(totals.files, 3);
+        assert_eq!(totals.size_logical, 10 + 20 + 40);
+        assert_eq!(
+            totals.size_on_disk,
+            a.size_on_disk + b.size_on_disk,
+            "итоги скана — сумма независимых итогов томов"
+        );
+        assert_eq!(totals.size_on_disk, root.size_on_disk);
+        assert!(!totals.cancelled);
+        assert_eq!(
+            sink.progress.last().map(|p| p.files),
+            Some(3),
+            "прогресс обязан быть общим счётчиком по всем томам"
+        );
+        assert!(
+            sink.done.as_ref().is_some_and(|done| done.is_ok()),
+            "по завершении sink должен получить итоги: {:?}",
+            sink.done
+        );
+    }
+
+    #[test]
+    fn cancel_all_drives_stops_everything() {
+        let first = test_dir();
+        for index in 0..2 {
+            std::fs::write(first.path().join(format!("a-{index}.bin")), [1u8; 16]).unwrap();
+        }
+        let second = test_dir();
+        let second_total = 2000;
+        for index in 0..second_total {
+            std::fs::write(second.path().join(format!("b-{index:04}.bin")), [2u8; 16]).unwrap();
+        }
+        let third = test_dir();
+        std::fs::write(third.path().join("c.bin"), [3u8; 16]).unwrap();
+
+        let roots = vec![
+            (
+                "A:".to_string(),
+                ScanTarget::Folder(first.path().to_path_buf()),
+            ),
+            (
+                "B:".to_string(),
+                ScanTarget::Folder(second.path().to_path_buf()),
+            ),
+            (
+                "C:".to_string(),
+                ScanTarget::Folder(third.path().to_path_buf()),
+            ),
+        ];
+        let mut index = ScanIndex::new("Все диски");
+        // Отмена — на втором томе: общий прогресс уже больше первого тома.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut sink = CancelOnProgress {
+            cancel: Arc::clone(&cancel),
+            cancel_above_files: 2,
+            inner: RecordingSink::default(),
+        };
+
+        let totals =
+            run_scan_all_with_interval(&mut index, &roots, &mut sink, &cancel, Duration::ZERO)
+                .expect("отмена — не ошибка: run_scan_all обязан вернуть Ok");
+
+        assert!(
+            totals.cancelled,
+            "остановленный скан обязан помечать итоги как частичные"
+        );
+        assert!(
+            cancel.load(Ordering::Relaxed),
+            "отмена должна была сработать"
+        );
+
+        let children = index.child_folders(index.root());
+        assert_eq!(
+            children.len(),
+            2,
+            "третий том не должен начинаться после отмены: {children:?}"
+        );
+        let by_name = |name: &str| {
+            children
+                .iter()
+                .find(|child| child.name == name)
+                .unwrap_or_else(|| panic!("в корне нет подпапки {name}: {children:?}"))
+                .clone()
+        };
+        assert_eq!(
+            by_name("A:").file_count,
+            2,
+            "первый том обязан быть просканирован полностью"
+        );
+        let partial = by_name("B:").file_count;
+        assert!(
+            partial > 0 && partial < second_total,
+            "второй том обязан остановиться посередине: {partial} из {second_total}"
+        );
+        assert_eq!(
+            index.folder_totals(index.root()).file_count,
+            2 + partial,
+            "итоги корня — то, что успели до отмены"
+        );
     }
 
     #[test]

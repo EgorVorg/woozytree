@@ -362,8 +362,7 @@ fn parse_record_with_stride(record: &[u8], stride: usize, buf: &mut Vec<u8>) -> 
                             .checked_add(attr_len)
                             .is_some_and(|end| value + 0x10 <= end)
                     {
-                        standard_modified =
-                            u64_at(record, value + 0x08).map(filetime_to_unix_ms);
+                        standard_modified = u64_at(record, value + 0x08).map(filetime_to_unix_ms);
                     }
                 }
             }
@@ -526,14 +525,19 @@ fn parse_file_name_value(record: &[u8], attr_off: usize, attr_len: usize) -> Opt
 /// Иначе нельзя: `FolderId` выдаётся только при создании папки, а номер
 /// записи-родителя может встретиться в `$MFT` и позже ребёнка.
 ///
+/// `into` — узел индекса, под который достраивается дерево тома: для одиночного
+/// диска это корень индекса, для тома в «Все диски» — подпапка с именем диска.
+/// Запись №5 (корень тома) своего узла не создаёт: её дети попадают в `into`.
+///
 /// Тонкая обёртка над [`scan_ntfs_reader_diag`]: отдаёт только итоги.
 pub fn scan_ntfs_reader(
     reader: &VolumeReader,
     index: &mut ScanIndex,
+    into: FolderId,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(&ScanProgress, &ScanIndex),
 ) -> Result<ScanTotals, ScanError> {
-    scan_ntfs_reader_diag(reader, index, cancel, progress).map(|(totals, _)| totals)
+    scan_ntfs_reader_diag(reader, index, into, cancel, progress).map(|(totals, _)| totals)
 }
 
 /// То же, что [`scan_ntfs_reader`], но вместе с разбивкой `skipped` по причинам.
@@ -545,17 +549,16 @@ pub fn scan_ntfs_reader(
 pub fn scan_ntfs_reader_diag(
     reader: &VolumeReader,
     index: &mut ScanIndex,
+    into: FolderId,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(&ScanProgress, &ScanIndex),
 ) -> Result<(ScanTotals, ScanDiag), ScanError> {
     let started = Instant::now();
     // Шаг fixup у живого тома равен размеру сектора из загрузочного сектора
     // (4Kn-диски), у файла-слепка берём классические 512 байт.
-    let stride = reader
-        .boot_sector()
-        .map_or(DEFAULT_FIXUP_STRIDE, |boot| {
-            usize::from(boot.bytes_per_sector)
-        });
+    let stride = reader.boot_sector().map_or(DEFAULT_FIXUP_STRIDE, |boot| {
+        usize::from(boot.bytes_per_sector)
+    });
     let volume_serial = reader
         .boot_sector()
         .map_or(0, |boot| boot.volume_serial as u32);
@@ -574,7 +577,7 @@ pub fn scan_ntfs_reader_diag(
     let mut diag = ScanDiag::default();
     let mut parsed_on_disk: u64 = 0;
 
-    let mut builder = TreeBuilder::new(index);
+    let mut builder = TreeBuilder::new(index, into);
 
     reader.read_records(cancel, &mut |record| {
         // Отмена проверяется на каждой записи: порции чтения $MFT крупнее, а
@@ -642,8 +645,9 @@ pub fn scan_ntfs_reader_diag(
         record_index += 1;
         if record_index % PROGRESS_EVERY_RECORDS == 0 {
             // Дерево уже содержит всё прочитанное: счётчик папок и размер живые.
-            let live_folders =
-                u64::from(builder.index.folder_totals(builder.index.root()).folder_count);
+            // Считаем `into`, а не корень индекса: у «Все диски» в корне лежат
+            // подпапки других томов, их сюда включать нельзя.
+            let live_folders = u64::from(builder.index.folder_totals(into).folder_count);
             progress(
                 &ScanProgress {
                     files: entries.len() as u64,
@@ -703,9 +707,9 @@ pub fn scan_ntfs_reader_diag(
         let parent = match builder.dirs.get(&parent_ref).copied() {
             Some(parent) => parent,
             None => {
-                // Родителя нет в таблице — файл не теряем, кладём в корень.
+                // Родителя нет в таблице — файл не теряем, кладём в папку тома.
                 diag.orphan += 1;
-                builder.index.root()
+                into
             }
         };
         builder.insert_file(&mut entries, position, parent);
@@ -738,11 +742,12 @@ pub fn scan_ntfs_reader_diag(
 pub fn scan_ntfs(
     drive_letter: &str,
     index: &mut ScanIndex,
+    into: FolderId,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(&ScanProgress, &ScanIndex),
 ) -> Result<ScanTotals, ScanError> {
     let reader = VolumeReader::open(drive_letter)?;
-    scan_ntfs_reader(&reader, index, cancel, progress)
+    scan_ntfs_reader(&reader, index, into, cancel, progress)
 }
 
 /// Построитель дерева по мере чтения `$MFT`.
@@ -754,6 +759,8 @@ pub fn scan_ntfs(
 /// ожидающих).
 struct TreeBuilder<'a> {
     index: &'a mut ScanIndex,
+    /// Папка индекса, в которую достраивается том (у «Все диски» — подпапка диска).
+    base: FolderId,
     /// Номер записи папки → узел индекса (корень тома — запись №5).
     dirs: HashMap<u64, FolderId>,
     /// Номер записи родителя → позиции имён, ждущих её появления.
@@ -767,12 +774,14 @@ struct TreeBuilder<'a> {
 }
 
 impl<'a> TreeBuilder<'a> {
-    fn new(index: &'a mut ScanIndex) -> TreeBuilder<'a> {
-        let root = index.root();
+    fn new(index: &'a mut ScanIndex, into: FolderId) -> TreeBuilder<'a> {
         let mut dirs = HashMap::new();
-        dirs.insert(ROOT_RECORD, root);
+        // Корень тома (запись №5) уже представлен папкой `into`: свой узел он
+        // не создаёт, а его дети попадают прямо в неё.
+        dirs.insert(ROOT_RECORD, into);
         TreeBuilder {
             index,
+            base: into,
             dirs,
             waiting: HashMap::new(),
             deferred_files: Vec::new(),
@@ -833,11 +842,7 @@ impl<'a> TreeBuilder<'a> {
         let parent_ref = entries[position].parent_ref;
         match self.dirs.get(&parent_ref).copied() {
             Some(parent) => self.insert(entries, position, parent),
-            None => self
-                .waiting
-                .entry(parent_ref)
-                .or_default()
-                .push(position),
+            None => self.waiting.entry(parent_ref).or_default().push(position),
         }
     }
 
@@ -910,10 +915,10 @@ impl<'a> TreeBuilder<'a> {
         }
     }
 
-    /// Закрыть дерево: неразрешённые имена — в корень, порядок — порядок чтения.
+    /// Закрыть дерево: неразрешённые имена — в папку тома, порядок — порядок чтения.
     ///
-    /// Папка, чей родитель так и не встретился, кладётся в корень (как в прежнем
-    /// двухпроходном пути), и её файлы-дети попадают именно в неё, а не в корень.
+    /// Папка, чей родитель так и не встретился, кладётся в `base` (корень тома),
+    /// и её файлы-дети попадают именно в неё, а не в корень индекса.
     fn finish(&mut self, entries: &mut [MftFileInfo], diag: &mut ScanDiag) {
         let mut unresolved: Vec<usize> = self
             .waiting
@@ -922,14 +927,14 @@ impl<'a> TreeBuilder<'a> {
             .collect();
         unresolved.sort_unstable();
 
-        // Сначала папки: их родитель не нашёлся — узел в корне.
+        // Сначала папки: их родитель не нашёлся — узел в папке тома.
         for &position in &unresolved {
             if !entries[position].is_directory {
                 continue;
             }
             let entry = &mut entries[position];
-            let root = self.index.root();
-            let (id, created) = create_folder(self.index, root, &entry.name);
+            let base = self.base;
+            let (id, created) = create_folder(self.index, base, &entry.name);
             if created {
                 self.folders += 1;
             }
@@ -946,9 +951,9 @@ impl<'a> TreeBuilder<'a> {
             let parent = match self.dirs.get(&parent_ref).copied() {
                 Some(parent) => parent,
                 None => {
-                    // Родителя нет в таблице — файл не теряем, кладём в корень.
+                    // Родителя нет в таблице — файл не теряем, кладём в папку тома.
                     diag.orphan += 1;
-                    self.index.root()
+                    self.base
                 }
             };
             self.insert_file(entries, position, parent);
@@ -995,6 +1000,17 @@ mod tests {
         SAMPLE_SIZE_LOGICAL, SAMPLE_SIZE_ON_DISK, SAMPLE_SKIPPED, fixture, make_record, test_dir,
         write_u64,
     };
+
+    /// Просканировать том в корень индекса: тестам движка «Все диски» не нужны.
+    fn scan_reader_into_root(
+        reader: &VolumeReader,
+        index: &mut ScanIndex,
+        cancel: &AtomicBool,
+        progress: &mut dyn FnMut(&ScanProgress, &ScanIndex),
+    ) -> Result<ScanTotals, ScanError> {
+        let into = index.root();
+        scan_ntfs_reader(reader, index, into, cancel, progress)
+    }
 
     #[test]
     fn test_parse_record_reads_unicode_name() {
@@ -1164,9 +1180,8 @@ mod tests {
     #[test]
     fn test_parse_record_ignores_extension_record() {
         // Базовая запись у файла другая: это обломок атрибутов, а не файл.
-        let mut record = make_record(
-            RecordSpec::new(10, RECORD_FLAG_IN_USE).name("обломок.txt", ROOT_RECORD),
-        );
+        let mut record =
+            make_record(RecordSpec::new(10, RECORD_FLAG_IN_USE).name("обломок.txt", ROOT_RECORD));
         write_u64(&mut record, 0x20, 1234);
         assert!(parse_record(&record).is_empty());
     }
@@ -1212,10 +1227,11 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let mut reports: Vec<ScanProgress> = Vec::new();
 
-        let totals = scan_ntfs_reader(&reader, &mut index, &cancel, &mut |progress, _index| {
-            reports.push(progress.clone())
-        })
-        .expect("сканирование фикстуры не должно падать");
+        let totals =
+            scan_reader_into_root(&reader, &mut index, &cancel, &mut |progress, _index| {
+                reports.push(progress.clone())
+            })
+            .expect("сканирование фикстуры не должно падать");
 
         assert!(!reports.is_empty(), "прогресс должен сообщать итоги");
         // Точные итоги фиксирует генератор `test_support`: любая ошибка в
@@ -1223,7 +1239,10 @@ mod tests {
         assert_eq!(totals.files, SAMPLE_FILE_COUNT, "файлы фикстуры");
         assert_eq!(totals.folders, SAMPLE_FOLDER_COUNT, "папки фикстуры");
         assert_eq!(totals.size_on_disk, SAMPLE_SIZE_ON_DISK, "занятое место");
-        assert_eq!(totals.size_logical, SAMPLE_SIZE_LOGICAL, "логический размер");
+        assert_eq!(
+            totals.size_logical, SAMPLE_SIZE_LOGICAL,
+            "логический размер"
+        );
         // В фикстуре есть родитель вне таблицы (сирота), запись с
         // $ATTRIBUTE_LIST и extension-запись с именем — это и есть пропуски.
         assert_eq!(
@@ -1300,7 +1319,7 @@ mod tests {
             .expect("слепок с жёсткими ссылками должен открываться");
         let mut index = ScanIndex::new("C:");
         let cancel = AtomicBool::new(false);
-        let totals = scan_ntfs_reader(&reader, &mut index, &cancel, &mut |_, _| {})
+        let totals = scan_reader_into_root(&reader, &mut index, &cancel, &mut |_, _| {})
             .expect("сканирование слепка не должно падать");
 
         let children = index.child_folders(index.root());
@@ -1349,7 +1368,7 @@ mod tests {
             .expect("слепок с именованным потоком должен открываться");
         let mut index = ScanIndex::new("C:");
         let cancel = AtomicBool::new(false);
-        let totals = scan_ntfs_reader(&reader, &mut index, &cancel, &mut |_, _| {})
+        let totals = scan_reader_into_root(&reader, &mut index, &cancel, &mut |_, _| {})
             .expect("сканирование слепка не должно падать");
 
         let root_totals = index.folder_totals(index.root());
@@ -1390,7 +1409,7 @@ mod tests {
             .expect("слепок с сиротой должен открываться");
         let mut index = ScanIndex::new("C:");
         let cancel = AtomicBool::new(false);
-        let totals = scan_ntfs_reader(&reader, &mut index, &cancel, &mut |_, _| {})
+        let totals = scan_reader_into_root(&reader, &mut index, &cancel, &mut |_, _| {})
             .expect("сканирование слепка не должно падать");
 
         assert_eq!(totals.files, 1);
@@ -1450,8 +1469,10 @@ mod tests {
             .expect("слепок с пропусками должен открываться");
         let mut index = ScanIndex::new("C:");
         let cancel = AtomicBool::new(false);
-        let (totals, diag) = scan_ntfs_reader_diag(&reader, &mut index, &cancel, &mut |_, _| {})
-            .expect("сканирование слепка не должно падать");
+        let into = index.root();
+        let (totals, diag) =
+            scan_ntfs_reader_diag(&reader, &mut index, into, &cancel, &mut |_, _| {})
+                .expect("сканирование слепка не должно падать");
 
         assert_eq!(diag.broken, 1, "битая запись");
         assert_eq!(diag.partial, 1, "базовая запись с $ATTRIBUTE_LIST");
@@ -1505,7 +1526,7 @@ mod tests {
             .expect("слепок с extension-записью должен открываться");
         let mut index = ScanIndex::new("C:");
         let cancel = AtomicBool::new(false);
-        let totals = scan_ntfs_reader(&reader, &mut index, &cancel, &mut |_, _| {})
+        let totals = scan_reader_into_root(&reader, &mut index, &cancel, &mut |_, _| {})
             .expect("сканирование слепка не должно падать");
 
         let root_totals = index.folder_totals(index.root());
@@ -1517,7 +1538,10 @@ mod tests {
         );
         assert_eq!(root_totals.size_logical, 5000);
         // Базовая запись с $ATTRIBUTE_LIST — неполный разбор, это пропуск.
-        assert_eq!(totals.skipped, 1, "запись с $ATTRIBUTE_LIST попадает в skipped");
+        assert_eq!(
+            totals.skipped, 1,
+            "запись с $ATTRIBUTE_LIST попадает в skipped"
+        );
     }
 
     #[test]
@@ -1548,11 +1572,11 @@ mod tests {
         ));
         std::fs::write(&fixture_path, &bytes).expect("не удалось записать слепок");
 
-        let reader = VolumeReader::from_fixture(&fixture_path, 1024)
-            .expect("слепок должен открываться");
+        let reader =
+            VolumeReader::from_fixture(&fixture_path, 1024).expect("слепок должен открываться");
         let mut index = ScanIndex::new("C:");
         let cancel = AtomicBool::new(false);
-        let totals = scan_ntfs_reader(&reader, &mut index, &cancel, &mut |_, _| {})
+        let totals = scan_reader_into_root(&reader, &mut index, &cancel, &mut |_, _| {})
             .expect("сканирование слепка не должно падать");
 
         assert_eq!(totals.files, 1, "видно только имя базовой записи");
@@ -1568,7 +1592,7 @@ mod tests {
             .expect("фикстура sample.mft должна открываться");
         let mut index = ScanIndex::new("C:");
         let cancel = AtomicBool::new(false);
-        let totals = scan_ntfs_reader(&reader, &mut index, &cancel, &mut |_, _| {
+        let totals = scan_reader_into_root(&reader, &mut index, &cancel, &mut |_, _| {
             cancel.store(true, Ordering::Relaxed);
         })
         .expect("отмена — не ошибка");
@@ -1594,13 +1618,14 @@ mod tests {
         let mut live_folders: Vec<u32> = Vec::new();
         let mut live_files: Vec<u32> = Vec::new();
 
-        let totals = scan_ntfs_reader(&reader, &mut index, &cancel, &mut |progress, current| {
-            reports.push(progress.clone());
-            let root_totals = current.folder_totals(current.root());
-            live_folders.push(root_totals.folder_count);
-            live_files.push(root_totals.file_count);
-        })
-        .expect("сканирование фикстуры не должно падать");
+        let totals =
+            scan_reader_into_root(&reader, &mut index, &cancel, &mut |progress, current| {
+                reports.push(progress.clone());
+                let root_totals = current.folder_totals(current.root());
+                live_folders.push(root_totals.folder_count);
+                live_files.push(root_totals.file_count);
+            })
+            .expect("сканирование фикстуры не должно падать");
 
         // Первый отчёт приходит на 1000-й записи, когда папки уже в индексе,
         // последний — итоговый.
@@ -1631,7 +1656,10 @@ mod tests {
         assert_eq!(totals.files, SAMPLE_FILE_COUNT, "файлы фикстуры");
         assert_eq!(totals.folders, SAMPLE_FOLDER_COUNT, "папки фикстуры");
         assert_eq!(totals.size_on_disk, SAMPLE_SIZE_ON_DISK, "занятое место");
-        assert_eq!(totals.size_logical, SAMPLE_SIZE_LOGICAL, "логический размер");
+        assert_eq!(
+            totals.size_logical, SAMPLE_SIZE_LOGICAL,
+            "логический размер"
+        );
         assert_eq!(totals.skipped, SAMPLE_SKIPPED, "пропуски фикстуры");
     }
 
@@ -1689,7 +1717,7 @@ mod tests {
             VolumeReader::from_fixture(&fixture_path, 1024).expect("слепок должен открываться");
         let mut incremental = ScanIndex::new("C:");
         let cancel = AtomicBool::new(false);
-        let totals = scan_ntfs_reader(&reader, &mut incremental, &cancel, &mut |_, _| {})
+        let totals = scan_reader_into_root(&reader, &mut incremental, &cancel, &mut |_, _| {})
             .expect("инкрементальное сканирование не должно падать");
 
         let batch = build_two_pass(&records);
@@ -1793,7 +1821,9 @@ mod tests {
     ///
     /// Идентификаторы папок в инкрементальном и двухпроходном построении могут
     /// различаться (порядок создания другой), поэтому сравнивать надо по путям.
-    fn folder_snapshot(index: &ScanIndex) -> std::collections::BTreeMap<String, (u64, u64, u32, u32)> {
+    fn folder_snapshot(
+        index: &ScanIndex,
+    ) -> std::collections::BTreeMap<String, (u64, u64, u32, u32)> {
         let mut snapshot = std::collections::BTreeMap::new();
         let mut stack = vec![(index.root(), String::new())];
         while let Some((id, path)) = stack.pop() {

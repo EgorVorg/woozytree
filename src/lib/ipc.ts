@@ -1,6 +1,7 @@
 // Обёртки над командами и событиями Tauri: фронтенд не знает про `invoke`/`listen`.
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 
 import type {
   DriveInfo,
@@ -12,6 +13,20 @@ import type {
   ScanTotals,
   TreemapRect,
 } from "./types";
+
+/**
+ * Системный диалог выбора папки для сканирования.
+ *
+ * `null` — пользователь закрыл диалог: выбор в тулбаре остаётся прежним.
+ */
+export async function pickFolder(): Promise<string | null> {
+  const selected = await open({
+    directory: true,
+    multiple: false,
+    title: "Выберите папку для сканирования",
+  });
+  return typeof selected === "string" ? selected : null;
+}
 
 /** Логические диски с меткой, ФС и свободным местом. */
 export function listDrives(): Promise<DriveInfo[]> {
