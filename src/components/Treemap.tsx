@@ -14,8 +14,10 @@ import { formatCount, formatPercent, formatSize } from "@/lib/format";
 import { getTreemap, onTreemap } from "@/lib/ipc";
 import {
   analyze_rects,
+  crumbs_for_tile,
   hit_test,
   is_other,
+  type Crumb,
   type TreemapTile,
 } from "@/lib/treemap";
 import type { TreemapRect } from "@/lib/types";
@@ -45,8 +47,10 @@ const LABEL_FONT = "'Space Grotesk Variable', 'Segoe UI', sans-serif";
 export interface TreemapProps {
   /** Папка, чью карту показываем; 0 — корень сканирования. */
   folderId: number;
-  /** Перейти в папку (id из плитки); имя — для хлебных крошек. */
-  onNavigate: (id: number, name?: string) => void;
+  /** Путь до открытой папки: карта дополняет его предками кликнутой плитки. */
+  path: readonly Crumb[];
+  /** Перейти по полному пути `crumbs` (как клик в дереве), а не на один уровень. */
+  onNavigate: (crumbs: Crumb[]) => void;
   /** Идёт сканирование: индекс ядра ещё недоступен, ждём живые события. */
   scanning?: boolean;
   /** Скан остановлен: карта показывает частичный срез и помечается плашкой. */
@@ -352,6 +356,7 @@ function tileKind(rect: TreemapRect): string {
  */
 export default function Treemap({
   folderId,
+  path,
   onNavigate,
   scanning = false,
   cancelled = false,
@@ -539,9 +544,12 @@ export default function Treemap({
     // Ярлык папки нарисован поверх детей: он и открывает папку на один уровень.
     const chip = chipAt(chips, x, y);
     if (chip) {
-      setSelectedKey(null);
-      setSelectedFile(null);
-      onNavigate(chip.rect.id, chip.rect.name);
+      const crumbs = crumbs_for_tile(rectsRef.current, chip.rect, path);
+      if (crumbs.length > 0) {
+        setSelectedKey(null);
+        setSelectedFile(null);
+        onNavigate(crumbs);
+      }
       return;
     }
     const nx = x / bounds.width;
@@ -554,9 +562,12 @@ export default function Treemap({
       return;
     }
     if (rect.is_dir && rect.id !== 0) {
-      setSelectedKey(null);
-      setSelectedFile(null);
-      onNavigate(rect.id, rect.name);
+      const crumbs = crumbs_for_tile(rectsRef.current, rect, path);
+      if (crumbs.length > 0) {
+        setSelectedKey(null);
+        setSelectedFile(null);
+        onNavigate(crumbs);
+      }
       return;
     }
     if (is_other(rect)) {

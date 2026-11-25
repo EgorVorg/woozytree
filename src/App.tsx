@@ -99,9 +99,11 @@ function App() {
     });
   }, []);
 
-  // Клик по папке на карте: имя нужно для хлебных крошек.
-  const handleMapNavigate = useCallback((id: number, name?: string) => {
-    setPath((current) => [...current, { id, name: name ?? `Папка ${id}` }]);
+  // Клик по папке на карте: карта приносит полный путь вместе с предками
+  // вложенной плитки (Music внутри Users → C:\ > Users > Music), поэтому путь
+  // заменяется целиком — как при клике в дереве, без «хвоста» и дублей.
+  const handleMapNavigate = useCallback((crumbs: Crumb[]) => {
+    if (crumbs.length > 0) setPath(crumbs);
   }, []);
 
   // Клик в дереве: узел приносит всю цепочку предков — путь заменяется целиком,
@@ -307,6 +309,7 @@ function App() {
               <Treemap
                 key={scanRun}
                 folderId={folderId}
+                path={path}
                 onNavigate={handleMapNavigate}
                 scanning={scanning}
                 cancelled={cancelled}

@@ -2,7 +2,14 @@
 // Контракт координат — нормированные 0..1 (см. `TreemapRect` в Rust).
 import { describe, expect, it } from "vitest";
 
-import { analyze_rects, hit_test, is_other, root_crumb_name } from "./treemap";
+import {
+  analyze_rects,
+  crumbs_for_tile,
+  hit_test,
+  is_other,
+  root_crumb_name,
+  type Crumb,
+} from "./treemap";
 import type { TreemapRect } from "./types";
 
 /** Плитка с координатами; по умолчанию — папка нулевого размера-заглушки. */
@@ -142,6 +149,92 @@ describe("is_other", () => {
     expect(
       is_other(tile({ x: 0, y: 0, w: 1, h: 1, name: "прочее.txt", size: 10 })),
     ).toBe(false);
+  });
+});
+
+describe("crumbs_for_tile", () => {
+  const ROOT: Crumb = { id: 0, name: "C:\\" };
+  // Вид корня: Users — плитка верхнего уровня, Music и Documents — её дети.
+  // Контракт выдачи: родитель идёт в списке раньше детей.
+  const users = tile({
+    id: 7,
+    name: "Users",
+    size: 1000,
+    is_dir: true,
+    x: 0.5,
+    y: 0,
+    w: 0.5,
+    h: 1,
+  });
+  const music = tile({
+    id: 9,
+    name: "Music",
+    size: 600,
+    is_dir: true,
+    x: 0.5,
+    y: 0.05,
+    w: 0.45,
+    h: 0.5,
+  });
+  const documents = tile({
+    id: 8,
+    name: "Documents",
+    size: 350,
+    is_dir: true,
+    x: 0.5,
+    y: 0.6,
+    w: 0.45,
+    h: 0.4,
+  });
+  const rects = [users, music, documents];
+
+  it("crumbs_for_tile_nested_folder_returns_three_links", () => {
+    // Клик по Music из корня: онлайн-вид рисует её внутри Users, поэтому путь
+    // обязан быть C:\ > Users > Music, а не C:\ > Music.
+    expect(crumbs_for_tile(rects, music, [ROOT])).toEqual([
+      ROOT,
+      { id: 7, name: "Users" },
+      { id: 9, name: "Music" },
+    ]);
+  });
+
+  it("crumbs_for_tile_top_level_folder_extends_root", () => {
+    // Папка верхнего уровня: корень + сама папка.
+    expect(crumbs_for_tile(rects, users, [ROOT])).toEqual([
+      ROOT,
+      { id: 7, name: "Users" },
+    ]);
+  });
+
+  it("crumbs_for_tile_file_is_not_navigation", () => {
+    // Файл только подсвечивается: путь не меняется, клик не навигация.
+    const file = tile({
+      name: "track.mp3",
+      size: 10,
+      x: 0.5,
+      y: 0.05,
+      w: 0.1,
+      h: 0.1,
+    });
+
+    expect(crumbs_for_tile([...rects, file], file, [ROOT])).toEqual([]);
+  });
+
+  it("crumbs_for_tile_other_tile_is_not_navigation", () => {
+    // Сводная плитка «прочее» (id = 0, не папка) действий не даёт.
+    const other = tile({ name: "прочее", x: 0.5, y: 0.9, w: 0.2, h: 0.1 });
+
+    expect(crumbs_for_tile([...rects, other], other, [ROOT])).toEqual([]);
+  });
+
+  it("crumbs_for_tile_skips_duplicate_last_crumb", () => {
+    // Текущий путь уже оканчивается этим звеном — не добавляем его второй раз.
+    expect(
+      crumbs_for_tile([users], users, [
+        ROOT,
+        { id: 7, name: "Users" },
+      ]),
+    ).toEqual([ROOT, { id: 7, name: "Users" }]);
   });
 });
 

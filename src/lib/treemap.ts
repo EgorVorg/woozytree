@@ -8,6 +8,12 @@ import type { TreemapRect } from "./types";
 /** Допуск для проверок «плитка лежит внутри родителя» при погрешности f64. */
 const EPS = 1e-9;
 
+/** Звено пути от корня сканирования до открытой папки. */
+export interface Crumb {
+  id: number;
+  name: string;
+}
+
 /** Плитка с посчитанными связями: глубина, родитель, доля от родителя. */
 export interface TreemapTile {
   rect: TreemapRect;
@@ -117,6 +123,45 @@ export function analyze_rects(rects: TreemapRect[]): TreemapTile[] {
 /** Сводная плитка «прочее»: id = 0, не папка, особое имя из Rust. */
 export function is_other(rect: TreemapRect): boolean {
   return !rect.is_dir && rect.id === 0 && rect.name === "прочее";
+}
+
+/**
+ * Полный путь до кликнутой плитки: префикс `base` (путь до открытой папки),
+ * цепочка её предков внутри текущей выдачи и сама плитка.
+ *
+ * Карта рисует вложенные плитки, поэтому клик по Music внутри Users должен
+ * давать «C:\ > Users > Music», а не «C:\ > Music». Контракт выдачи Rust
+ * (`treemap_for_folder`) гарантирует, что родитель идёт в списке раньше
+ * ребёнка, поэтому цепочку собираем через `parent_index` вверх до плитки
+ * верхнего уровня.
+ *
+ * Для не-навигации возвращает `[]`: файл только подсвечивается, сводная
+ * плитка «прочее» (id = 0) действий не даёт. Повтор последнего звена
+ * отбрасывается — повторный клик по той же папке не плодит крошки и
+ * React-ключи.
+ */
+export function crumbs_for_tile(
+  rects: TreemapRect[],
+  tile: TreemapRect,
+  base: readonly Crumb[] = [],
+): Crumb[] {
+  if (!tile.is_dir || tile.id === 0) return [];
+  const index = rects.indexOf(tile);
+  if (index < 0) return [];
+
+  const ancestors: TreemapRect[] = [];
+  let parent = parent_index(rects, index);
+  while (parent !== null) {
+    ancestors.unshift(rects[parent]);
+    parent = parent_index(rects, parent);
+  }
+
+  const crumbs: Crumb[] = base.map((crumb) => ({ ...crumb }));
+  for (const node of [...ancestors, tile]) {
+    if (crumbs.length > 0 && crumbs[crumbs.length - 1].id === node.id) continue;
+    crumbs.push({ id: node.id, name: node.name });
+  }
+  return crumbs;
 }
 
 /**
