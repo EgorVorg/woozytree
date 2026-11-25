@@ -2,7 +2,7 @@
 //
 // Значения применяются сразу (родитель перерисовывает карту/таблицу/топ) и
 // сохраняются в localStorage — после перезапуска окно откроется с ними же.
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -29,24 +29,16 @@ interface SettingsPopoverProps {
   onChange: (settings: DisplaySettings) => void;
 }
 
-/** Пункт радио «Размер»: клик по подписи тоже переключает режим. */
-function SizeOption({
-  value,
-  label,
-  onSelect,
-}: {
-  value: SizeMode;
-  label: string;
-  onSelect: (value: SizeMode) => void;
-}) {
+/** Задержка применения порога: пока человек печатает, раскладку не гоняем. */
+const THRESHOLD_DEBOUNCE_MS = 200;
+
+/** Пункт радио «Размер»: подпись связана с радиокнопкой через `<label>`. */
+function SizeOption({ value, label }: { value: SizeMode; label: string }) {
   return (
-    <div
-      className="flex cursor-pointer items-center gap-1.5"
-      onClick={() => onSelect(value)}
-    >
-      <RadioGroupItem value={value} aria-label={label} />
+    <label className="flex cursor-pointer items-center gap-1.5">
+      <RadioGroupItem value={value} />
       <span className="text-xs">{label}</span>
-    </div>
+    </label>
   );
 }
 
@@ -67,7 +59,11 @@ export default function SettingsPopover({
   // Последнее значение, которое поле само записало в настройки. Синхронизация
   // по эффекту нужна только тогда, когда настройка изменилась снаружи: иначе
   // набор «1.» нормализовался бы в «1» и десятичная дробь не набиралась.
-  const lastPushed = useRef<number | null>(null);
+  const lastPushed = useRef<number | null>(settings.minTileBytes);
+  // Актуальные настройки для отложенного применения: таймер замыкается на
+  // значение, которое было на момент ввода, а не на устаревший рендер.
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
 
   useEffect(() => {
     if (settings.minTileBytes !== lastPushed.current) {
@@ -76,16 +72,31 @@ export default function SettingsPopover({
     }
   }, [settings.minTileBytes]);
 
-  const applyThreshold = (text: string) => {
-    setMinTileText(text);
-    const mib = text.trim() === "" ? 0 : Number(text.replace(",", "."));
-    if (!Number.isFinite(mib)) {
-      return;
-    }
-    const next = set_min_tile_mib(settings, mib);
-    lastPushed.current = next.minTileBytes;
-    onChange(next);
-  };
+  /** Применить набранный порог: пустое поле — 0 МиБ (без порога). */
+  const commitThreshold = useCallback(
+    (text: string) => {
+      const mib = text.trim() === "" ? 0 : Number(text.replace(",", "."));
+      if (!Number.isFinite(mib)) {
+        return;
+      }
+      const next = set_min_tile_mib(settingsRef.current, mib);
+      lastPushed.current = next.minTileBytes;
+      if (next.minTileBytes !== settingsRef.current.minTileBytes) {
+        onChange(next);
+      }
+    },
+    [onChange],
+  );
+
+  // Пока человек печатает, раскладку не пересчитываем: применение — через
+  // 200 мс после последнего символа (Enter и blur применяют сразу).
+  useEffect(() => {
+    const timer = setTimeout(
+      () => commitThreshold(minTileText),
+      THRESHOLD_DEBOUNCE_MS,
+    );
+    return () => clearTimeout(timer);
+  }, [minTileText, commitThreshold]);
 
   return (
     <Popover>
@@ -114,20 +125,8 @@ export default function SettingsPopover({
             }
             aria-label="Что считать размером"
           >
-            <SizeOption
-              value="on_disk"
-              label="на диске"
-              onSelect={(sizeMode) =>
-                onChange(update_settings(settings, { sizeMode }))
-              }
-            />
-            <SizeOption
-              value="logical"
-              label="фактический"
-              onSelect={(sizeMode) =>
-                onChange(update_settings(settings, { sizeMode }))
-              }
-            />
+            <SizeOption value="on_disk" label="на диске" />
+            <SizeOption value="logical" label="фактический" />
           </RadioGroup>
         </fieldset>
 
@@ -154,7 +153,14 @@ export default function SettingsPopover({
               min={0}
               step={0.1}
               value={minTileText}
-              onChange={(event) => applyThreshold(event.target.value)}
+              onChange={(event) => setMinTileText(event.target.value)}
+              onBlur={() => commitThreshold(minTileText)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  commitThreshold(minTileText);
+                }
+              }}
               className="w-20 text-right"
               title="Плитки мельче порога собираются в «прочее»; итоги не меняются"
             />

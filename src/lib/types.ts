@@ -67,6 +67,8 @@ export interface FileRow {
   percent_of_parent: number;
   /** Повторная жёсткая ссылка: размер не входит в итоги папки. */
   hard_linked: boolean;
+  /** Короткое DOS-имя (8.3) того же файла: вторая строка, не отдельный файл. */
+  is_alias: boolean;
 }
 
 /** Страница файлов папки (`get_files`). */
@@ -146,6 +148,8 @@ export interface SearchRow {
   modified: number;
   /** Повторная жёсткая ссылка: размер не входит в итоги папки. */
   hard_linked: boolean;
+  /** Короткое DOS-имя (8.3) того же файла. */
+  is_alias: boolean;
 }
 
 /** Страница результатов поиска (`search_files`). */

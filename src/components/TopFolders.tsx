@@ -9,6 +9,8 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { formatCount, formatPercent, formatSize } from "@/lib/format";
+import { size_for } from "@/lib/settings";
+import { rank_top_folders } from "@/lib/top";
 import type { FolderSummary, SizeMode } from "@/lib/types";
 
 interface TopFoldersProps {
@@ -19,17 +21,13 @@ interface TopFoldersProps {
   rootSize: number;
 }
 
-/** Размер строки в выбранном режиме. */
-function row_size(row: FolderSummary, sizeMode: SizeMode): number {
-  return sizeMode === "on_disk" ? row.size_on_disk : row.size_logical;
-}
-
 /**
  * Таблица самых тяжёлых папок корня (обновляется по событию `scan://top`).
  *
- * Ядро присылает топ-20 по размеру на диске, а окно показывает и сортирует его
- * по выбранному в настройках размеру: переключение режима меняет цифры, порядок
- * строк и проценты согласованно с картой и таблицей.
+ * Ядро присылает 100 кандидатов по занятому месту, а окно выбирает из них
+ * топ-20 по выбранному в настройках размеру: иначе папка с большим фактическим
+ * размером, но скромным занятым могла бы не попасть в список вовсе. Цифры,
+ * порядок строк и проценты согласованы с картой и таблицей.
  */
 export default function TopFolders({
   rows,
@@ -37,10 +35,7 @@ export default function TopFolders({
   rootSize,
 }: TopFoldersProps) {
   const sorted = useMemo(
-    () =>
-      [...rows]
-        .sort((left, right) => row_size(right, sizeMode) - row_size(left, sizeMode))
-        .slice(0, 20),
+    () => rank_top_folders(rows, sizeMode),
     [rows, sizeMode],
   );
 
@@ -49,8 +44,9 @@ export default function TopFolders({
       <header className="flex flex-wrap items-baseline justify-between gap-2 px-4 pt-4 pb-2">
         <h2 className="text-sm font-medium">Самые тяжёлые папки</h2>
         <span className="text-xs text-muted-foreground">
-          Топ-20 дочерних папок корня ·{" "}
-          {sizeMode === "on_disk" ? "размер на диске" : "фактический размер"}
+          Топ-20 дочерних папок корня · кандидаты: 100 крупнейших на диске ·
+          показаны по{" "}
+          {sizeMode === "on_disk" ? "размеру на диске" : "фактическому размеру"}
         </span>
       </header>
 
@@ -78,7 +74,11 @@ export default function TopFolders({
             </TableRow>
           ) : (
             sorted.map((row) => {
-              const size = row_size(row, sizeMode);
+              const size = size_for(
+                sizeMode,
+                row.size_on_disk,
+                row.size_logical,
+              );
               // Пока итог скана неизвестен (живое сканирование), доля на диске
               // берётся из события, а фактическая честно показывается прочерком.
               const percent =

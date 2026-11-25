@@ -98,6 +98,8 @@ interface LabelChip {
   height: number;
   /** Подпись, уже обрезанная по длине. */
   label: string;
+  /** Собственный размер папки — чтобы число под чипом не читалось как размер ребёнка. */
+  sizeLabel: string;
 }
 
 /** Ключ выбранной плитки: переживает живые обновления координат. */
@@ -143,9 +145,12 @@ function chipLayout(
 
   return candidates.map((tile) => {
     const label = shortLabel(tile.rect.name);
+    // Размер именно папки (а не первого ребёнка под чипом) — часть ярлыка.
+    const sizeLabel = formatSize(tile.rect.size);
+    const full = `${label} · ${sizeLabel}`;
     const chipWidth = Math.min(
       tile.rect.w * width - 8,
-      Math.max(44, label.length * 6.2 + 12),
+      Math.max(48, full.length * 6.2 + 12),
     );
     return {
       rect: tile.rect,
@@ -154,6 +159,7 @@ function chipLayout(
       width: chipWidth,
       height: 17,
       label,
+      sizeLabel,
     };
   });
 }
@@ -353,13 +359,24 @@ function drawTreemap(
     ctx.clip();
     ctx.fillStyle = COLORS.label;
     ctx.fillText(chip.label, chip.x + 5, chip.y + chip.height / 2 + 0.5);
+    // Размер папки рядом с именем: иначе число под чипом можно было принять
+    // за размер ребёнка, чья плитка нарисована ниже.
+    const nameWidth = ctx.measureText(chip.label).width;
+    ctx.fillStyle = COLORS.labelMuted;
+    ctx.fillText(
+      ` · ${chip.sizeLabel}`,
+      chip.x + 5 + nameWidth,
+      chip.y + chip.height / 2 + 0.5,
+    );
     ctx.restore();
   }
 }
 
 /** Подпись типа плитки для всплывающей подсказки. */
 function tileKind(rect: TreemapRect): string {
-  if (is_other(rect)) return "прочее — мелкие файлы сводной плиткой";
+  // Сводная плитка «прочее» — не файл и не папка: подпись нейтральна, потому
+  // что в неё попадает и мелочь папок при выключенных файлах.
+  if (is_other(rect)) return "прочее — сводная плитка мелочи";
   return rect.is_dir ? "папка" : "файл";
 }
 
@@ -474,6 +491,11 @@ export default function Treemap({
   }, []);
 
   // Данные для текущей папки.
+  //
+  // Переход `scanning → false` входит в зависимости эффекта: это и есть
+  // страховка от потерянного финального события — даже если последний
+  // `scan://treemap` не дошёл, карта корня перезапрашивается командой
+  // `get_treemap` уже с актуальными настройками отображения.
   useEffect(() => {
     let alive = true;
     setSelectedKey(null);
@@ -641,10 +663,11 @@ export default function Treemap({
       // открытой папки — действия должны получить именно его папку.
       folderId: folder_id_for_tile(rectsRef.current, rect, folderId),
       fileName: rect.name,
-      // Плитка не несёт признака «жёсткая ссылка» (TreemapRect его не хранит),
-      // поэтому запрет на безвозвратное удаление здесь подстраховывает не
-      // карта, а строка таблицы файлов.
+      // Плитка не несёт признаков «жёсткая ссылка» / «короткое имя»
+      // (TreemapRect их не хранит), поэтому запрет на безвозвратное удаление
+      // здесь подстраховывает не карта, а строка таблицы файлов.
       hardLinked: false,
+      alias: false,
       x: event.clientX,
       y: event.clientY,
     });
@@ -663,7 +686,9 @@ export default function Treemap({
       : notice
         ? notice
         : rects.length === 0
-          ? "Нет данных для этой папки."
+          ? settings.showFilesOnMap
+            ? "Нет данных для этой папки."
+            : "Нет папок для карты: файлы скрыты настройкой «Показывать файлы на карте»."
           : null;
 
   // Подсказка прижимается к краям canvas, чтобы не уезжать за карту.
@@ -730,7 +755,8 @@ export default function Treemap({
             </div>
             <div className="mt-1 tabular-nums text-muted-foreground">
               {formatSize(tooltipTile.rect.size)} ·{" "}
-              {formatPercent(tooltipTile.percent_of_parent)} от родителя
+              {formatPercent(tooltipTile.percent_of_parent)}{" "}
+              {settings.showFilesOnMap ? "от родителя" : "от видимых папок"}
             </div>
             <div className="mt-0.5 text-muted-foreground">
               {hoveredChip

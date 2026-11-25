@@ -10,6 +10,7 @@ import {
   normalize_settings,
   save_settings,
   set_min_tile_mib,
+  size_for,
   update_settings,
   type DisplaySettings,
 } from "./settings";
@@ -96,19 +97,24 @@ describe("settings", () => {
     expect(load_settings(storage)).toEqual({
       sizeMode: "logical",
       showFilesOnMap: true,
-      minTileBytes: 1024,
+      // 1024 Б меньше шага поля (0.01 МиБ): такое значение отображалось бы
+      // как «0», поэтому при чтении оно честно приводится к нулю.
+      minTileBytes: 0,
     });
 
-    // Не-конечные и дробные значения: NaN/Infinity не проходят, дробь округляется
-    // вниз до байта.
+    // Не-конечные значения не проходят; дробь приводится к точности поля.
     expect(
       normalize_settings({ minTileBytes: Number.NaN }).minTileBytes,
     ).toBe(0);
     expect(
       normalize_settings({ minTileBytes: Number.POSITIVE_INFINITY }).minTileBytes,
     ).toBe(0);
-    expect(normalize_settings({ minTileBytes: 100.9 }).minTileBytes).toBe(100);
+    expect(normalize_settings({ minTileBytes: 100.9 }).minTileBytes).toBe(0);
     expect(normalize_settings({ minTileBytes: -100 }).minTileBytes).toBe(0);
+    // 0.02 МиБ — два шага поля, значение переживает чтение без искажений.
+    expect(
+      normalize_settings({ minTileBytes: 0.02 * MIB }).minTileBytes,
+    ).toBe(Math.round(0.02 * MIB));
   });
 
   it("min_tile_mib_roundtrips_bytes", () => {
@@ -120,5 +126,23 @@ describe("settings", () => {
     // Отрицательное/нечисловое поле — 0 МиБ, без отрицательного порога.
     expect(min_tile_mib(set_min_tile_mib(DEFAULT_SETTINGS, -3))).toBe(0);
     expect(set_min_tile_mib(DEFAULT_SETTINGS, Number.NaN).minTileBytes).toBe(0);
+  });
+
+  it("threshold_below_field_precision_is_zero", () => {
+    // Поле показывает два знака: 0.001 МиБ иначе отобразилось бы как «0»,
+    // хотя в настройке лежали бы байты, — порог «сбрасывался» бы сам.
+    expect(set_min_tile_mib(DEFAULT_SETTINGS, 0.001).minTileBytes).toBe(0);
+    expect(set_min_tile_mib(DEFAULT_SETTINGS, 0.009).minTileBytes).toBe(0);
+    // Ближайший шаг поля (0.01 МиБ) сохраняется и читается тем же числом.
+    const smallest = set_min_tile_mib(DEFAULT_SETTINGS, 0.01);
+    expect(smallest.minTileBytes).toBeGreaterThan(0);
+    expect(min_tile_mib(smallest)).toBe(0.01);
+    // Больше двух знаков — округление к шагу, а не «хвост» байтов.
+    expect(min_tile_mib(set_min_tile_mib(DEFAULT_SETTINGS, 1.234))).toBe(1.23);
+  });
+
+  it("size_for_picks_value_by_mode", () => {
+    expect(size_for("on_disk", 100, 900)).toBe(100);
+    expect(size_for("logical", 100, 900)).toBe(900);
   });
 });

@@ -9,7 +9,7 @@ const GIB = 1024 * MIB;
 
 describe("formatSize", () => {
   it("format_size_uses_kib_for_small_values", () => {
-    expect(formatSize(512)).toBe("0.5 КиБ");
+    expect(formatSize(512)).toBe("512 Б");
     expect(formatSize(1536)).toBe("1.5 КиБ");
   });
 
@@ -24,8 +24,9 @@ describe("formatSize", () => {
     expect(formatSize(-1)).toBe("0 Б");
   });
 
-  it("format_size_uses_kib_for_sizes_below_one_mib", () => {
-    expect(formatSize(1)).toBe("0.0 КиБ");
+  it("format_size_uses_bytes_below_one_kib", () => {
+    expect(formatSize(1)).toBe("1 Б");
+    expect(formatSize(1023)).toBe("1023 Б");
     expect(formatSize(KIB)).toBe("1.0 КиБ");
     expect(formatSize(MIB - 1024)).toBe("1023.0 КиБ");
     expect(formatSize(MIB)).toBe("1.0 МиБ");

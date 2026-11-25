@@ -35,9 +35,9 @@ import {
 import {
   copy_text,
   error_text,
-  HARD_LINK_PERMANENT_REASON,
   permanent_delete_allowed,
   permanent_delete_question,
+  permanent_delete_reason,
 } from "@/lib/actions";
 import { deletePaths, getFilePath, openPath, revealInExplorer } from "@/lib/ipc";
 import type { DeleteReport } from "@/lib/types";
@@ -48,8 +48,10 @@ export interface FileActionTarget {
   folderId: number;
   /** Имя файла без пути. */
   fileName: string;
-  /** Строка помечена «жёсткая ссылка» (в т.ч. DOS-алиас): безвозвратно нельзя. */
+  /** Строка помечена «жёсткая ссылка»: безвозвратно нельзя. */
   hardLinked?: boolean;
+  /** Строка — короткое DOS-имя (8.3): безвозвратно тоже нельзя. */
+  alias?: boolean;
   /** Координаты правого клика: clientX/clientY. */
   x: number;
   y: number;
@@ -97,7 +99,14 @@ export default function FileActionsMenu({
   );
   // Вторичные ссылки и короткие имена (8.3) нельзя удалять безвозвратно:
   // единственный файл исчез бы навсегда. В корзину — по-прежнему можно.
-  const permanentAllowed = permanent_delete_allowed(target?.hardLinked ?? false);
+  const permanentReason = permanent_delete_reason(
+    target?.hardLinked ?? false,
+    target?.alias ?? false,
+  );
+  const permanentAllowed = permanent_delete_allowed(
+    target?.hardLinked ?? false,
+    target?.alias ?? false,
+  );
 
   /** Показать итог удаления: ошибки — в красную плашку, успех — родителю. */
   const reportDelete = useCallback(
@@ -223,9 +232,9 @@ export default function FileActionsMenu({
                   // безвозвратное удаление стёрло бы единственный файл.
                   <DropdownMenuLabel
                     className="max-w-56 text-[10px] leading-snug text-muted-foreground"
-                    title={HARD_LINK_PERMANENT_REASON}
+                    title={permanentReason ?? undefined}
                   >
-                    {HARD_LINK_PERMANENT_REASON}
+                    {permanentReason}
                   </DropdownMenuLabel>
                 )}
               </DropdownMenuGroup>

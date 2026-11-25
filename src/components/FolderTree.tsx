@@ -8,6 +8,7 @@ import { useQueries } from "@tanstack/react-query";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useEffect, useMemo, useRef, useState } from "react";
 
+import { files_word, folders_in_label } from "@/lib/actions";
 import {
   flatten_tree,
   tree_chain,
@@ -38,11 +39,14 @@ export interface FolderTreeProps {
 
 /** Склонение «файл/файла/файлов» для подсказки строки. */
 function filesLabel(count: number): string {
-  const mod10 = count % 10;
-  const mod100 = count % 100;
-  if (mod10 === 1 && mod100 !== 11) return "файл";
-  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 12 || mod100 > 14)) return "файла";
-  return "файлов";
+  // Правила склонения живут в одном месте (`files_word`): та же функция
+  // используется в сообщении об удалении.
+  return files_word(count);
+}
+
+/** Склонение для фразы «в N папках»: «в 1 папке», «в 2 папках». */
+function foldersLabel(count: number): string {
+  return folders_in_label(count);
 }
 
 /** Строка дерева: треугольник раскрытия, имя, размер на диске. */
@@ -57,7 +61,7 @@ function TreeRowView({
   onToggle: (id: number) => void;
   onSelect: (row: TreeRow) => void;
 }) {
-  const hint = `${row.name} · ${formatSize(row.size_on_disk)} · ${formatCount(row.file_count)} ${filesLabel(row.file_count)} в ${formatCount(row.folder_count)} папках`;
+  const hint = `${row.name} · ${formatSize(row.size_on_disk)} · ${formatCount(row.file_count)} ${filesLabel(row.file_count)} в ${formatCount(row.folder_count)} ${foldersLabel(row.folder_count)}`;
   return (
     <div
       className="flex h-full items-center gap-0.5"

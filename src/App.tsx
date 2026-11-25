@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import FileTable from "@/components/FileTable";
 import FileTypesPanel from "@/components/FileTypesPanel";
 import FolderTree from "@/components/FolderTree";
-import ScanStatus, { Breadcrumbs, type Crumb } from "@/components/ScanStatus";
+import ScanStatus, { Breadcrumbs } from "@/components/ScanStatus";
 import SearchPanel from "@/components/SearchPanel";
 import Tabs, { type AppTab } from "@/components/Tabs";
 import Toolbar from "@/components/Toolbar";
@@ -23,14 +23,17 @@ import {
   pickFolder,
   startScan,
 } from "@/lib/ipc";
+import { path_to_crumb, path_up, replace_path } from "@/lib/navigation";
 import { scanPercent } from "@/lib/progress";
 import {
   load_settings,
   save_settings,
+  size_for,
   type DisplaySettings,
 } from "@/lib/settings";
 import { root_crumb_name } from "@/lib/treemap";
 import type {
+  Crumb,
   DeleteReport,
   DriveInfo,
   FolderSummary,
@@ -169,30 +172,25 @@ function App() {
   }, []);
 
   const handleUp = useCallback(() => {
-    setPath((current) =>
-      current.length > 1 ? current.slice(0, -1) : current,
-    );
+    setPath(path_up);
   }, []);
 
   // Крошка: отрезать всё, что глубже выбранного звена пути.
   const handleCrumb = useCallback((id: number) => {
-    setPath((current) => {
-      const index = current.findIndex((crumb) => crumb.id === id);
-      return index >= 0 ? current.slice(0, index + 1) : current;
-    });
+    setPath((current) => path_to_crumb(current, id));
   }, []);
 
   // Клик по папке на карте: карта приносит полный путь вместе с предками
   // вложенной плитки (Music внутри Users → C:\ > Users > Music), поэтому путь
   // заменяется целиком — как при клике в дереве, без «хвоста» и дублей.
   const handleMapNavigate = useCallback((crumbs: Crumb[]) => {
-    if (crumbs.length > 0) setPath(crumbs);
+    setPath((current) => replace_path(current, crumbs));
   }, []);
 
   // Клик в дереве: узел приносит всю цепочку предков — путь заменяется целиком,
   // поэтому переход в соседнюю ветку не оставляет «хвоста» прежнего пути.
   const handleTreeNavigate = useCallback((crumbs: Crumb[]) => {
-    if (crumbs.length > 0) setPath(crumbs);
+    setPath((current) => replace_path(current, crumbs));
   }, []);
 
   // Клик по строке поиска: ядро отдало цепочку папки (`get_path_crumbs`) —
@@ -200,7 +198,7 @@ function App() {
   // и при навигации из карты (механизм Плана 2).
   const handleSearchNavigate = useCallback((crumbs: Crumb[]) => {
     if (crumbs.length === 0) return;
-    setPath(crumbs);
+    setPath((current) => replace_path(current, crumbs));
     setTab("map");
   }, []);
 
@@ -223,6 +221,9 @@ function App() {
     listDrives()
       .then((list) => {
         setDrives(list);
+        // Успешное обновление списка снимает прошлую ошибку: плашка о неудаче
+        // не должна висеть, когда диски уже прочитаны.
+        setError(null);
         setChoice((current) => {
           if (current === null || current.kind !== "drive") {
             return current ?? { kind: "drive", letter: preferredLetter(list) };
@@ -347,7 +348,9 @@ function App() {
     // Новый скан — показываем карту: результаты прошлого поиска уже не к месту.
     setTab("map");
     setScanRun((run) => run + 1);
-    startScan(target).catch((err: unknown) => {
+    // Настройки отображения уходят вместе с целью: живая карта строится по
+    // снимку на старте, а не по значениям по умолчанию.
+    startScan(target, settings).catch((err: unknown) => {
       setError(String(err));
       setScanError(true);
       setProgress(null);
@@ -531,9 +534,7 @@ function App() {
             sizeMode={settings.sizeMode}
             rootSize={
               totals
-                ? settings.sizeMode === "on_disk"
-                  ? totals.size_on_disk
-                  : totals.size_logical
+                ? size_for(settings.sizeMode, totals.size_on_disk, totals.size_logical)
                 : 0
             }
           />

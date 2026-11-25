@@ -29,6 +29,27 @@ export const DEFAULT_SETTINGS: DisplaySettings = {
 };
 
 const MIB = 1024 * 1024;
+/**
+ * Шаг поля порога: 0.01 МиБ. Поле ввода показывает два знака после запятой,
+ * поэтому хранилище обязано хранить ровно столько же: иначе значение вроде
+ * 0.001 МиБ отображалось бы как 0 и «сбрасывалось» само.
+ */
+const MIB_STEP = MIB / 100;
+
+/**
+ * Размер элемента в выбранном режиме.
+ *
+ * Один помощник на все места, где настройка «на диске / фактический» решает,
+ * какую из двух цифр показать (топ папок, типы файлов, статус). Дублировать
+ * тернарник по компонентам — значит однажды разойтись с режимом в одном из них.
+ */
+export function size_for(
+  sizeMode: SizeMode,
+  onDisk: number,
+  logical: number,
+): number {
+  return sizeMode === "on_disk" ? onDisk : logical;
+}
 
 /** Минимум хранилища, которого достаточно настройкам (localStorage подходит). */
 export interface SettingsStorage {
@@ -50,12 +71,22 @@ function is_record(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/** Порог в байтах: неотрицательное целое; мусор и дроби приводятся к норме. */
+/**
+ * Порог в байтах, приведённый к точности поля (0.01 МиБ): неотрицательный,
+ * мусор и дроби ниже шага — 0.
+ */
 function normalize_min_tile_bytes(value: unknown): number {
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
     return 0;
   }
-  return Math.min(Math.floor(value), Number.MAX_SAFE_INTEGER);
+  // Всё, что меньше шага поля, отображалось бы как «0» — хранить эти байты
+  // бессмысленно. Более крупное значение округляем к шагу, чтобы запись и
+  // чтение возвращали одно и то же число.
+  if (value < MIB_STEP) {
+    return 0;
+  }
+  const steps = Math.max(1, Math.round(value / MIB_STEP));
+  return Math.min(Math.round(steps * MIB_STEP), Number.MAX_SAFE_INTEGER);
 }
 
 /**
@@ -147,9 +178,13 @@ export function set_min_tile_mib(
   settings: DisplaySettings,
   mib: number,
 ): DisplaySettings {
+  // Округляем к точности поля (0.01 МиБ), чтобы введённое человеком значение
+  // возвращалось в поле ровно таким же. Всё, что меньше шага, — 0 (без порога).
+  const steps =
+    Number.isFinite(mib) && mib > 0 ? Math.floor(mib * 100) : 0;
   const bytes =
-    Number.isFinite(mib) && mib > 0
-      ? Math.min(Math.round(mib * MIB), Number.MAX_SAFE_INTEGER)
-      : 0;
+    steps <= 0
+      ? 0
+      : Math.min(Math.round((steps / 100) * MIB), Number.MAX_SAFE_INTEGER);
   return update_settings(settings, { minTileBytes: bytes });
 }

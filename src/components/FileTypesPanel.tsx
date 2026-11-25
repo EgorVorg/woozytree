@@ -6,18 +6,21 @@
 // основная карта (Treemap.tsx) живёт на навигации, живых событиях и зуме,
 // которых на вкладке типов нет; общими остаются раскладка в Rust и хит-тест
 // `hit_test`. Так проще не сломать главную карту и не тащить в неё режимы.
-import { keepPreviousData, useQuery } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 
 import {
-  DEFAULT_TYPE_SORT,
+  default_type_sort,
   extension_label,
   next_type_sort,
+  size_sort_column,
   tile_extension,
   type TypeSortState,
 } from "@/lib/filetypes";
 import { formatCount, formatPercent, formatSize } from "@/lib/format";
 import { getFileTypes, getTypesTreemap } from "@/lib/ipc";
+import { same_query_scope } from "@/lib/query";
+import { size_for } from "@/lib/settings";
 import { hit_test } from "@/lib/treemap";
 import type { FileTypeRow, SizeMode, TreemapRect, TypeSort } from "@/lib/types";
 import { cn } from "@/lib/utils";
@@ -212,7 +215,9 @@ export default function FileTypesPanel({
   scanning,
   scanRun,
 }: FileTypesPanelProps) {
-  const [sortState, setSortState] = useState<TypeSortState>(DEFAULT_TYPE_SORT);
+  const [sortState, setSortState] = useState<TypeSortState>(() =>
+    default_type_sort(sizeMode),
+  );
   const [selected, setSelected] = useState<string | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const selectedRowRef = useRef<HTMLTableRowElement | null>(null);
@@ -231,7 +236,16 @@ export default function FileTypesPanel({
     queryFn: () => getFileTypes(folderId, sortState.sort, sortState.desc),
     enabled: !scanning,
     staleTime: Number.POSITIVE_INFINITY,
-    placeholderData: keepPreviousData,
+    // Прошлый порядок показываем только при смене сортировки в той же папке и
+    // том же скане: иначе строки прошлого контекста выдавались бы за текущие.
+    placeholderData: (previousData, previousQuery) =>
+      same_query_scope(previousQuery?.queryKey, [
+        "file_types",
+        scanRun,
+        folderId,
+      ])
+        ? previousData
+        : undefined,
   });
 
   // Карта: бюджет плиток и раскладка — в ядре; сортировка таблицы на неё не
@@ -246,6 +260,24 @@ export default function FileTypesPanel({
 
   const rows = typesQuery.data ?? EMPTY_ROWS;
   const rects = useMemo(() => mapQuery.data ?? EMPTY_RECTS, [mapQuery.data]);
+
+  // Режим размера сменился — колонка размера следует за ним, как в таблице
+  // файлов. Колонку, выбранную вручную (имя, число файлов), не трогаем.
+  useEffect(() => {
+    setSortState((current) => {
+      if (current.sort !== "size_on_disk" && current.sort !== "size_logical") {
+        return current;
+      }
+      const target = size_sort_column(sizeMode);
+      return current.sort === target ? current : { ...current, sort: target };
+    });
+  }, [sizeMode]);
+
+  // Другая папка или новый скан — выбранный тип прошлого контекста не имеет
+  // смысла: снимаем выбор, чтобы подсветка не искала несуществующую строку.
+  useEffect(() => {
+    setSelected(null);
+  }, [scanRun, folderId]);
 
   const totals = useMemo(
     () =>
@@ -263,9 +295,9 @@ export default function FileTypesPanel({
   // Размер выбранного режима — база процентов и заливки карты. Сумма строк
   // равна итогу папки в этом режиме (дубликаты жёстких ссылок не входят ни туда,
   // ни туда), поэтому доля считается без дополнительного запроса.
-  const selectedTotal = sizeMode === "on_disk" ? totals.disk : totals.logical;
+  const selectedTotal = size_for(sizeMode, totals.disk, totals.logical);
   const percentOf = (row: FileTypeRow): number => {
-    const value = sizeMode === "on_disk" ? row.size_on_disk : row.size_logical;
+    const value = size_for(sizeMode, row.size_on_disk, row.size_logical);
     return selectedTotal > 0 ? Math.min(1, value / selectedTotal) : 0;
   };
 
@@ -379,11 +411,20 @@ export default function FileTypesPanel({
           ? "Нет данных для карты."
           : null;
 
+  // Сумма размеров показанных плиток: карта раскладывает их на весь контейнер
+  // (бюджет 600 типов), поэтому площадь плитки — доля именно показанных типов.
+  // Подсказка обязана считать от той же базы, иначе площадь и процент спорят.
+  const mapTotal = useMemo(
+    () => rects.reduce((sum, rect) => sum + rect.size, 0),
+    [rects],
+  );
+  const mapTruncated = mapTotal !== selectedTotal;
+
   const hoveredRow = hoveredRect
     ? rows.find((row) => row.extension === tile_extension(hoveredRect.name))
     : undefined;
   const hoverShare =
-    hoveredRect && selectedTotal > 0 ? hoveredRect.size / selectedTotal : 0;
+    hoveredRect && mapTotal > 0 ? hoveredRect.size / mapTotal : 0;
   const tooltip = hoveredRect
     ? (() => {
         const tooltipWidth = 220;
@@ -433,8 +474,8 @@ export default function FileTypesPanel({
               {extension_label(tile_extension(hoveredRect.name))}
             </div>
             <div className="mt-1 tabular-nums text-muted-foreground">
-              {formatSize(hoveredRect.size)} · {formatPercent(hoverShare)} от
-              папки
+              {formatSize(hoveredRect.size)} · {formatPercent(hoverShare)}{" "}
+              {mapTruncated ? "от показанных типов" : "от папки"}
             </div>
             <div className="mt-0.5 text-muted-foreground">
               {hoveredRow

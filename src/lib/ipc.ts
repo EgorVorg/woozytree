@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 
+import type { DisplaySettings } from "./settings";
 import type {
   Crumb,
   DeleteReport,
@@ -40,9 +41,22 @@ export function listDrives(): Promise<DriveInfo[]> {
   return invoke<DriveInfo[]>("list_drives");
 }
 
-/** Запустить сканирование в фоне; события придут по `scan://…`. */
-export function startScan(target: ScanTarget): Promise<void> {
-  return invoke("start_scan", { target });
+/**
+ * Запустить сканирование в фоне; события придут по `scan://…`.
+ *
+ * Настройки отображения передаются снимком на старте: живую карту строит ядро
+ * по событиям, и без снимка она рисовалась бы с дефолтами до конца скана.
+ */
+export function startScan(
+  target: ScanTarget,
+  settings: DisplaySettings,
+): Promise<void> {
+  return invoke("start_scan", {
+    target,
+    sizeMode: settings.sizeMode,
+    includeFiles: settings.showFilesOnMap,
+    minTileBytes: settings.minTileBytes,
+  });
 }
 
 /** Попросить текущее сканирование остановиться. */

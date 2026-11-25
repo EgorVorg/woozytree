@@ -1,7 +1,7 @@
 // Чистая логика дерева папок и таблицы файлов: разворачивание ленивого дерева
 // в плоский список строк, цепочка предков для навигации, допустимые колонки
 // сортировки. Без React и IPC — поэтому покрыто unit-тестами.
-import type { FileSort, FolderSummary } from "./types";
+import type { Crumb, FileSort, FolderSummary } from "./types";
 
 /** Корень сканирования: имя и итоги (из `ScanTotals`). */
 export interface TreeRoot {
@@ -28,11 +28,13 @@ export interface TreeRow {
   loading: boolean;
 }
 
-/** Звено пути от корня до папки (совместимо с `Crumb` в App). */
-export interface TreeCrumb {
-  id: number;
-  name: string;
-}
+/**
+ * Звено пути от корня до папки.
+ *
+ * Это тот же `Crumb`, что у крошек и карты: один тип на всё приложение
+ * (`lib/types.ts`), иначе пути из дерева, карты и поиска формально несовместимы.
+ */
+export type TreeCrumb = Crumb;
 
 /** Колонки, которые принимает `get_files`. */
 const FILE_SORT_COLUMNS: readonly string[] = [

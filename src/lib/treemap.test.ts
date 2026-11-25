@@ -101,13 +101,23 @@ describe("analyze_rects", () => {
       x: 0,
       y: 0,
       w: 0.75,
-      h: 1,
+      h: 0.5,
       name: "a.bin",
-      size: 150,
+      size: 200,
+    });
+    // Второй видимый ребёнок A: сумма видимых детей равна размеру папки, как
+    // и в реальной выдаче, где дети покрывают родителя.
+    const fileA2 = tile({
+      x: 0,
+      y: 0.5,
+      w: 0.75,
+      h: 0.5,
+      name: "a2.bin",
+      size: 100,
     });
 
-    const analyzed = analyze_rects([folderA, folderB, fileA]);
-    expect(analyzed).toHaveLength(3);
+    const analyzed = analyze_rects([folderA, folderB, fileA, fileA2]);
+    expect(analyzed).toHaveLength(4);
 
     expect(analyzed[0]).toMatchObject({
       depth: 0,
@@ -127,8 +137,46 @@ describe("analyze_rects", () => {
       depth: 1,
       parent_name: "A",
       parent_size: 300,
-      percent_of_parent: 0.5,
+      percent_of_parent: 2 / 3,
       has_children: false,
+    });
+    expect(analyzed[3]).toMatchObject({
+      depth: 1,
+      parent_name: "A",
+      parent_size: 300,
+      percent_of_parent: 1 / 3,
+    });
+  });
+
+  it("analyze_rects_percent_matches_visible_area_when_children_partial", () => {
+    // Скрытые файлы: у папки A виден только один ребёнок. Площадь ребёнка
+    // занимает всю плитку A, поэтому доля — 1.0, а не «1/3 полной папки»:
+    // площадь и процент обязаны считаться от одной базы (видимого).
+    const folderA = tile({
+      x: 0,
+      y: 0,
+      w: 1,
+      h: 1,
+      id: 1,
+      name: "A",
+      size: 300,
+      is_dir: true,
+    });
+    const onlyChild = tile({
+      x: 0,
+      y: 0,
+      w: 1,
+      h: 1,
+      id: 2,
+      name: "B",
+      size: 100,
+      is_dir: true,
+    });
+
+    const analyzed = analyze_rects([folderA, onlyChild]);
+    expect(analyzed[1]).toMatchObject({
+      parent_size: 100,
+      percent_of_parent: 1,
     });
   });
 
@@ -236,6 +284,17 @@ describe("crumbs_for_tile", () => {
         { id: 7, name: "Users" },
       ]),
     ).toEqual([ROOT, { id: 7, name: "Users" }]);
+  });
+
+  it("crumbs_for_tile_finds_copy_of_tile_by_id", () => {
+    // Плитка пришла из другого снимка данных (не та же ссылка, что в массиве):
+    // путь обязан собраться по (id, is_dir), а не по identity объекта.
+    const staleCopy = { ...music };
+    expect(crumbs_for_tile(rects, staleCopy, [ROOT])).toEqual([
+      ROOT,
+      { id: 7, name: "Users" },
+      { id: 9, name: "Music" },
+    ]);
   });
 });
 

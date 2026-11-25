@@ -3,7 +3,7 @@
 // TanStack Table — колонки, строки и сортировка (сортирует ядро: ручной режим),
 // TanStack Virtual — виртуальный список (в C:\Windows десятки тысяч строк),
 // TanStack Query — страницы `get_files` с кэшем по папке и сортировке.
-import { LinkSimple } from "@phosphor-icons/react";
+import { LinkSimple, TextAa } from "@phosphor-icons/react";
 import {
   createColumnHelper,
   rowSortingFeature,
@@ -26,6 +26,7 @@ import {
   formatSize,
 } from "@/lib/format";
 import { getFiles } from "@/lib/ipc";
+import { same_query_scope } from "@/lib/query";
 import type { DeleteReport, FileRow, FileSort, SizeMode } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
@@ -67,7 +68,15 @@ const columns = columnHelper.columns([
           <span className="truncate" title={row.name}>
             {row.name}
           </span>
-          {row.hard_linked ? (
+          {row.is_alias ? (
+            <span
+              className="inline-flex shrink-0 items-center gap-0.5 rounded border border-border bg-muted/60 px-1 py-0 text-[10px] leading-4 font-normal text-muted-foreground"
+              title="короткое имя 8.3: второе имя того же файла, размер не входит в итоги"
+            >
+              <TextAa size={10} weight="bold" />
+              короткое имя
+            </span>
+          ) : row.hard_linked ? (
             <span
               className="inline-flex shrink-0 items-center gap-0.5 rounded border border-border bg-muted/60 px-1 py-0 text-[10px] leading-4 font-normal text-muted-foreground"
               title="жёсткая ссылка: размер не входит в итоги"
@@ -204,20 +213,12 @@ export default function FileTable({
     enabled: !scanning,
     staleTime: Number.POSITIVE_INFINITY,
     // Строки прошлого запроса показываем только при смене сортировки в той же
-    // папке: при переходе в другую папку или на новый скан это были бы чужие
-    // файлы, выданные за текущие.
-    placeholderData: (previousData, previousQuery) => {
-      if (!previousQuery) return undefined;
-      const [tag, run, folder] = previousQuery.queryKey as [
-        string,
-        number,
-        number,
-      ];
-      if (tag !== "files" || run !== scanRun || folder !== folderId) {
-        return undefined;
-      }
-      return previousData;
-    },
+    // папке и том же скане: при переходе в другую папку или на новый скан это
+    // были бы чужие файлы, выданные за текущие.
+    placeholderData: (previousData, previousQuery) =>
+      same_query_scope(previousQuery?.queryKey, ["files", scanRun, folderId])
+        ? previousData
+        : undefined,
   });
 
   // Все загруженные страницы одним списком: таблица и виртуализатор работают
@@ -256,6 +257,9 @@ export default function FileTable({
   const { fetchNextPage, hasNextPage, isFetchingNextPage } = query;
   useEffect(() => {
     if (!hasNextPage || isFetchingNextPage) return;
+    // Пока на экране placeholder прошлого порядка, догружать нечего: страницы
+    // относятся к старому запросу и подмешались бы к новому.
+    if (query.isPlaceholderData) return;
     if (lastVirtualIndex >= rows.length - LOAD_AHEAD) {
       void fetchNextPage();
     }
@@ -265,6 +269,7 @@ export default function FileTable({
     isFetchingNextPage,
     lastVirtualIndex,
     rows.length,
+    query.isPlaceholderData,
   ]);
 
   // Новая папка или сортировка — читаем список сверху.
@@ -376,6 +381,7 @@ export default function FileTable({
                         // Для вторичных ссылок и коротких имён безвозвратное
                         // удаление отключено (см. FileActionsMenu).
                         hardLinked: row.original.hard_linked,
+                        alias: row.original.is_alias,
                         x: event.clientX,
                         y: event.clientY,
                       });

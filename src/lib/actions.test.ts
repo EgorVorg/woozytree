@@ -1,11 +1,14 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  ALIAS_PERMANENT_REASON,
   error_text,
   files_word,
+  folders_in_label,
   HARD_LINK_PERMANENT_REASON,
   permanent_delete_allowed,
   permanent_delete_question,
+  permanent_delete_reason,
 } from "./actions";
 
 describe("files_word", () => {
@@ -21,6 +24,18 @@ describe("files_word", () => {
     expect(files_word(25)).toBe("файлов");
     expect(files_word(111)).toBe("файлов");
     expect(files_word(0)).toBe("файлов");
+  });
+});
+
+describe("folders_in_label", () => {
+  it("даёт форму «в N папке/папках»", () => {
+    expect(folders_in_label(1)).toBe("папке");
+    expect(folders_in_label(21)).toBe("папке");
+    expect(folders_in_label(101)).toBe("папке");
+    expect(folders_in_label(2)).toBe("папках");
+    expect(folders_in_label(5)).toBe("папках");
+    expect(folders_in_label(11)).toBe("папках");
+    expect(folders_in_label(0)).toBe("папках");
   });
 });
 
@@ -42,11 +57,23 @@ describe("permanent_delete_allowed", () => {
   it("запрещает безвозвратное удаление для жёстких ссылок и коротких имён", () => {
     expect(permanent_delete_allowed(false)).toBe(true);
     expect(permanent_delete_allowed(true)).toBe(false);
+    expect(permanent_delete_allowed(false, true)).toBe(false);
+    expect(permanent_delete_allowed(true, true)).toBe(false);
   });
 
   it("объясняет причину запрета по-русски", () => {
     expect(HARD_LINK_PERMANENT_REASON).toContain("вторичных ссылок");
     expect(HARD_LINK_PERMANENT_REASON).toContain("основную строку файла");
+    expect(ALIAS_PERMANENT_REASON).toContain("короткого имени");
+    expect(ALIAS_PERMANENT_REASON).toContain("второе имя того же файла");
+  });
+
+  it("выбирает причину по пометке строки", () => {
+    expect(permanent_delete_reason(false)).toBeNull();
+    expect(permanent_delete_reason(true)).toBe(HARD_LINK_PERMANENT_REASON);
+    // У алиаса обычно стоит и hard_linked, но объяснение — про короткое имя.
+    expect(permanent_delete_reason(true, true)).toBe(ALIAS_PERMANENT_REASON);
+    expect(permanent_delete_reason(false, true)).toBe(ALIAS_PERMANENT_REASON);
   });
 });
 

@@ -3,7 +3,7 @@
 // Фильтры и страницы считает ядро (`search_files`), окно получает только
 // видимый кусок. Строки виртуализированы (страница — 2000 строк, как в таблице
 // файлов): результат на 1.26 млн файлов не должен раздувать DOM.
-import { LinkSimple } from "@phosphor-icons/react";
+import { LinkSimple, TextAa } from "@phosphor-icons/react";
 import {
   createColumnHelper,
   tableFeatures,
@@ -59,7 +59,15 @@ const columns = columnHelper.columns([
           <span className="truncate" title={row.name}>
             {row.name}
           </span>
-          {row.hard_linked ? (
+          {row.is_alias ? (
+            <span
+              className="inline-flex shrink-0 items-center gap-0.5 rounded border border-border bg-muted/60 px-1 py-0 text-[10px] leading-4 font-normal text-muted-foreground"
+              title="короткое имя 8.3: второе имя того же файла, размер не входит в итоги"
+            >
+              <TextAa size={10} weight="bold" />
+              короткое имя
+            </span>
+          ) : row.hard_linked ? (
             <span
               className="inline-flex shrink-0 items-center gap-0.5 rounded border border-border bg-muted/60 px-1 py-0 text-[10px] leading-4 font-normal text-muted-foreground"
               title="жёсткая ссылка: размер не входит в итоги"

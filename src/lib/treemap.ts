@@ -3,16 +3,13 @@
 // Контракт вывода Rust (`treemap_for_folder`): прямоугольники вложенные,
 // родитель идёт в списке раньше своих детей, координаты нормированы 0..1.
 // Поэтому «верхняя» плитка под точкой — последняя подходящая в списке.
-import type { TreemapRect } from "./types";
+import type { Crumb, TreemapRect } from "./types";
+
+/** Звено пути от корня сканирования до открытой папки. */
+export type { Crumb };
 
 /** Допуск для проверок «плитка лежит внутри родителя» при погрешности f64. */
 const EPS = 1e-9;
-
-/** Звено пути от корня сканирования до открытой папки. */
-export interface Crumb {
-  id: number;
-  name: string;
-}
 
 /** Плитка с посчитанными связями: глубина, родитель, доля от родителя. */
 export interface TreemapTile {
@@ -87,13 +84,23 @@ export function parent_index(
 /**
  * Разметка плиток для отрисовки и подсказок: глубина, размер родителя и доля
  * от него. Один проход, потому что родитель всегда раньше ребёнка.
+ *
+ * `parent_size` — сумма **видимых** соседей, а не полный размер папки. При
+ * включённых файлах это одно и то же (дети покрывают папку), а при скрытых
+ * файлах плитка папки занимает долю от суммы видимых папок — и процент обязан
+ * считаться от той же базы, иначе площадь и число в подсказке спорят.
  */
 export function analyze_rects(rects: TreemapRect[]): TreemapTile[] {
   const parents = rects.map((_, index) => parent_index(rects, index));
 
-  let top_size = 0;
+  // Сумма размеров видимых детей для каждого родителя; ключ null — корень вида.
+  const sibling_total = new Map<number | null, number>();
   for (let index = 0; index < rects.length; index += 1) {
-    if (parents[index] === null) top_size += rects[index].size;
+    const parent = parents[index];
+    sibling_total.set(
+      parent,
+      (sibling_total.get(parent) ?? 0) + rects[index].size,
+    );
   }
 
   const has_children = rects.map(() => false);
@@ -106,7 +113,7 @@ export function analyze_rects(rects: TreemapRect[]): TreemapTile[] {
     const parent = parents[index];
     const depth = parent === null ? 0 : depths[parent] + 1;
     depths[index] = depth;
-    const parent_size = parent === null ? top_size : rects[parent].size;
+    const parent_size = sibling_total.get(parent) ?? 0;
     const percent_of_parent =
       parent_size > 0 ? Math.min(1, rect.size / parent_size) : 0;
     return {
@@ -146,7 +153,13 @@ export function crumbs_for_tile(
   base: readonly Crumb[] = [],
 ): Crumb[] {
   if (!tile.is_dir || tile.id === 0) return [];
-  const index = rects.indexOf(tile);
+  // Ищем плитку по (id, is_dir), а не по ссылке: у папки id уникален, поэтому
+  // путь собирается, даже если объект плитки пришёл из другого снимка данных
+  // (например, между живым событием и ответом команды). Файлы сюда не
+  // попадают — у них id = 0 и вышел бы ранний возврат.
+  const index = rects.findIndex(
+    (candidate) => candidate.is_dir === tile.is_dir && candidate.id === tile.id,
+  );
   if (index < 0) return [];
 
   const ancestors: TreemapRect[] = [];
