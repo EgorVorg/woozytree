@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import FileTable from "@/components/FileTable";
+import FileTypesPanel from "@/components/FileTypesPanel";
 import FolderTree from "@/components/FolderTree";
 import ScanStatus, { Breadcrumbs, type Crumb } from "@/components/ScanStatus";
 import SearchPanel from "@/components/SearchPanel";
@@ -423,9 +424,17 @@ function App() {
               )
             }
             types={
-              <section className="rounded-lg border border-border bg-card px-4 py-6 text-sm text-muted-foreground">
-                Появится в следующей задаче.
-              </section>
+              path.length === 0 ? (
+                <section className="rounded-lg border border-border bg-card px-4 py-6 text-sm text-muted-foreground">
+                  Карта типов появится здесь сразу после начала сканирования.
+                </section>
+              ) : (
+                <FileTypesPanel
+                  folderId={folderId}
+                  scanning={scanning}
+                  scanRun={scanRun}
+                />
+              )
             }
             search={
               <SearchPanel

@@ -8,6 +8,7 @@ import type {
   DriveInfo,
   FilePage,
   FileSort,
+  FileTypeRow,
   FolderSummary,
   ScanProgress,
   ScanTarget,
@@ -15,6 +16,7 @@ import type {
   SearchPage,
   SearchQuery,
   TreemapRect,
+  TypeSort,
 } from "./types";
 
 /**
@@ -96,6 +98,31 @@ export function getTreemap(
   maxRects: number,
 ): Promise<TreemapRect[]> {
   return invoke<TreemapRect[]>("get_treemap", { folderId, maxRects });
+}
+
+/**
+ * Агрегаты по расширениям в поддереве папки — таблица вкладки «Типы файлов».
+ *
+ * `sort`/`desc` применяет ядро: таблица получает уже упорядоченные строки и не
+ * сортирует миллионы файлов на стороне окна.
+ */
+export function getFileTypes(
+  folderId: number,
+  sort: TypeSort,
+  desc: boolean,
+): Promise<FileTypeRow[]> {
+  return invoke<FileTypeRow[]>("get_file_types", { folderId, sort, desc });
+}
+
+/**
+ * Плоские плитки карты типов: расширения в нормированном контейнере 0..1.
+ * `maxRects` — бюджет раскладки, ядро клампит его 5000.
+ */
+export function getTypesTreemap(
+  folderId: number,
+  maxRects: number,
+): Promise<TreemapRect[]> {
+  return invoke<TreemapRect[]>("get_types_treemap", { folderId, maxRects });
 }
 
 export function onProgress(cb: (p: ScanProgress) => void): Promise<UnlistenFn> {

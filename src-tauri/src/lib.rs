@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, State};
 
 use model::{
-    CrumbDto, DriveInfo, FilePage, FileSort, FolderSummary, ScanError, ScanProgress, ScanTotals,
-    SearchPage, SearchQuery, TreemapRect,
+    CrumbDto, DriveInfo, FilePage, FileSort, FileTypeRow, FolderSummary, ScanError, ScanProgress,
+    ScanTotals, SearchPage, SearchQuery, TreemapRect, TypeSort,
 };
 use scan::index::ScanIndex;
 use scan::{ScanService, ScanSink, ScanTarget, drive_root, run_scan};
@@ -197,6 +197,18 @@ fn cancel_scan(state: State<'_, AppState>) {
     state.service.cancel();
 }
 
+/// Проверить, что папка с таким id есть в готовом индексе.
+///
+/// Идентификаторы папок выдаются по порядку (0 — корень), поэтому последний
+/// известный id равен числу папок в корне: чужой id отсекается без паники.
+fn check_folder_id(index: &ScanIndex, folder_id: u32) -> Result<(), String> {
+    let max_id = index.folder_totals(index.root()).folder_count;
+    if folder_id > max_id {
+        return Err(format!("Папка с id {folder_id} не найдена."));
+    }
+    Ok(())
+}
+
 #[tauri::command]
 fn get_children(state: State<'_, AppState>, folder_id: u32) -> Result<Vec<FolderSummary>, String> {
     let index = state
@@ -204,12 +216,7 @@ fn get_children(state: State<'_, AppState>, folder_id: u32) -> Result<Vec<Folder
         .index()
         .ok_or_else(|| "Индекс ещё не готов: сначала завершите сканирование.".to_string())?;
 
-    // Идентификаторы папок выдаются по порядку (0 — корень), поэтому последний
-    // известный id равен числу папок в корне. Так чужой id отсекается без паники.
-    let max_id = index.folder_totals(index.root()).folder_count;
-    if folder_id > max_id {
-        return Err(format!("Папка с id {folder_id} не найдена."));
-    }
+    check_folder_id(&index, folder_id)?;
 
     Ok(index.child_folders(folder_id))
 }
@@ -238,6 +245,23 @@ fn file_sort_from_name(name: &str) -> Result<FileSort, String> {
     }
 }
 
+/// Колонка сортировки таблицы типов из строки окна.
+///
+/// Времени изменения здесь нет: у группы расширений его не существует, поэтому
+/// допустимы только четыре имени. Неизвестное имя — ошибка на русском, а не
+/// паника: окно могло сохранить старую настройку или прислать мусор.
+fn type_sort_from_name(name: &str) -> Result<TypeSort, String> {
+    match name {
+        "name" => Ok(TypeSort::Name),
+        "count" => Ok(TypeSort::Count),
+        "size_on_disk" => Ok(TypeSort::SizeOnDisk),
+        "size_logical" => Ok(TypeSort::SizeLogical),
+        other => Err(format!(
+            "Неизвестная сортировка «{other}»: ожидается name, count, size_on_disk или size_logical."
+        )),
+    }
+}
+
 /// Страница таблицы файлов папки: сортировка и срез делает индекс.
 ///
 /// Команда асинхронная: сортировка большой папки (десятки тысяч имён) — это
@@ -258,12 +282,7 @@ fn get_files(
         .index()
         .ok_or_else(|| "Индекс ещё не готов: сначала завершите сканирование.".to_string())?;
 
-    // Идентификаторы папок выдаются по порядку (0 — корень), поэтому последний
-    // известный id равен числу папок в корне. Чужой id отсекаем без паники.
-    let max_id = index.folder_totals(index.root()).folder_count;
-    if folder_id > max_id {
-        return Err(format!("Папка с id {folder_id} не найдена."));
-    }
+    check_folder_id(&index, folder_id)?;
 
     Ok(FilePage {
         total: index.file_count(folder_id),
@@ -307,12 +326,7 @@ fn get_path_crumbs(state: State<'_, AppState>, folder_id: u32) -> Result<Vec<Cru
         .index()
         .ok_or_else(|| "Индекс ещё не готов: сначала завершите сканирование.".to_string())?;
 
-    // Идентификаторы папок выдаются по порядку (0 — корень), поэтому последний
-    // известный id равен числу папок в корне. Чужой id отсекаем без паники.
-    let max_id = index.folder_totals(index.root()).folder_count;
-    if folder_id > max_id {
-        return Err(format!("Папка с id {folder_id} не найдена."));
-    }
+    check_folder_id(&index, folder_id)?;
 
     Ok(index
         .ancestors(folder_id)
@@ -341,17 +355,62 @@ fn get_treemap(
         .index()
         .ok_or_else(|| "Индекс ещё не готов: сначала завершите сканирование.".to_string())?;
 
-    // Идентификаторы папок выдаются по порядку (0 — корень), поэтому последний
-    // известный id равен числу папок в корне. Чужой id отсекаем без паники.
-    let max_id = index.folder_totals(index.root()).folder_count;
-    if folder_id > max_id {
-        return Err(format!("Папка с id {folder_id} не найдена."));
-    }
+    check_folder_id(&index, folder_id)?;
 
     let max_rects = max_rects.min(TREEMAP_RECTS_LIMIT);
     Ok(treemap::layout::treemap_for_folder(
         &index, folder_id, max_rects,
     ))
+}
+
+/// Сколько плиток карты типов максимум отдаём одной командой.
+///
+/// Расширений на диске тысячи, а не миллионы, но ответ IPC всё равно ограничен:
+/// карте типов хватает нескольких сотен крупнейших, остальные — в таблице.
+const TYPES_RECTS_LIMIT: usize = 5_000;
+
+/// Агрегаты по расширениям в поддереве папки — таблица вкладки «Типы файлов».
+///
+/// Команда асинхронная: обход поддерева (на C: — 1.26 млн файлов) и агрегация
+/// по `HashMap` занимают десятки-сотни миллисекунд, окно ждать не должно.
+#[tauri::command(async)]
+fn get_file_types(
+    state: State<'_, AppState>,
+    folder_id: u32,
+    sort: String,
+    desc: bool,
+) -> Result<Vec<FileTypeRow>, String> {
+    let sort = type_sort_from_name(&sort)?;
+    let index = state
+        .service
+        .index()
+        .ok_or_else(|| "Индекс ещё не готов: сначала завершите сканирование.".to_string())?;
+
+    check_folder_id(&index, folder_id)?;
+
+    Ok(index.file_types(folder_id, sort, desc))
+}
+
+/// Плитки карты типов: расширения как плоский список прямоугольников 0..1.
+///
+/// Раскладка — общий `layout_treemap`, поэтому плитки покрывают контейнер без
+/// пересечений. Команда асинхронная: сортировка тысяч групп и раскладка — это
+/// единицы-десятки миллисекунд CPU.
+#[tauri::command(async)]
+fn get_types_treemap(
+    state: State<'_, AppState>,
+    folder_id: u32,
+    max_rects: usize,
+) -> Result<Vec<TreemapRect>, String> {
+    let index = state
+        .service
+        .index()
+        .ok_or_else(|| "Индекс ещё не готов: сначала завершите сканирование.".to_string())?;
+
+    check_folder_id(&index, folder_id)?;
+
+    let max_rects = max_rects.min(TYPES_RECTS_LIMIT);
+    Ok(index.types_treemap(folder_id, max_rects))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -371,7 +430,9 @@ pub fn run() {
             get_scan_totals,
             get_treemap,
             search_files,
-            get_path_crumbs
+            get_path_crumbs,
+            get_file_types,
+            get_types_treemap
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -436,6 +497,27 @@ mod tests {
         assert!(text.contains("«size»"), "{text}");
         assert!(
             text.contains("size_on_disk") && text.contains("modified"),
+            "ошибка должна перечислять допустимые колонки: {text}"
+        );
+    }
+
+    #[test]
+    fn type_sort_maps_window_column_names() {
+        assert!(matches!(type_sort_from_name("name"), Ok(TypeSort::Name)));
+        assert!(matches!(type_sort_from_name("count"), Ok(TypeSort::Count)));
+        assert!(matches!(
+            type_sort_from_name("size_on_disk"),
+            Ok(TypeSort::SizeOnDisk)
+        ));
+        assert!(matches!(
+            type_sort_from_name("size_logical"),
+            Ok(TypeSort::SizeLogical)
+        ));
+        // Времени изменения у группы расширений нет: колонка не принимается.
+        let text = type_sort_from_name("modified").expect_err("modified неприменим к типам файлов");
+        assert!(text.contains("«modified»"), "{text}");
+        assert!(
+            text.contains("count") && text.contains("size_logical"),
             "ошибка должна перечислять допустимые колонки: {text}"
         );
     }

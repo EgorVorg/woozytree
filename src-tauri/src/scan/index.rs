@@ -5,9 +5,10 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use crate::model::{
-    FileKey, FileMeta, FileRow, FileSort, FolderId, FolderSummary, FolderTotals, SearchQuery,
-    SearchRow,
+    FileKey, FileMeta, FileRow, FileSort, FileTypeRow, FolderId, FolderSummary, FolderTotals,
+    SearchQuery, SearchRow, TreemapRect, TypeSort,
 };
+use crate::treemap::layout::{Rect, TreemapItem, layout_treemap};
 
 /// Результат добавления файла в индекс.
 pub enum AddOutcome {
@@ -254,6 +255,49 @@ fn compare_files(left: &FileRecord, right: &FileRecord, sort: FileSort, desc: bo
         FileSort::Modified => left.modified.cmp(&right.modified),
     };
     ordered(primary, desc).then_with(|| compare_names(&left.name, &right.name))
+}
+
+/// Расширение файла без точки в нижнем регистре; `""` — расширения нет.
+///
+/// Расширение — текст после последней точки. Точка в начале имени (`.gitignore`)
+/// расширением не считается: это скрытый файл без расширения, как в проводнике;
+/// точка в конце (`file.`) тоже даёт пустое расширение. Регистр снимается
+/// `to_lowercase`, чтобы `.TXT` и `.txt` попали в одну группу.
+fn extension_of(name: &str) -> String {
+    match name.rfind('.') {
+        Some(dot) if dot > 0 && dot + 1 < name.len() => name[dot + 1..].to_lowercase(),
+        _ => String::new(),
+    }
+}
+
+/// Имя группы без расширения в таблице и на карте типов.
+const NO_EXTENSION_NAME: &str = "(нет)";
+
+/// Суммы по одной группе расширений: счётчик и размеры.
+#[derive(Default)]
+struct TypeAgg {
+    count: u32,
+    size_on_disk: u64,
+    size_logical: u64,
+}
+
+/// Порядок строк таблицы типов.
+///
+/// `desc` разворачивает только основную колонку; равные значения всегда идут по
+/// возрастанию имени — так порядок групп не зависит от направления сортировки.
+fn compare_type_rows(
+    left: &FileTypeRow,
+    right: &FileTypeRow,
+    sort: TypeSort,
+    desc: bool,
+) -> Ordering {
+    let primary = match sort {
+        TypeSort::Name => return ordered(compare_names(&left.extension, &right.extension), desc),
+        TypeSort::Count => left.count.cmp(&right.count),
+        TypeSort::SizeOnDisk => left.size_on_disk.cmp(&right.size_on_disk),
+        TypeSort::SizeLogical => left.size_logical.cmp(&right.size_logical),
+    };
+    ordered(primary, desc).then_with(|| compare_names(&left.extension, &right.extension))
 }
 
 /// Порядок результатов поиска: крупное сверху, при равных размерах — по имени
@@ -588,12 +632,116 @@ impl ScanIndex {
             .collect();
         (rows, total)
     }
+
+    /// Агрегаты по расширениям рекурсивно по поддереву папки — таблица вкладки
+    /// «Типы файлов».
+    ///
+    /// Обход — по папкам поддерева, а не по всему плоскому списку файлов: для
+    /// открытой подпапки не нужно проверять миллион чужих записей. Группы
+    /// копятся в `HashMap` (расширений на диске тысячи, а не миллионы), затем
+    /// сортируются один раз. Счётчик включает повторные жёсткие ссылки (это
+    /// разные имена), а размеры дубликатов не суммируются — как в итогах папки,
+    /// поэтому сумма строк сходится с деревом.
+    pub fn file_types(&self, folder: FolderId, sort: TypeSort, desc: bool) -> Vec<FileTypeRow> {
+        let mut groups: HashMap<String, TypeAgg> = HashMap::new();
+        let mut stack = vec![folder];
+        while let Some(id) = stack.pop() {
+            let node = &self.nodes[id as usize];
+            for &position in &node.files {
+                let file = &self.files[position as usize];
+                let aggregate = groups.entry(extension_of(&file.name)).or_default();
+                aggregate.count += 1;
+                if !file.hard_linked {
+                    aggregate.size_on_disk += file.size_on_disk;
+                    aggregate.size_logical += file.size_logical;
+                }
+            }
+            stack.extend(node.children.iter().copied());
+        }
+
+        let parent_size = self.nodes[folder as usize].totals.size_on_disk;
+        let mut rows: Vec<FileTypeRow> = groups
+            .into_iter()
+            .map(|(extension, aggregate)| FileTypeRow {
+                extension,
+                count: aggregate.count,
+                size_on_disk: aggregate.size_on_disk,
+                size_logical: aggregate.size_logical,
+                // Сумма размеров групп не больше итога папки (дубликаты жёстких
+                // ссылок не входят), но контракт DTO — 0.0..=1.0: ограничиваем.
+                percent_of_parent: if parent_size == 0 {
+                    0.0
+                } else {
+                    (aggregate.size_on_disk as f32 / parent_size as f32).min(1.0)
+                },
+            })
+            .collect();
+        rows.sort_by(|left, right| compare_type_rows(left, right, sort, desc));
+        rows
+    }
+
+    /// Плоская карта типов: плитки-расширения в контейнере 0..1.
+    ///
+    /// Используется тот же `layout_treemap`, что и у основной карты, поэтому
+    /// плитки не пересекаются и покрывают весь контейнер. Бюджет `max_rects`
+    /// ограничивает число плиток: на диске расширений тысячи, а окну хватает
+    /// крупнейших — остальные видны в таблице ниже. Группы нулевого размера
+    /// (пустые файлы) на карту не попадают: площади у них нет.
+    pub fn types_treemap(&self, folder: FolderId, max_rects: usize) -> Vec<TreemapRect> {
+        if max_rects == 0 {
+            return Vec::new();
+        }
+        let mut rows = self.file_types(folder, TypeSort::SizeOnDisk, true);
+        rows.retain(|row| row.size_on_disk > 0);
+        rows.truncate(max_rects);
+        if rows.is_empty() {
+            return Vec::new();
+        }
+
+        let items: Vec<TreemapItem> = rows
+            .iter()
+            .map(|row| TreemapItem {
+                // Все плитки — типы, а не папки и не файлы: id = 0, is_dir = false.
+                id: 0,
+                name: if row.extension.is_empty() {
+                    NO_EXTENSION_NAME.to_string()
+                } else {
+                    row.extension.clone()
+                },
+                size: row.size_on_disk,
+                is_dir: false,
+            })
+            .collect();
+        let container = Rect {
+            x: 0.0,
+            y: 0.0,
+            w: 1.0,
+            h: 1.0,
+        };
+
+        layout_treemap(&items, container)
+            .into_iter()
+            .map(|(position, tile)| {
+                let item = &items[position];
+                TreemapRect {
+                    id: 0,
+                    name: item.name.clone(),
+                    size: item.size,
+                    is_dir: false,
+                    x: tile.x,
+                    y: tile.y,
+                    w: tile.w,
+                    h: tile.h,
+                }
+            })
+            .collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{FileKey, FileMeta, FileSort, SearchQuery, SearchRow};
+    use crate::model::{FileKey, FileMeta, FileSort, SearchQuery, SearchRow, TypeSort};
 
     /// Файл с полным набором полей: размер на диске, логический размер и время.
     fn meta_full(
@@ -1272,5 +1420,196 @@ mod tests {
             "WoozyTree-Тест\\вложенная\\глубже"
         );
         assert_eq!(folder_index.path_of(folder_root), "WoozyTree-Тест");
+    }
+
+    /// Агрегация по расширениям: `.txt`/`.TXT` — одна группа, `.rs` — вторая,
+    /// файл без расширения — третья (`""`). Размеры суммарны, доля — от итога
+    /// папки. Жёсткая ссылка-дубликат видна в счётчике, но размер не задваивает.
+    #[test]
+    fn file_types_aggregate_by_extension() {
+        let mut index = ScanIndex::new("C:");
+        let root = index.root();
+        index.add_file(root, meta_full("a.txt", 400, 300, 0, 1));
+        index.add_file(root, meta_full("b.TXT", 200, 100, 0, 2));
+        index.add_file(root, meta_full("main.rs", 300, 150, 0, 3));
+        index.add_file(root, meta_full("README", 100, 50, 0, 4));
+
+        let rows = index.file_types(root, TypeSort::SizeOnDisk, true);
+        assert_eq!(rows.len(), 3, "txt, rs и «без расширения»");
+        let extensions: Vec<&str> = rows.iter().map(|row| row.extension.as_str()).collect();
+        assert_eq!(
+            extensions,
+            ["txt", "rs", ""],
+            "по размеру на диске, убыв.; имя группы — без точки в нижнем регистре"
+        );
+
+        let txt = &rows[0];
+        assert_eq!(txt.count, 2, ".txt и .TXT — одна группа");
+        assert_eq!(txt.size_on_disk, 600);
+        assert_eq!(txt.size_logical, 400);
+        assert_eq!(txt.percent_of_parent, 0.6, "600 из 1000 байт папки");
+
+        let rs = &rows[1];
+        assert_eq!((rs.count, rs.size_on_disk, rs.size_logical), (1, 300, 150));
+        assert_eq!(rs.percent_of_parent, 0.3);
+
+        let no_extension = &rows[2];
+        assert_eq!(no_extension.extension, "");
+        assert_eq!(
+            (
+                no_extension.count,
+                no_extension.size_on_disk,
+                no_extension.size_logical
+            ),
+            (1, 100, 50),
+        );
+        assert_eq!(no_extension.percent_of_parent, 0.1);
+
+        let percent_sum: f32 = rows.iter().map(|row| row.percent_of_parent).sum();
+        assert!(
+            (percent_sum - 1.0).abs() < 1e-6,
+            "доли типов складываются в 100 % папки: {percent_sum}"
+        );
+
+        // Сортировка по имени без учёта регистра: пустое расширение — первым
+        // (asc) и последним (desc).
+        let by_name: Vec<String> = index
+            .file_types(root, TypeSort::Name, false)
+            .iter()
+            .map(|row| row.extension.clone())
+            .collect();
+        assert_eq!(by_name, ["", "rs", "txt"]);
+        let by_name_desc: Vec<String> = index
+            .file_types(root, TypeSort::Name, true)
+            .iter()
+            .map(|row| row.extension.clone())
+            .collect();
+        assert_eq!(by_name_desc, ["txt", "rs", ""]);
+
+        // По числу файлов: txt (2) первый; равные счётчики — по имени asc.
+        let by_count: Vec<String> = index
+            .file_types(root, TypeSort::Count, true)
+            .iter()
+            .map(|row| row.extension.clone())
+            .collect();
+        assert_eq!(by_count, ["txt", "", "rs"]);
+        // По фактическому размеру: 400, 150, 50.
+        let by_logical: Vec<String> = index
+            .file_types(root, TypeSort::SizeLogical, true)
+            .iter()
+            .map(|row| row.extension.clone())
+            .collect();
+        assert_eq!(by_logical, ["txt", "rs", ""]);
+
+        // Повторная жёсткая ссылка на a.txt: имя учитывается в счётчике, но
+        // размер — нет (как в итогах папки), поэтому сумма не растёт.
+        assert!(matches!(
+            index.add_file(root, meta_full("alias.txt", 400, 300, 0, 1)),
+            AddOutcome::HardLinkDuplicate
+        ));
+        let rows = index.file_types(root, TypeSort::SizeOnDisk, true);
+        let txt = rows.iter().find(|row| row.extension == "txt").expect("txt");
+        assert_eq!(txt.count, 3);
+        assert_eq!(txt.size_on_disk, 600, "размер дубликата не задваивается");
+        assert_eq!(txt.percent_of_parent, 0.6);
+        let sum: u64 = rows.iter().map(|row| row.size_on_disk).sum();
+        assert_eq!(
+            sum,
+            index.folder_totals(root).size_on_disk,
+            "сумма по типам сходится с итогом папки"
+        );
+    }
+
+    /// Агрегаты рекурсивны: файлы вложенных папок входят в типы родителя, а
+    /// папка считает только своё поддерево.
+    #[test]
+    fn file_types_are_recursive() {
+        let mut index = ScanIndex::new("C:");
+        let root = index.root();
+        let docs = index.folder(root, "docs");
+        let deep = index.folder(docs, "deep");
+
+        index.add_file(root, meta("root.txt", 100, 1));
+        index.add_file(docs, meta("doc.pdf", 200, 2));
+        index.add_file(deep, meta("nested.PDF", 300, 3));
+        index.add_file(deep, meta("image.png", 400, 4));
+
+        let rows = index.file_types(root, TypeSort::SizeOnDisk, true);
+        let extensions: Vec<&str> = rows.iter().map(|row| row.extension.as_str()).collect();
+        assert_eq!(extensions, ["pdf", "png", "txt"]);
+        assert_eq!(rows[0].count, 2, ".pdf и .PDF — одна группа");
+        assert_eq!(rows[0].size_on_disk, 500);
+        assert_eq!(
+            rows[0].percent_of_parent, 0.5,
+            "500 из 1000 байт всего поддерева"
+        );
+
+        let sum: u64 = rows.iter().map(|row| row.size_on_disk).sum();
+        assert_eq!(sum, index.folder_totals(root).size_on_disk);
+
+        // Подпапка docs: 500 + 400 = 900 байт, доли — от её итога.
+        let docs_rows = index.file_types(docs, TypeSort::SizeOnDisk, true);
+        let docs_extensions: Vec<&str> =
+            docs_rows.iter().map(|row| row.extension.as_str()).collect();
+        assert_eq!(docs_extensions, ["pdf", "png"]);
+        assert_eq!(docs_rows[0].size_on_disk, 500);
+        assert_eq!(docs_rows[0].percent_of_parent, 500.0 / 900.0);
+        assert_eq!(
+            docs_rows.iter().map(|row| row.size_on_disk).sum::<u64>(),
+            index.folder_totals(docs).size_on_disk
+        );
+    }
+
+    /// Карта типов — плоская раскладка расширений тем же `layout_treemap`, что
+    /// и основная карта: плитки покрывают контейнер, бюджет соблюдён, имена —
+    /// расширения («(нет)» для файлов без расширения), id = 0.
+    #[test]
+    fn types_treemap_covers_container() {
+        let mut index = ScanIndex::new("C:");
+        let root = index.root();
+        for (name, size, key) in [
+            ("a.txt", 500u64, 1u64),
+            ("b.TXT", 300, 2),
+            ("main.rs", 100, 3),
+            ("data.bin", 60, 4),
+            ("README", 40, 5),
+        ] {
+            index.add_file(root, meta(name, size, key));
+        }
+
+        // Полная выдача: четыре расширения (txt, rs, bin и «(нет)»), доли от
+        // 1000 байт.
+        let rects = index.types_treemap(root, 10);
+        assert_eq!(rects.len(), 4);
+        assert_eq!(
+            rects
+                .iter()
+                .map(|rect| rect.name.as_str())
+                .collect::<Vec<_>>(),
+            ["txt", "rs", "bin", "(нет)"],
+            "порядок — по убыванию размера, безымянное расширение — «(нет)»"
+        );
+        assert!(rects.iter().all(|rect| rect.id == 0 && !rect.is_dir));
+        let txt = rects.iter().find(|rect| rect.name == "txt").expect("txt");
+        assert!((txt.w * txt.h - 0.8).abs() < 1e-9, "800 из 1000 байт");
+
+        // Бюджет: не больше max_rects плиток, и они покрывают контейнер.
+        let limited = index.types_treemap(root, 3);
+        assert_eq!(limited.len(), 3);
+        let covered: f64 = limited.iter().map(|rect| rect.w * rect.h).sum();
+        assert!(
+            (covered - 1.0).abs() < 1e-9,
+            "плитки покрывают весь контейнер: {covered}"
+        );
+        for rect in &limited {
+            assert!(rect.x >= 0.0 && rect.y >= 0.0);
+            assert!(rect.x + rect.w <= 1.0 + 1e-9);
+            assert!(rect.y + rect.h <= 1.0 + 1e-9);
+        }
+
+        // Нет файлов или бюджет 0 — пусто, без паники.
+        let empty = index.folder(root, "empty");
+        assert!(index.types_treemap(empty, 10).is_empty());
+        assert!(index.types_treemap(root, 0).is_empty());
     }
 }
