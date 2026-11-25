@@ -4,7 +4,8 @@
 //! `scan_bench --fixture <путь к слепку MFT>` для проверки без тома.
 //! Печатает итоги сканирования, верхние папки, время по фазам и разбивку
 //! пропусков по причинам. `scan_bench --files 100000` мерит время выдачи
-//! страницы таблицы файлов на синтетической папке.
+//! страницы таблицы файлов на синтетической папке. `scan_bench --search C:
+//! отчёт` — время первой страницы поиска по подстроке на реальном индексе.
 
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
@@ -12,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use woozytree_lib::model::{
     FileKey, FileMeta, FileSort, FolderId, FolderSummary, ScanError, ScanProgress, ScanTotals,
-    TreemapRect,
+    SearchQuery, TreemapRect,
 };
 use woozytree_lib::scan::index::ScanIndex;
 use woozytree_lib::scan::mft::{ScanDiag, scan_ntfs_reader_diag};
@@ -370,8 +371,79 @@ fn run_live(drive: &str) {
     bench_files(&index, drive);
 }
 
+/// Замер поиска на реальном томе: скан, затем время первой страницы результатов.
+///
+/// `scan_bench --search C: отчёт` — то же, что делает окно: линейный проход по
+/// индексу (1.26 млн файлов) + сортировка найденного + сборка страницы 2000
+/// строк. Первый вызов — «холодный», как у пользователя, без прогрева.
+fn run_search_bench(drive: &str, needle: &str) {
+    let letter = drive.trim_end_matches([':', '\\', '/']).to_string();
+    let target = ScanTarget::Drive(letter);
+    let mut index = ScanIndex::new(drive);
+    let cancel = AtomicBool::new(false);
+    let mut sink = LiveSink::new();
+    let started = Instant::now();
+    let totals = match run_scan(&target, &mut index, &mut sink, &cancel) {
+        Ok(totals) => totals,
+        Err(error) => {
+            eprintln!("scan_bench: {}", describe(error));
+            std::process::exit(1);
+        }
+    };
+    println!(
+        "[search] скан {drive}: файлов {}, папок {}, за {:?}",
+        totals.files,
+        totals.folders,
+        started.elapsed()
+    );
+
+    let queries = [
+        (
+            "подстрока",
+            SearchQuery {
+                name: needle.to_string(),
+                min_size: 0,
+                max_size: None,
+                modified_after: None,
+                modified_before: None,
+            },
+        ),
+        (
+            "всё подряд",
+            SearchQuery {
+                name: String::new(),
+                min_size: 0,
+                max_size: None,
+                modified_after: None,
+                modified_before: None,
+            },
+        ),
+    ];
+    for (label, query) in queries {
+        // Первый вызов — «холодный», как у пользователя; второй — повтор.
+        for attempt in ["первый", "повтор"] {
+            let started = Instant::now();
+            let (rows, total) = index.search_files(&query, 0, 2_000);
+            let elapsed = started.elapsed();
+            println!(
+                "[search] {label} ({attempt}): {elapsed:?}, строк {}, всего {}",
+                rows.len(),
+                total
+            );
+        }
+    }
+}
+
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Замер поиска на готовом индексе: `scan_bench --search C: отчёт`.
+    if args.first().map(String::as_str) == Some("--search") {
+        let drive = args.get(1).cloned().unwrap_or_else(|| "C:".to_string());
+        let needle = args.get(2).cloned().unwrap_or_else(|| "отчёт".to_string());
+        run_search_bench(&drive, &needle);
+        return;
+    }
 
     // Режим замера раскладки: `scan_bench --treemap [буква_тома] [бюджет]`.
     // Флаг снимается — дальше это обычный скан тома, раскладку мерим на его

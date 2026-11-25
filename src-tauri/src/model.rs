@@ -85,6 +85,55 @@ pub struct FilePage {
     pub total: u32,
 }
 
+/// Фильтры поиска файлов по готовому индексу.
+///
+/// Пустые фильтры валидны: `name: ""`, `min_size: 0` и `None` в границах
+/// означают «всё подряд». Верхняя граница размера — `Option`, а не `u64::MAX`:
+/// это значение нельзя передать из JS без потери точности.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SearchQuery {
+    /// Подстрока имени без учёта регистра: правила те же, что у сортировки
+    /// (ASCII, кириллица, «ё» ≈ «е»).
+    pub name: String,
+    /// Нижняя граница размера на диске в байтах; 0 — без границы.
+    pub min_size: u64,
+    /// Верхняя граница размера на диске в байтах; `None` — без границы.
+    pub max_size: Option<u64>,
+    /// Время изменения не раньше (включительно), Unix-мс; `None` — без границы.
+    pub modified_after: Option<i64>,
+    /// Время изменения не позже (включительно), Unix-мс; `None` — без границы.
+    pub modified_before: Option<i64>,
+}
+
+/// DTO для фронтенда: строка результатов поиска.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SearchRow {
+    pub name: String,
+    /// Путь папки файла от корня индекса, разделитель `\`.
+    pub folder_path: String,
+    /// Папка файла — для перехода на карту (`get_path_crumbs`).
+    pub folder_id: u32,
+    pub size_on_disk: u64,
+    pub size_logical: u64,
+    pub modified: i64,
+    pub hard_linked: bool,
+}
+
+/// DTO для фронтенда: страница результатов поиска (`search_files`).
+#[derive(Debug, serde::Serialize)]
+pub struct SearchPage {
+    pub rows: Vec<SearchRow>,
+    /// Сколько всего файлов подходит под фильтры — для пагинации.
+    pub total: u32,
+}
+
+/// Звено пути от корня индекса до папки (`get_path_crumbs`).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CrumbDto {
+    pub id: u32,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ScanProgress {
     pub files: u64,

@@ -4,6 +4,8 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import FileTable from "@/components/FileTable";
 import FolderTree from "@/components/FolderTree";
 import ScanStatus, { Breadcrumbs, type Crumb } from "@/components/ScanStatus";
+import SearchPanel from "@/components/SearchPanel";
+import Tabs, { type AppTab } from "@/components/Tabs";
 import Toolbar from "@/components/Toolbar";
 import TopFolders from "@/components/TopFolders";
 import Treemap from "@/components/Treemap";
@@ -131,6 +133,8 @@ function App() {
   const [scanUsed, setScanUsed] = useState(0);
   // Путь от корня сканирования до открытой папки; последний элемент — текущая.
   const [path, setPath] = useState<Crumb[]>([]);
+  // Открытая вкладка: карта, типы файлов (Задача 3) или поиск.
+  const [tab, setTab] = useState<AppTab>("map");
   // Номер запуска сканирования: смена ключа сбрасывает карту к новому скану.
   const [scanRun, setScanRun] = useState(0);
 
@@ -159,6 +163,15 @@ function App() {
   // поэтому переход в соседнюю ветку не оставляет «хвоста» прежнего пути.
   const handleTreeNavigate = useCallback((crumbs: Crumb[]) => {
     if (crumbs.length > 0) setPath(crumbs);
+  }, []);
+
+  // Клик по строке поиска: ядро отдало цепочку папки (`get_path_crumbs`) —
+  // открываем её на карте. Дерево и таблица синхронизируются тем же `path`, что
+  // и при навигации из карты (механизм Плана 2).
+  const handleSearchNavigate = useCallback((crumbs: Crumb[]) => {
+    if (crumbs.length === 0) return;
+    setPath(crumbs);
+    setTab("map");
   }, []);
 
   // Alt+↑ — на уровень вверх (дублирует кнопку «Вверх»).
@@ -297,6 +310,8 @@ function App() {
     setScanUsed(scanBaseBytes(choice, drives));
     // Новая карта начинается с корня охвата: «C:\», «Все диски» или путь папки.
     setPath([{ id: 0, name: rootCrumb(choice) }]);
+    // Новый скан — показываем карту: результаты прошлого поиска уже не к месту.
+    setTab("map");
     setScanRun((run) => run + 1);
     startScan(target).catch((err: unknown) => {
       setError(String(err));
@@ -367,41 +382,59 @@ function App() {
             </div>
           ) : null}
 
-          {path.length === 0 ? (
-            <section className="rounded-lg border border-border bg-card px-4 py-6 text-sm text-muted-foreground">
-              Карта занятости появится здесь сразу после начала сканирования.
-            </section>
-          ) : (
-            <>
-              <Breadcrumbs
-                path={path}
-                onNavigate={handleCrumb}
-                onUp={handleUp}
-              />
-              <Treemap
-                key={scanRun}
-                folderId={folderId}
-                path={path}
-                onNavigate={handleMapNavigate}
+          <Tabs
+            value={tab}
+            onChange={setTab}
+            map={
+              path.length === 0 ? (
+                <section className="rounded-lg border border-border bg-card px-4 py-6 text-sm text-muted-foreground">
+                  Карта занятости появится здесь сразу после начала сканирования.
+                </section>
+              ) : (
+                <div className="flex min-w-0 flex-col gap-4">
+                  <Breadcrumbs
+                    path={path}
+                    onNavigate={handleCrumb}
+                    onUp={handleUp}
+                  />
+                  <Treemap
+                    key={scanRun}
+                    folderId={folderId}
+                    path={path}
+                    onNavigate={handleMapNavigate}
+                    scanning={scanning}
+                    cancelled={cancelled}
+                  />
+                  <div className="grid min-w-0 grid-cols-1 gap-4 lg:grid-cols-[minmax(240px,320px)_minmax(0,1fr)]">
+                    <FolderTree
+                      path={path}
+                      root={rootSummary}
+                      scanning={scanning}
+                      scanRun={scanRun}
+                      onNavigate={handleTreeNavigate}
+                    />
+                    <FileTable
+                      folderId={folderId}
+                      scanning={scanning}
+                      scanRun={scanRun}
+                    />
+                  </div>
+                </div>
+              )
+            }
+            types={
+              <section className="rounded-lg border border-border bg-card px-4 py-6 text-sm text-muted-foreground">
+                Появится в следующей задаче.
+              </section>
+            }
+            search={
+              <SearchPanel
                 scanning={scanning}
-                cancelled={cancelled}
+                scanRun={scanRun}
+                onOpenFolder={handleSearchNavigate}
               />
-              <div className="grid min-w-0 grid-cols-1 gap-4 lg:grid-cols-[minmax(240px,320px)_minmax(0,1fr)]">
-                <FolderTree
-                  path={path}
-                  root={rootSummary}
-                  scanning={scanning}
-                  scanRun={scanRun}
-                  onNavigate={handleTreeNavigate}
-                />
-                <FileTable
-                  folderId={folderId}
-                  scanning={scanning}
-                  scanRun={scanRun}
-                />
-              </div>
-            </>
-          )}
+            }
+          />
 
           <ScanStatus
             progress={progress}

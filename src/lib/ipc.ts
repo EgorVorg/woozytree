@@ -4,6 +4,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 
 import type {
+  Crumb,
   DriveInfo,
   FilePage,
   FileSort,
@@ -11,6 +12,8 @@ import type {
   ScanProgress,
   ScanTarget,
   ScanTotals,
+  SearchPage,
+  SearchQuery,
   TreemapRect,
 } from "./types";
 
@@ -65,6 +68,23 @@ export function getFiles(
 /** Итоги последнего завершённого сканирования. */
 export function getScanTotals(): Promise<ScanTotals> {
   return invoke<ScanTotals>("get_scan_totals");
+}
+
+/**
+ * Поиск файлов по готовому индексу: фильтры и страница `offset..offset+limit`
+ * считает ядро. Пустые фильтры — «всё подряд».
+ */
+export function searchFiles(
+  q: SearchQuery,
+  offset: number,
+  limit: number,
+): Promise<SearchPage> {
+  return invoke<SearchPage>("search_files", { q, offset, limit });
+}
+
+/** Цепочка папок от корня до указанной — для перехода из поиска на карту. */
+export function getPathCrumbs(folderId: number): Promise<Crumb[]> {
+  return invoke<Crumb[]>("get_path_crumbs", { folderId });
 }
 
 /**

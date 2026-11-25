@@ -77,6 +77,50 @@ export interface FilePage {
 /** Колонки, по которым ядро умеет сортировать таблицу файлов. */
 export type FileSort = "name" | "size_on_disk" | "size_logical" | "modified";
 
+/** Фильтры поиска файлов (команда `search_files`). */
+export interface SearchQuery {
+  /** Подстрока имени без учёта регистра; «» — без фильтра по имени. */
+  name: string;
+  /** Нижняя граница размера на диске, байт; 0 — без границы. */
+  min_size: number;
+  /** Верхняя граница размера на диске; `null` — без границы. */
+  max_size: number | null;
+  /** Время изменения не раньше (включительно), Unix-мс; `null` — без границы. */
+  modified_after: number | null;
+  /** Время изменения не позже (включительно), Unix-мс; `null` — без границы. */
+  modified_before: number | null;
+}
+
+/** Строка результатов поиска (`SearchPage.rows`). */
+export interface SearchRow {
+  name: string;
+  /** Путь папки файла от корня индекса. */
+  folder_path: string;
+  /** Папка файла — для перехода на карту. */
+  folder_id: number;
+  /** Занято на диске, байт. */
+  size_on_disk: number;
+  /** Фактический размер, байт. */
+  size_logical: number;
+  /** Время изменения, Unix-мс (0 — время неизвестно). */
+  modified: number;
+  /** Повторная жёсткая ссылка: размер не входит в итоги папки. */
+  hard_linked: boolean;
+}
+
+/** Страница результатов поиска (`search_files`). */
+export interface SearchPage {
+  rows: SearchRow[];
+  /** Всего файлов под фильтры — по нему таблица понимает, есть ли ещё страницы. */
+  total: number;
+}
+
+/** Звено пути от корня сканирования до папки (`get_path_crumbs`). */
+export interface Crumb {
+  id: number;
+  name: string;
+}
+
 /**
  * Прямоугольник карты (результат `get_treemap` и событие `scan://treemap`).
  *

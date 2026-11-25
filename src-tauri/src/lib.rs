@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, State};
 
 use model::{
-    DriveInfo, FilePage, FileSort, FolderSummary, ScanError, ScanProgress, ScanTotals, TreemapRect,
+    CrumbDto, DriveInfo, FilePage, FileSort, FolderSummary, ScanError, ScanProgress, ScanTotals,
+    SearchPage, SearchQuery, TreemapRect,
 };
 use scan::index::ScanIndex;
 use scan::{ScanService, ScanSink, ScanTarget, drive_root, run_scan};
@@ -270,6 +271,56 @@ fn get_files(
     })
 }
 
+/// Сколько строк выдачи поиска отдаём одной командой максимум: страница
+/// таблицы — 2000, запас сверху; защита от случайно огромного ответа IPC.
+const SEARCH_ROWS_LIMIT: usize = 5_000;
+
+/// Поиск файлов по готовому индексу: фильтры и страница — в ядре.
+///
+/// Команда асинхронная: линейный проход по 1.26 млн файлов и сортировка
+/// найденного занимают десятки-сотни миллисекунд, а главный поток окна не
+/// должен ждать. Пустые фильтры валидны — это «всё подряд».
+#[tauri::command(async)]
+fn search_files(
+    state: State<'_, AppState>,
+    q: SearchQuery,
+    offset: usize,
+    limit: usize,
+) -> Result<SearchPage, String> {
+    let index = state
+        .service
+        .index()
+        .ok_or_else(|| "Индекс ещё не готов: сначала завершите сканирование.".to_string())?;
+    let limit = limit.min(SEARCH_ROWS_LIMIT);
+    let (rows, total) = index.search_files(&q, offset, limit);
+    Ok(SearchPage { rows, total })
+}
+
+/// Цепочка папок от корня до указанной: путь для перехода из поиска на карту.
+///
+/// Команда асинхронная, как и остальные запросы к индексу: подъём по родителям
+/// дешёвый, но окно не должно ждать даже его синхронно.
+#[tauri::command(async)]
+fn get_path_crumbs(state: State<'_, AppState>, folder_id: u32) -> Result<Vec<CrumbDto>, String> {
+    let index = state
+        .service
+        .index()
+        .ok_or_else(|| "Индекс ещё не готов: сначала завершите сканирование.".to_string())?;
+
+    // Идентификаторы папок выдаются по порядку (0 — корень), поэтому последний
+    // известный id равен числу папок в корне. Чужой id отсекаем без паники.
+    let max_id = index.folder_totals(index.root()).folder_count;
+    if folder_id > max_id {
+        return Err(format!("Папка с id {folder_id} не найдена."));
+    }
+
+    Ok(index
+        .ancestors(folder_id)
+        .into_iter()
+        .map(|(id, name)| CrumbDto { id, name })
+        .collect())
+}
+
 /// Сколько прямоугольников карты максимум отдаём одной командой: защита от
 /// случайно огромного ответа IPC и зависания отрисовки.
 const TREEMAP_RECTS_LIMIT: usize = 20_000;
@@ -318,7 +369,9 @@ pub fn run() {
             get_children,
             get_files,
             get_scan_totals,
-            get_treemap
+            get_treemap,
+            search_files,
+            get_path_crumbs
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

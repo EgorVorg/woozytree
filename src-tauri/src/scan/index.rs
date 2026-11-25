@@ -4,7 +4,10 @@
 use std::cmp::Ordering;
 use std::collections::HashMap;
 
-use crate::model::{FileKey, FileMeta, FileRow, FileSort, FolderId, FolderSummary, FolderTotals};
+use crate::model::{
+    FileKey, FileMeta, FileRow, FileSort, FolderId, FolderSummary, FolderTotals, SearchQuery,
+    SearchRow,
+};
 
 /// Результат добавления файла в индекс.
 pub enum AddOutcome {
@@ -121,6 +124,118 @@ fn lowered_chars(text: &str) -> impl Iterator<Item = char> + '_ {
         .map(|c| if c == 'ё' { 'е' } else { c })
 }
 
+/// Подстрока без учёта регистра по правилам сортировки: ASCII, кириллица и
+/// «ё» ≈ «е». Пустой образец совпадает с любым именем («всё подряд»).
+///
+/// Функция чистая и годится для разовых проверок; поиск по миллиону файлов
+/// строит [`NameNeedle`] один раз на запрос, а не на каждое имя.
+pub fn name_contains(haystack: &str, needle: &str) -> bool {
+    NameNeedle::new(needle).matches(haystack)
+}
+
+/// Предвычисленный образец поиска: нормализованные символы (нижний регистр,
+/// «ё» → «е») и таблица префикс-функции KMP.
+///
+/// Нормализация — та же, что у сортировки ([`lowered_chars`]), поэтому поиск и
+/// порядок имён не расходятся. Считать образец один раз важно: вызов на
+/// 1.26 млн файлов не должен аллоцировать вектор символов на каждое имя.
+struct NameNeedle {
+    /// Образец в нижнем регистре, «ё» → «е».
+    chars: Vec<char>,
+    /// Префикс-функция KMP: без неё частичное совпадение пришлось бы откатывать
+    /// перебором и можно было бы пропустить наложение («aab» в «aaab»).
+    prefix: Vec<usize>,
+    /// Образец целиком ASCII — значит, в ASCII-имени достаточно байтового поиска.
+    ascii: bool,
+}
+
+impl NameNeedle {
+    fn new(text: &str) -> NameNeedle {
+        let chars: Vec<char> = lowered_chars(text).collect();
+        let prefix = prefix_table(&chars);
+        let ascii = chars.iter().all(|c| c.is_ascii());
+        NameNeedle {
+            chars,
+            prefix,
+            ascii,
+        }
+    }
+
+    /// Совпадает ли имя с образцом (пустой образец — совпадает всегда).
+    fn matches(&self, haystack: &str) -> bool {
+        if self.chars.is_empty() {
+            return true;
+        }
+        // ASCII-имя (типичный случай на диске) — байтовый поиск без итераторов
+        // по символам и без аллокаций.
+        if haystack.is_ascii() {
+            // Не-ASCII образец не может совпасть с ASCII-именем: снятие регистра
+            // ASCII-символа остаётся ASCII.
+            if !self.ascii {
+                return false;
+            }
+            return ascii_contains(haystack.as_bytes(), &self.chars);
+        }
+        contains_folded(haystack, &self.chars, &self.prefix)
+    }
+}
+
+/// Таблица префикс-функции KMP для нормализованного образца.
+fn prefix_table(needle: &[char]) -> Vec<usize> {
+    let mut prefix = vec![0usize; needle.len()];
+    let mut matched = 0usize;
+    for index in 1..needle.len() {
+        while matched > 0 && needle[index] != needle[matched] {
+            matched = prefix[matched - 1];
+        }
+        if needle[index] == needle[matched] {
+            matched += 1;
+        }
+        prefix[index] = matched;
+    }
+    prefix
+}
+
+/// Поиск ASCII-образца в ASCII-имени: регистр снимается по байтам.
+fn ascii_contains(haystack: &[u8], needle: &[char]) -> bool {
+    let length = needle.len();
+    if length > haystack.len() {
+        return false;
+    }
+    let first = needle[0] as u8;
+    for start in 0..=haystack.len() - length {
+        if haystack[start].to_ascii_lowercase() != first {
+            continue;
+        }
+        let candidate = &haystack[start..start + length];
+        if candidate
+            .iter()
+            .zip(needle)
+            .all(|(byte, expected)| byte.to_ascii_lowercase() == *expected as u8)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Поиск по не-ASCII имени: KMP по нормализованным символам.
+fn contains_folded(haystack: &str, needle: &[char], prefix: &[usize]) -> bool {
+    let mut matched = 0usize;
+    for c in lowered_chars(haystack) {
+        while matched > 0 && needle[matched] != c {
+            matched = prefix[matched - 1];
+        }
+        if needle[matched] == c {
+            matched += 1;
+            if matched == needle.len() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Порядок с учётом направления сортировки.
 fn ordered(order: Ordering, desc: bool) -> Ordering {
     if desc { order.reverse() } else { order }
@@ -139,6 +254,19 @@ fn compare_files(left: &FileRecord, right: &FileRecord, sort: FileSort, desc: bo
         FileSort::Modified => left.modified.cmp(&right.modified),
     };
     ordered(primary, desc).then_with(|| compare_names(&left.name, &right.name))
+}
+
+/// Порядок результатов поиска: крупное сверху, при равных размерах — по имени
+/// (правила проводника), затем по позиции в индексе. Позиция последним ключом
+/// делает порядок полным, поэтому страницы не зависят от стабильности сортировки.
+fn compare_search_positions(files: &[FileRecord], left: u32, right: u32) -> Ordering {
+    let left_file = &files[left as usize];
+    let right_file = &files[right as usize];
+    right_file
+        .size_on_disk
+        .cmp(&left_file.size_on_disk)
+        .then_with(|| compare_names(&left_file.name, &right_file.name))
+        .then_with(|| left.cmp(&right))
 }
 
 pub struct ScanIndex {
@@ -170,6 +298,39 @@ impl ScanIndex {
 
     pub fn root(&self) -> FolderId {
         0
+    }
+
+    /// Цепочка от корня индекса до папки включительно: (id, имя).
+    ///
+    /// Нужна для перехода из поиска: клик по строке результата получает путь
+    /// папки и открывает её на карте (`get_path_crumbs`). Узлы индекса помнят
+    /// родителя, поэтому цепочка собирается подъёмом до корня.
+    pub fn ancestors(&self, folder: FolderId) -> Vec<(FolderId, String)> {
+        let mut chain = Vec::new();
+        let mut cursor = Some(folder);
+        while let Some(id) = cursor {
+            let node = &self.nodes[id as usize];
+            chain.push((id, node.name.clone()));
+            cursor = node.parent;
+        }
+        chain.reverse();
+        chain
+    }
+
+    /// Путь папки от корня индекса, разделитель `\`: «C:\Users\georg».
+    ///
+    /// Корень диска уже кончается слэшем («C:\»), поэтому второй разделитель
+    /// перед первым именем не ставится. У корня-папки в индексе хранится только
+    /// имя, так что путь относительный — от корня сканирования.
+    pub fn path_of(&self, folder: FolderId) -> String {
+        let mut path = String::new();
+        for (index, (_, name)) in self.ancestors(folder).into_iter().enumerate() {
+            if index > 0 && !path.ends_with('\\') {
+                path.push('\\');
+            }
+            path.push_str(&name);
+        }
+        path
     }
 
     /// Создать папку или вернуть уже существующую с тем же именем у того же родителя.
@@ -340,12 +501,99 @@ impl ScanIndex {
         children.sort_by(|a, b| b.size_on_disk.cmp(&a.size_on_disk));
         children
     }
+
+    /// Поиск файлов по фильтрам: линейный проход по плоскому списку, затем
+    /// сортировка найденных по размеру на диске и срез страницы.
+    ///
+    /// Линейный проход по 1.26 млн записей — доли секунды даже в debug-сборке,
+    /// а команда `search_files` асинхронная, поэтому окно не ждёт. Сортируется
+    /// только найденное (а не все файлы) — так первая страница сразу показывает
+    /// самое крупное. `total` — сколько всего подходит под фильтры.
+    ///
+    /// Фильтр размера — по занятому месту (`size_on_disk`, основная метрика
+    /// приложения); фактический размер в выдаче — отдельное поле. Границы дат
+    /// включительные; файлы с неизвестным временем (0) при заданной дате не
+    /// показываются, чтобы не выдаваться за «очень старые».
+    pub fn search_files(
+        &self,
+        q: &SearchQuery,
+        offset: usize,
+        limit: usize,
+    ) -> (Vec<SearchRow>, u32) {
+        let needle = NameNeedle::new(&q.name);
+        let by_date = q.modified_after.is_some() || q.modified_before.is_some();
+        let mut matches: Vec<u32> = Vec::new();
+        for (position, file) in self.files.iter().enumerate() {
+            if !needle.matches(&file.name) {
+                continue;
+            }
+            if file.size_on_disk < q.min_size {
+                continue;
+            }
+            if let Some(max_size) = q.max_size {
+                if file.size_on_disk > max_size {
+                    continue;
+                }
+            }
+            if by_date {
+                if file.modified <= 0 {
+                    continue;
+                }
+                if let Some(after) = q.modified_after {
+                    if file.modified < after {
+                        continue;
+                    }
+                }
+                if let Some(before) = q.modified_before {
+                    if file.modified > before {
+                        continue;
+                    }
+                }
+            }
+            matches.push(position as u32);
+        }
+
+        let total = matches.len() as u32;
+        if limit == 0 || offset >= matches.len() {
+            return (Vec::new(), total);
+        }
+
+        // Полная сортировка нужна только когда страница забирает весь хвост.
+        // Иначе достаточно отобрать `end` самых крупных (select_nth_unstable) и
+        // отсортировать только их: первая страница не ждёт сортировки 1.26 млн
+        // строк, а порядок страниц остаётся тем же (порядок полный).
+        let end = offset.saturating_add(limit).min(matches.len());
+        if end < matches.len() {
+            matches.select_nth_unstable_by(end, |left, right| {
+                compare_search_positions(&self.files, *left, *right)
+            });
+        }
+        matches[..end]
+            .sort_unstable_by(|left, right| compare_search_positions(&self.files, *left, *right));
+
+        let rows = matches[offset..end]
+            .iter()
+            .map(|&position| {
+                let file = &self.files[position as usize];
+                SearchRow {
+                    name: file.name.clone(),
+                    folder_path: self.path_of(file.parent),
+                    folder_id: file.parent,
+                    size_on_disk: file.size_on_disk,
+                    size_logical: file.size_logical,
+                    modified: file.modified,
+                    hard_linked: file.hard_linked,
+                }
+            })
+            .collect();
+        (rows, total)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{FileKey, FileMeta, FileSort};
+    use crate::model::{FileKey, FileMeta, FileSort, SearchQuery, SearchRow};
 
     /// Файл с полным набором полей: размер на диске, логический размер и время.
     fn meta_full(
@@ -369,6 +617,17 @@ mod tests {
 
     fn meta(name: &str, size: u64, file_index: u64) -> FileMeta {
         meta_full(name, size, size, 0, file_index)
+    }
+
+    /// Запрос «всё подряд»: пустые фильтры валидны и означают полную выдачу.
+    fn query(name: &str) -> SearchQuery {
+        SearchQuery {
+            name: name.to_string(),
+            min_size: 0,
+            max_size: None,
+            modified_after: None,
+            modified_before: None,
+        }
     }
 
     #[test]
@@ -812,5 +1071,206 @@ mod tests {
         );
         let small = rows.iter().find(|row| row.name == "small.bin").unwrap();
         assert_eq!(small.percent_of_parent, 0.1);
+    }
+
+    /// Поиск: 30 файлов с разными именами, размерами и датами — проверяем
+    /// каждый фильтр, их сочетание, пагинацию (offset/limit) и `total`.
+    #[test]
+    fn search_files_pages_and_filters() {
+        let mut index = ScanIndex::new("C:");
+        let root = index.root();
+        let documents = index.folder(root, "Документы");
+        let reports = index.folder(documents, "Отчёты");
+        let downloads = index.folder(root, "Загрузки");
+
+        // По 10 файлов в каждой папке; размер и дата растут вместе с номером
+        // файла, поэтому каждый фильтр отсекает заранее известный диапазон.
+        let folders = [reports, documents, downloads];
+        for group in 0..3u64 {
+            for number in 1..=10u64 {
+                let position = group * 10 + number - 1;
+                let name = match group {
+                    0 => format!("Отчёт {number:02}.txt"),
+                    1 => format!("photo {number:02}.jpg"),
+                    _ => format!("данные {number:02}.bin"),
+                };
+                let size = (position + 1) * 1_000;
+                let modified = 1_000 + position as i64 * 1_000;
+                index.add_file(
+                    folders[group as usize],
+                    meta_full(&name, size, size / 2, modified, position + 1),
+                );
+            }
+        }
+
+        // Имя: кириллица без учёта регистра — «Отчёт» находится по «ОТЧЁТ».
+        let (rows, total) = index.search_files(&query("ОТЧЁТ"), 0, 100);
+        assert_eq!(total, 10);
+        assert_eq!(rows.len(), 10);
+        assert!(rows.iter().all(|row| row.name.starts_with("Отчёт ")));
+
+        // Размер на диске 5 000..=15 000 байт — позиции 4..=14, всего 11.
+        let mut by_size = query("");
+        by_size.min_size = 5_000;
+        by_size.max_size = Some(15_000);
+        assert_eq!(index.search_files(&by_size, 0, 100).1, 11);
+
+        // Дата 8 000..=12 000 мс — позиции 7..=11, всего 5.
+        let mut by_date = query("");
+        by_date.modified_after = Some(8_000);
+        by_date.modified_before = Some(12_000);
+        assert_eq!(index.search_files(&by_date, 0, 100).1, 5);
+
+        // Сочетание фильтров: «данные» + размер от 25 000 + дата не позже 28 000
+        // — позиции 24..=27, всего 4.
+        let mut combined = query("данные");
+        combined.min_size = 25_000;
+        combined.modified_before = Some(28_000);
+        let (rows, total) = index.search_files(&combined, 0, 100);
+        assert_eq!(total, 4);
+        assert_eq!(rows.len(), 4);
+        assert!(rows.iter().all(|row| row.name.starts_with("данные ")));
+
+        // Пагинация: страницы — срез одного и того же порядка, `total` честный.
+        let (first_page, total) = index.search_files(&query(""), 0, 10);
+        assert_eq!(total, 30);
+        assert_eq!(first_page.len(), 10);
+        assert_eq!(
+            first_page[0].size_on_disk, 30_000,
+            "первая страница начинается с самого крупного файла"
+        );
+        assert!(
+            first_page
+                .windows(2)
+                .all(|pair| pair[0].size_on_disk >= pair[1].size_on_disk),
+            "страница отсортирована по размеру на диске"
+        );
+        let (tail, total) = index.search_files(&query(""), 25, 10);
+        assert_eq!(total, 30);
+        assert_eq!(tail.len(), 5);
+        let (beyond, total) = index.search_files(&query(""), 30, 10);
+        assert!(beyond.is_empty());
+        assert_eq!(total, 30);
+        let (none, total) = index.search_files(&query(""), 0, 0);
+        assert!(none.is_empty(), "limit = 0 — пустая страница");
+        assert_eq!(total, 30);
+
+        // Строка несёт папку файла: путь от корня индекса и id для перехода.
+        let (rows, _) = index.search_files(&query("Отчёт 01"), 0, 10);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].folder_id, reports);
+        assert_eq!(rows[0].folder_path, "C:\\Документы\\Отчёты");
+        assert_eq!(rows[0].size_on_disk, 1_000);
+        assert_eq!(rows[0].size_logical, 500);
+        assert_eq!(rows[0].modified, 1_000);
+
+        // Противоречивые границы размера дают пустую выдачу, а не панику.
+        let mut impossible = query("");
+        impossible.min_size = 100;
+        impossible.max_size = Some(50);
+        assert_eq!(index.search_files(&impossible, 0, 10).1, 0);
+
+        // Файл с неизвестным временем (0) не притворяется «очень старым»: при
+        // заданной дате он не показывается.
+        index.add_file(downloads, meta_full("без-даты.bin", 1_000, 1_000, 0, 999));
+        assert_eq!(index.search_files(&by_date, 0, 100).1, 5);
+        assert_eq!(index.search_files(&query(""), 0, 100).1, 31);
+    }
+
+    /// «ОТЧЁТ» находится по «отчёт», «Ёж» — по «еж»: те же правила, что и у
+    /// сортировки (регистр и «ё» не различаются), и для ASCII тоже.
+    #[test]
+    fn search_matches_name_case_insensitively() {
+        let mut index = ScanIndex::new("C:");
+        let root = index.root();
+        for (position, name) in ["ОТЧЁТ.txt", "Ёж.txt", "ёжик.txt", "report.TXT"]
+            .iter()
+            .enumerate()
+        {
+            index.add_file(root, meta(name, 10, position as u64));
+        }
+
+        let names = |needle: &str| -> Vec<String> {
+            index
+                .search_files(&query(needle), 0, 100)
+                .0
+                .iter()
+                .map(|row| row.name.clone())
+                .collect()
+        };
+
+        assert_eq!(names("отчёт"), ["ОТЧЁТ.txt"]);
+        assert_eq!(names("Отчёт"), ["ОТЧЁТ.txt"]);
+        // «ё» и «е» — одна буква, как в сортировке; равные размеры — по имени.
+        assert_eq!(names("еж"), ["Ёж.txt", "ёжик.txt"]);
+        assert_eq!(names("ЕЖ"), ["Ёж.txt", "ёжик.txt"]);
+        // ASCII: регистр не важен и здесь.
+        assert_eq!(names("REPORT"), ["report.TXT"]);
+        // Пустой запрос — «всё подряд».
+        assert_eq!(names("").len(), 4);
+
+        assert!(name_contains("ОТЧЁТ.txt", "отчёт"));
+        assert!(name_contains("Ёж", "еж"));
+        assert!(name_contains("report.TXT", "REPORT"));
+        assert!(!name_contains("Ёж", "ёж2"));
+        assert!(!name_contains("файл", "ЁЖ"));
+        assert!(name_contains("что угодно", ""));
+        assert!(name_contains("", ""));
+    }
+
+    /// Жёсткая ссылка в поиске видна отдельной строкой с пометкой.
+    #[test]
+    fn search_reports_hard_linked_rows() {
+        let mut index = ScanIndex::new("C:");
+        let root = index.root();
+        index.add_file(root, meta("shared.bin", 4_096, 7));
+        index.add_file(root, meta("alias.bin", 4_096, 7));
+
+        let (rows, total): (Vec<SearchRow>, u32) = index.search_files(&query(""), 0, 10);
+        assert_eq!(total, 2);
+        let alias = rows
+            .iter()
+            .find(|row| row.name == "alias.bin")
+            .expect("повторная ссылка должна быть в выдаче");
+        assert!(alias.hard_linked);
+        let shared = rows
+            .iter()
+            .find(|row| row.name == "shared.bin")
+            .expect("первая ссылка должна быть в выдаче");
+        assert!(!shared.hard_linked);
+    }
+
+    /// Путь папки — от корня индекса, разделитель `\'`, без двойных слэшей у
+    /// корня диска. Цепочка предков — для перехода из поиска (get_path_crumbs).
+    #[test]
+    fn path_of_builds_native_path() {
+        // В приложении корень диска создаётся как «C:\» (drive_root), а не «C:».
+        let mut index = ScanIndex::new("C:\\");
+        let root = index.root();
+        let users = index.folder(root, "Users");
+        let georg = index.folder(users, "georg");
+
+        assert_eq!(index.path_of(root), "C:\\");
+        assert_eq!(index.path_of(users), "C:\\Users");
+        assert_eq!(index.path_of(georg), "C:\\Users\\georg");
+        assert_eq!(
+            index.ancestors(georg),
+            vec![
+                (root, "C:\\".to_string()),
+                (users, "Users".to_string()),
+                (georg, "georg".to_string()),
+            ]
+        );
+
+        // Корень-папка хранит только имя: путь строится от корня индекса.
+        let mut folder_index = ScanIndex::new("WoozyTree-Тест");
+        let folder_root = folder_index.root();
+        let nested = folder_index.folder(folder_root, "вложенная");
+        let deep = folder_index.folder(nested, "глубже");
+        assert_eq!(
+            folder_index.path_of(deep),
+            "WoozyTree-Тест\\вложенная\\глубже"
+        );
+        assert_eq!(folder_index.path_of(folder_root), "WoozyTree-Тест");
     }
 }

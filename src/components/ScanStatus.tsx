@@ -1,13 +1,10 @@
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { formatCount, formatSeconds, formatSize } from "@/lib/format";
-import type { ScanProgress } from "@/lib/types";
+import type { Crumb, ScanProgress } from "@/lib/types";
 
-/** Звено пути от корня сканирования до открытой папки. */
-export interface Crumb {
-  id: number;
-  name: string;
-}
+/** Звено пути от корня сканирования до открытой папки (общий тип `Crumb`). */
+export type { Crumb };
 
 interface BreadcrumbsProps {
   /** Путь от корня: первый элемент — корень сканирования. */
