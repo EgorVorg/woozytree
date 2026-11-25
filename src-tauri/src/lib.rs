@@ -432,27 +432,54 @@ fn get_types_treemap(
     Ok(index.types_treemap(folder_id, max_rects))
 }
 
-/// Проверить путь действия из окна: непустой, абсолютный, не корень диска.
+/// Проверить путь действия из окна.
 ///
-/// Корень запрещён отдельно: безвозвратное удаление папки — это
-/// `remove_dir_all`, поэтому «C:\» в запросе означал бы потерю всей системы.
-/// Окно присылает только пути файлов из индекса, так что для него это
-/// ограничение недостижимо, но команда не должна верить окну на слово.
+/// Отвергаются: пустой путь; путь с пробелами по краям (обрезать нельзя —
+/// «a.txt » и «a.txt» могут быть разными файлами); относительный путь;
+/// компоненты `.` и `..` (уводят из папки, а `remove_dir_all` по такому пути
+/// стёр бы чужой каталог); корень диска; путь, у которого родитель не
+/// существует или не папка. Окно присылает только пути файлов из индекса, но
+/// команда не должна верить окну на слово.
 fn action_path(path: &str) -> Result<PathBuf, String> {
-    let trimmed = path.trim();
-    if trimmed.is_empty() {
+    if path.is_empty() {
         return Err("Не указан путь файла.".to_string());
     }
-    let path = PathBuf::from(trimmed);
-    if !path.is_absolute() {
-        return Err(format!("Путь должен быть абсолютным: {trimmed}"));
-    }
-    if path.parent().is_none() {
+    if path.trim() != path {
         return Err(format!(
-            "Нельзя выполнить действие с корнем диска: {trimmed}"
+            "Путь не должен начинаться или заканчиваться пробелами: «{path}»"
         ));
     }
-    Ok(path)
+    let path_buf = PathBuf::from(path);
+    if !path_buf.is_absolute() {
+        return Err(format!("Путь должен быть абсолютным: {path}"));
+    }
+    // `Path::components` нормализует «.» и «..» (они исчезают из цепочки),
+    // поэтому проверяем сырые сегменты исходной строки.
+    for segment in path.split(|symbol| symbol == '\\' || symbol == '/') {
+        if segment == "." || segment == ".." {
+            return Err(format!("Путь не должен содержать «.» или «..»: {path}"));
+        }
+    }
+    let Some(parent) = path_buf.parent() else {
+        return Err(format!("Нельзя выполнить действие с корнем диска: {path}"));
+    };
+    match std::fs::symlink_metadata(parent) {
+        Ok(metadata) if metadata.is_dir() => {}
+        _ => return Err(format!("Папка не найдена: {}", parent.display())),
+    }
+    Ok(path_buf)
+}
+
+/// Годится ли имя файла из окна как звено пути действия.
+///
+/// Пробелы по краям не обрезаются (это испортило бы другое имя), а `.`, `..`,
+/// слэши и двоеточие недопустимы: они уводят путь из папки.
+fn index_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name == name.trim()
+        && name != "."
+        && name != ".."
+        && !name.chars().any(|c| matches!(c, '\\' | '/' | ':'))
 }
 
 /// Путь действия, который сейчас существует: открывать и показывать нечего,
@@ -461,6 +488,23 @@ fn existing_action_path(path: &str) -> Result<PathBuf, String> {
     let path = action_path(path)?;
     if std::fs::symlink_metadata(&path).is_err() {
         return Err(format!("Файл не найден: {}", path.display()));
+    }
+    Ok(path)
+}
+
+/// Проверить путь для безвозвратного удаления: существует и это файл.
+///
+/// Папки запрещены: безвозвратное удаление папки — это `remove_dir_all`, и одна
+/// ошибка в запросе стоила бы целого дерева. Ссылка на папку тоже отвергается.
+fn permanent_delete_target(path: &str) -> Result<PathBuf, String> {
+    let path = action_path(path)?;
+    let metadata = std::fs::symlink_metadata(&path)
+        .map_err(|_| format!("Файл не найден: {}", path.display()))?;
+    if metadata.is_dir() || (metadata.file_type().is_symlink() && path.is_dir()) {
+        return Err(format!(
+            "Безвозвратно удалять папки нельзя: {}",
+            path.display()
+        ));
     }
     Ok(path)
 }
@@ -477,9 +521,10 @@ fn action_error_text(err: &ScanError) -> String {
 
 /// Реальный абсолютный путь файла в папке индекса — для действий в окне.
 ///
-/// Индекс хранит только имена, а удалению и открытию нужен путь. Имя
-/// проверяется на разделители: иначе через него можно было бы выпросить путь
-/// за пределами папки (`..\`), а команда должна верить только индексу.
+/// Индекс хранит только имена, а удалению и открытию нужен путь. Имя проверяется
+/// на `.`/`..`, разделители и двоеточие (иначе через него можно было бы
+/// выпросить путь за пределами папки), а пара (folder_id, имя) должна реально
+/// существовать в индексе: путь выдаётся только для проиндексированного файла.
 #[tauri::command(async)]
 fn get_file_path(
     state: State<'_, AppState>,
@@ -493,26 +538,35 @@ fn get_file_path(
 
     check_folder_id(&index, folder_id)?;
 
-    let name = file_name.trim();
-    if name.is_empty() || name == "." || name == ".." {
+    if !index_name_ok(&file_name) {
         return Err(format!("Недопустимое имя файла: «{file_name}»"));
     }
-    if name.contains('\\') || name.contains('/') || name.contains(':') {
-        return Err(format!("Имя файла не должно содержать путь: «{file_name}»"));
+    if !index.has_file(folder_id, &file_name) {
+        return Err(format!("Файл не найден в папке индекса: «{file_name}»"));
     }
 
-    Ok(index.real_path_of(folder_id, Some(name)))
+    let path = index.real_path_of(folder_id, Some(&file_name));
+    if path.is_empty() {
+        return Err(format!("Не удалось построить путь для файла «{file_name}»"));
+    }
+    Ok(path)
 }
 
 /// Удалить пути: в корзину (`permanent == false`) или безвозвратно.
 ///
 /// Команда асинхронная: `remove_dir_all` большого дерева или обращение к
 /// корзине может занять заметное время, а главный поток окна ждать не должен.
+/// Безвозвратное удаление принимает только существующие файлы; корзина —
+/// любые проверенные пути (её можно отменить восстановлением).
 #[tauri::command(async)]
 fn delete_paths(paths: Vec<String>, permanent: bool) -> Result<DeleteReport, String> {
     let mut checked = Vec::with_capacity(paths.len());
     for path in &paths {
-        checked.push(action_path(path)?);
+        checked.push(if permanent {
+            permanent_delete_target(path)?
+        } else {
+            action_path(path)?
+        });
     }
     Ok(ops::delete_paths(&checked, permanent))
 }
@@ -664,6 +718,71 @@ mod tests {
         let folder: ScanTarget =
             serde_json::from_str(r#"{"folder":"C:\\Temp"}"#).expect("папка из окна");
         assert!(matches!(folder, ScanTarget::Folder(path) if path.ends_with("Temp")));
+    }
+
+    #[test]
+    fn action_path_rejects_dot_components() {
+        // «..» и «.» уводят путь из папки: с permanent=true это remove_dir_all
+        // по чужому каталогу, поэтому такие пути обязаны отвергаться.
+        assert!(action_path("C:\\Temp\\..").is_err());
+        assert!(action_path("C:\\Temp\\.").is_err());
+        assert!(action_path("C:\\Temp\\..\\Windows").is_err());
+
+        let dir = crate::files::test_dir();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, b"data").expect("файл создаётся");
+        assert!(
+            action_path(&file.to_string_lossy()).is_ok(),
+            "обычный абсолютный путь файла допустим"
+        );
+    }
+
+    #[test]
+    fn action_path_rejects_surrounding_whitespace_without_trimming() {
+        // trim() молча переписал бы имя («a.txt » → «a.txt» — другой файл),
+        // поэтому путь с пробелами по краям отвергается, а не обрезается.
+        assert!(action_path(" C:\\Temp\\a.txt").is_err());
+        assert!(action_path("C:\\Temp\\a.txt ").is_err());
+        assert!(action_path("C:\\Temp\\a.txt\n").is_err());
+    }
+
+    #[test]
+    fn permanent_delete_rejects_folders_and_allows_files() {
+        let dir = crate::files::test_dir();
+        let folder = dir.path().join("папка-навсегда");
+        std::fs::create_dir(&folder).expect("папка создаётся");
+        let file = dir.path().join("файл.txt");
+        std::fs::write(&file, b"data").expect("файл создаётся");
+
+        let folder_text = folder.to_string_lossy().into_owned();
+        let error =
+            permanent_delete_target(&folder_text).expect_err("безвозвратно удалять папки нельзя");
+        assert!(
+            error.contains("папки нельзя"),
+            "ошибка должна объяснять запрет: {error}"
+        );
+        assert!(
+            permanent_delete_target(&file.to_string_lossy()).is_ok(),
+            "файл удалять можно"
+        );
+        assert!(
+            permanent_delete_target(&dir.path().join("нет.txt").to_string_lossy()).is_err(),
+            "несуществующий файл не проходит проверку существования"
+        );
+    }
+
+    #[test]
+    fn index_name_validation_rejects_dots_slashes_and_spaces() {
+        assert!(index_name_ok("a.txt"));
+        assert!(index_name_ok("a b.txt"), "пробелы внутри имени легальны");
+        assert!(!index_name_ok(""), "пустое имя недопустимо");
+        assert!(!index_name_ok("."));
+        assert!(!index_name_ok(".."));
+        assert!(!index_name_ok("a\\b"));
+        assert!(!index_name_ok("a/b"));
+        assert!(!index_name_ok("x:y"));
+        assert!(!index_name_ok(" a.txt"), "пробел в начале не обрезается");
+        assert!(!index_name_ok("a.txt "), "пробел в конце не обрезается");
     }
 
     #[test]

@@ -618,6 +618,10 @@ export default function Treemap({
       // открытой папки — действия должны получить именно его папку.
       folderId: folder_id_for_tile(rectsRef.current, rect, folderId),
       fileName: rect.name,
+      // Плитка не несёт признака «жёсткая ссылка» (TreemapRect его не хранит),
+      // поэтому запрет на безвозвратное удаление здесь подстраховывает не
+      // карта, а строка таблицы файлов.
+      hardLinked: false,
       x: event.clientX,
       y: event.clientY,
     });

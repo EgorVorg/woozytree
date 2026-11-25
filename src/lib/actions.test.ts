@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import {
   error_text,
   files_word,
+  HARD_LINK_PERMANENT_REASON,
+  permanent_delete_allowed,
   permanent_delete_question,
 } from "./actions";
 
@@ -33,6 +35,18 @@ describe("permanent_delete_question", () => {
     expect(permanent_delete_question(10)).toBe(
       "Безвозвратно удалить 10 файлов?",
     );
+  });
+});
+
+describe("permanent_delete_allowed", () => {
+  it("запрещает безвозвратное удаление для жёстких ссылок и коротких имён", () => {
+    expect(permanent_delete_allowed(false)).toBe(true);
+    expect(permanent_delete_allowed(true)).toBe(false);
+  });
+
+  it("объясняет причину запрета по-русски", () => {
+    expect(HARD_LINK_PERMANENT_REASON).toContain("вторичных ссылок");
+    expect(HARD_LINK_PERMANENT_REASON).toContain("основную строку файла");
   });
 });
 

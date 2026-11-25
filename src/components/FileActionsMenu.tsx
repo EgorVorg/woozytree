@@ -32,7 +32,13 @@ import {
   DropdownMenuLabel,
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
-import { copy_text, error_text, permanent_delete_question } from "@/lib/actions";
+import {
+  copy_text,
+  error_text,
+  HARD_LINK_PERMANENT_REASON,
+  permanent_delete_allowed,
+  permanent_delete_question,
+} from "@/lib/actions";
 import { deletePaths, getFilePath, openPath, revealInExplorer } from "@/lib/ipc";
 import type { DeleteReport } from "@/lib/types";
 
@@ -42,6 +48,8 @@ export interface FileActionTarget {
   folderId: number;
   /** Имя файла без пути. */
   fileName: string;
+  /** Строка помечена «жёсткая ссылка» (в т.ч. DOS-алиас): безвозвратно нельзя. */
+  hardLinked?: boolean;
   /** Координаты правого клика: clientX/clientY. */
   x: number;
   y: number;
@@ -87,6 +95,9 @@ export default function FileActionsMenu({
     () => (target ? anchor_at(target.x, target.y) : null),
     [target],
   );
+  // Вторичные ссылки и короткие имена (8.3) нельзя удалять безвозвратно:
+  // единственный файл исчез бы навсегда. В корзину — по-прежнему можно.
+  const permanentAllowed = permanent_delete_allowed(target?.hardLinked ?? false);
 
   /** Показать итог удаления: ошибки — в красную плашку, успех — родителю. */
   const reportDelete = useCallback(
@@ -198,14 +209,25 @@ export default function FileActionsMenu({
                   <TrashIcon />
                   Удалить в корзину
                 </DropdownMenuItem>
-                <DropdownMenuItem
-                  variant="destructive"
-                  disabled={busy}
-                  onClick={askPermanent}
-                >
-                  <TrashIcon />
-                  Удалить навсегда…
-                </DropdownMenuItem>
+                {permanentAllowed ? (
+                  <DropdownMenuItem
+                    variant="destructive"
+                    disabled={busy}
+                    onClick={askPermanent}
+                  >
+                    <TrashIcon />
+                    Удалить навсегда…
+                  </DropdownMenuItem>
+                ) : (
+                  // Для вторичной ссылки/короткого имени пункта нет вовсе:
+                  // безвозвратное удаление стёрло бы единственный файл.
+                  <DropdownMenuLabel
+                    className="max-w-56 text-[10px] leading-snug text-muted-foreground"
+                    title={HARD_LINK_PERMANENT_REASON}
+                  >
+                    {HARD_LINK_PERMANENT_REASON}
+                  </DropdownMenuLabel>
+                )}
               </DropdownMenuGroup>
             ) : null}
           </DropdownMenuContent>

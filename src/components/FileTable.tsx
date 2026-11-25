@@ -348,6 +348,9 @@ export default function FileTable({
                       setMenuTarget({
                         folderId,
                         fileName: row.original.name,
+                        // Для вторичных ссылок и коротких имён безвозвратное
+                        // удаление отключено (см. FileActionsMenu).
+                        hardLinked: row.original.hard_linked,
                         x: event.clientX,
                         y: event.clientY,
                       });

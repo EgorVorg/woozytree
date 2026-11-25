@@ -80,6 +80,21 @@ fn is_drive_segment(name: &str) -> bool {
     bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
+/// Годится ли имя из индекса как звено реального пути.
+///
+/// Индекс хранит имена, а не пути: имя `..` или с обратным слэшом/двоеточием
+/// увело бы склейку из папки (и `remove_dir_all` по такому «пути» стёр бы
+/// чужой каталог). Поэтому такие имена реального пути не дают вовсе, а команды
+/// действий отвергают пустой путь. Пробелы по краям не обрезаются: «a.txt » —
+/// другое имя, чем «a.txt», и молча менять его нельзя.
+fn valid_path_segment(name: &str) -> bool {
+    !name.is_empty()
+        && name == name.trim()
+        && name != "."
+        && name != ".."
+        && !name.chars().any(|c| matches!(c, '\\' | '/' | ':'))
+}
+
 /// Сравнение имён для сортировки — по-русски, как в проводнике: регистр не
 /// различается (включая кириллицу), «ё» стоит наравне с «е». Порядок символов —
 /// по коду Unicode: латиница раньше кириллицы, а после снятия регистра строчные
@@ -433,12 +448,14 @@ impl ScanIndex {
         for (_, name) in self.ancestors(folder).into_iter().skip(1) {
             if base.is_empty() {
                 // «Все диски»: первый сегмент — том, база «C:\».
-                base = if is_drive_segment(&name) {
-                    format!("{name}\\")
-                } else {
-                    name
-                };
+                if !is_drive_segment(&name) {
+                    return String::new();
+                }
+                base = format!("{name}\\");
             } else {
+                if !valid_path_segment(&name) {
+                    return String::new();
+                }
                 if !base.ends_with('\\') {
                     base.push('\\');
                 }
@@ -448,6 +465,9 @@ impl ScanIndex {
         let Some(name) = file_name else {
             return base;
         };
+        if !valid_path_segment(name) {
+            return String::new();
+        }
         if base.is_empty() {
             return name.to_string();
         }
@@ -537,6 +557,20 @@ impl ScanIndex {
     /// Число файлов-ссылок непосредственно в папке — для пагинации таблицы.
     pub fn file_count(&self, folder: FolderId) -> u32 {
         self.nodes[folder as usize].files.len() as u32
+    }
+
+    /// Есть ли в индексе файл с таким именем в этой папке.
+    ///
+    /// Нужно команде пути действия: окно присылает (folder_id, имя), и путь
+    /// выдаётся только для реально проиндексированной пары — иначе через имя
+    /// можно было бы выпросить путь к чему угодно и затем удалить его.
+    pub fn has_file(&self, folder: FolderId, name: &str) -> bool {
+        let Some(node) = self.nodes.get(folder as usize) else {
+            return false;
+        };
+        node.files
+            .iter()
+            .any(|&index| self.files[index as usize].name == name)
     }
 
     /// Страница файлов папки: сортировка при выдаче, затем срез `offset..offset+limit`.
@@ -1578,6 +1612,79 @@ mod tests {
             "C:\\Users\\файл.bin"
         );
         assert_eq!(index.real_path_of(d, None), "D:\\");
+    }
+
+    /// Имена из индекса не должны уводить путь из папки: `.`, `..`, слэши и
+    /// двоеточия в имени сегмента недопустимы — действия с таким «путём» стёрли
+    /// бы чужой файл. У «Все диски» двоеточие разрешено только в сегменте тома.
+    #[test]
+    fn real_path_of_rejects_invalid_index_names() {
+        let mut index = ScanIndex::new("C:\\");
+        index.set_root_real_path("C:\\".to_string());
+        let root = index.root();
+        let parent = index.folder(root, "Temp");
+        let dots = index.folder(parent, "..");
+        let slash = index.folder(parent, "a\\b");
+        let colon = index.folder(parent, "x:y");
+        let dot = index.folder(parent, ".");
+
+        assert_eq!(
+            index.real_path_of(dots, None),
+            "",
+            "имя «..» не должно давать путь"
+        );
+        assert_eq!(index.real_path_of(dot, None), "", "имя «.» недопустимо");
+        assert_eq!(
+            index.real_path_of(slash, None),
+            "",
+            "слэш в имени недопустим"
+        );
+        assert_eq!(
+            index.real_path_of(colon, None),
+            "",
+            "двоеточие в имени недопустимо"
+        );
+        assert_eq!(
+            index.real_path_of(dots, Some("файл.txt")),
+            "",
+            "путь файла в папке «..» тоже недопустим"
+        );
+        assert_eq!(
+            index.real_path_of(parent, Some("..")),
+            "",
+            "имя файла «..» недопустимо"
+        );
+        // Санity: обычная папка под корнем путь по-прежнему получает.
+        assert_eq!(index.real_path_of(parent, Some("a.txt")), "C:\\Temp\\a.txt");
+
+        // «Все диски»: «C:» — законная база, но «..» внутри — нет.
+        let mut all = ScanIndex::new("Все диски");
+        all.set_root_real_path(String::new());
+        let root_all = all.root();
+        let c = all.folder(root_all, "C:");
+        let windows = all.folder(c, "Windows");
+        let bad_all = all.folder(windows, "..");
+        assert_eq!(all.real_path_of(c, None), "C:\\");
+        assert_eq!(all.real_path_of(windows, None), "C:\\Windows");
+        assert_eq!(all.real_path_of(bad_all, None), "");
+    }
+
+    /// `has_file` подтверждает, что (папка, имя) есть в индексе: только для
+    /// таких пар команда `get_file_path` выдаёт путь действия.
+    #[test]
+    fn has_file_checks_name_in_folder() {
+        let mut index = ScanIndex::new("C:\\");
+        let root = index.root();
+        let temp = index.folder(root, "Temp");
+        index.add_file(temp, meta("a.txt", 10, 1));
+
+        assert!(index.has_file(temp, "a.txt"));
+        assert!(!index.has_file(temp, "b.txt"));
+        assert!(!index.has_file(root, "a.txt"));
+        assert!(
+            !index.has_file(9999, "a.txt"),
+            "чужой id не должен паниковать"
+        );
     }
 
     /// Агрегация по расширениям: `.txt`/`.TXT` — одна группа, `.rs` — вторая,
