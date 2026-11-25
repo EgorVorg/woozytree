@@ -385,6 +385,8 @@ pub enum SizeMode { OnDisk, Logical } // serde: "on_disk" | "logical"
 // lib.rs — команды получают параметры отображения (ОСОЗНАННОЕ расширение сигнатур Плана 2; старые вызовы обновляются):
 #[tauri::command(async)] fn get_treemap(folder_id: u32, max_rects: usize, size_mode: String, include_files: bool, min_tile_bytes: u64) -> Result<Vec<TreemapRect>, String>;
 #[tauri::command(async)] fn get_types_treemap(folder_id: u32, max_rects: usize, size_mode: String) -> Result<Vec<TreemapRect>, String>;
+// get_files (Плана 2) тоже получает `size_mode: String` — осознанное расширение сигнатуры: процент строки считается от выбранного размера:
+// #[tauri::command(async)] fn get_files(folder_id: u32, sort: String, desc: bool, offset: usize, limit: usize, size_mode: String) -> Result<FilePage, String>;
 // treemap_for_folder получает те же три параметра (SizeMode, include_files, min_tile_bytes):
 // include_files=false — только папки; min_tile_bytes — плитки мельче складываются в «прочее» (ТОЛЬКО отображение, итоги не меняются).
 
