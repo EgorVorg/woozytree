@@ -17,7 +17,7 @@ use model::{
     CrumbDto, DeleteReport, DriveInfo, FilePage, FileSort, FileTypeRow, FolderSummary, ScanError,
     ScanProgress, ScanTotals, SearchPage, SearchQuery, SizeMode, TreemapRect, TypeSort,
 };
-use scan::index::{ScanIndex, valid_path_segment};
+use scan::index::{ScanIndex, is_drive_segment, valid_path_segment};
 use scan::{DisplayOptions, ScanService, ScanSink, ScanTarget, drive_root, run_scan_with_display};
 
 /// Состояние приложения: сервис сканирования живёт всё время работы окна.
@@ -501,10 +501,26 @@ fn action_path(path: &str) -> Result<PathBuf, String> {
         return Err(format!("Путь должен быть абсолютным: {path}"));
     }
     // `Path::components` нормализует «.» и «..» (они исчезают из цепочки),
-    // поэтому проверяем сырые сегменты исходной строки.
-    for segment in path.split(|symbol| symbol == '\\' || symbol == '/') {
+    // поэтому проверяем сырые сегменты исходной строки. Имя сегмента проходит
+    // и проверку Win32-нормализации: `foo.` открылось бы как `foo`, а кавычка
+    // сломала бы аргументы explorer. Буква диска — исключение: «C:» — не имя.
+    for (index, segment) in path
+        .split(|symbol| symbol == '\\' || symbol == '/')
+        .enumerate()
+    {
+        if segment.is_empty() {
+            continue;
+        }
+        if index == 0 && is_drive_segment(segment) {
+            continue;
+        }
         if segment == "." || segment == ".." {
             return Err(format!("Путь не должен содержать «.» или «..»: {path}"));
+        }
+        if !valid_path_segment(segment) {
+            return Err(format!(
+                "Недопустимое имя в пути (Win32 исказит его): «{segment}»"
+            ));
         }
     }
     let Some(parent) = path_buf.parent() else {
@@ -779,6 +795,38 @@ mod tests {
         assert!(action_path(" C:\\Temp\\a.txt").is_err());
         assert!(action_path("C:\\Temp\\a.txt ").is_err());
         assert!(action_path("C:\\Temp\\a.txt\n").is_err());
+    }
+
+    #[test]
+    fn action_path_rejects_win32_normalized_components() {
+        // Win32 отбрасывает хвостовую точку и запрещает `" * ? < > |`: такой
+        // путь разрешился бы в соседний файл (или дал инъекцию аргументов
+        // explorer в `/select,"{path}"`), поэтому команды действий его отвергают.
+        for path in [
+            "C:\\Temp\\foo.",
+            "C:\\Temp\\a\"b",
+            "C:\\Temp\\a*b",
+            "C:\\Temp\\a?b",
+            "C:\\Temp\\a<b",
+            "C:\\Temp\\a>b",
+            "C:\\Temp\\a|b",
+            "C:\\Temp \\a.txt",
+            "C:\\Temp\\CON.txt",
+        ] {
+            assert!(
+                action_path(path).is_err(),
+                "путь {path:?} не должен проходить проверку"
+            );
+        }
+
+        // Санity: обычный и «похожий» путь не ломаются проверкой имён.
+        let dir = crate::files::test_dir();
+        let file = dir.path().join("a.b");
+        std::fs::write(&file, b"data").expect("файл создаётся");
+        assert!(
+            action_path(&file.to_string_lossy()).is_ok(),
+            "обычный абсолютный путь файла по-прежнему допустим"
+        );
     }
 
     #[test]

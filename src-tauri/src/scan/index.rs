@@ -60,8 +60,16 @@ fn zero_totals() -> FolderTotals {
 /// и не пользователь, которому путь показывают. Хвостовой слэш у папки лишний
 /// (склейка с именем добавляет разделитель сама), а у корня диска («C:\») он —
 /// часть пути, поэтому короткие пути не трогаем.
+///
+/// Пробелы по краям не обрезаются: `trim()` молча переписал бы путь
+/// («C:\Temp » → «C:\Temp») и увёл бы базу на соседнюю папку, а действия с
+/// файлами выполнялись бы не над той папкой, которую сканировали. Такой корень
+/// отвергается пустой базой: `real_path_of` тогда не даёт путей вовсе.
 fn normalize_root_path(raw: &str) -> String {
-    let mut text = raw.trim().to_string();
+    if raw.trim() != raw {
+        return String::new();
+    }
+    let mut text = raw.to_string();
     if let Some(rest) = text.strip_prefix("\\\\?\\") {
         // «\\?\UNC\server\share» — это сетевой путь «\\server\share».
         text = match rest.strip_prefix("UNC\\") {
@@ -78,9 +86,27 @@ fn normalize_root_path(raw: &str) -> String {
 }
 
 /// Имя подпапки тома в корне «Все диски»: «C:» (буква и двоеточие).
-fn is_drive_segment(name: &str) -> bool {
+pub(crate) fn is_drive_segment(name: &str) -> bool {
     let bytes = name.as_bytes();
     bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
+/// Зарезервированное имя устройства Win32: `CON`, `PRN`, `AUX`, `NUL`,
+/// `COM1`…`COM9`, `LPT1`…`LPT9` — целиком или с расширением (`CON.txt`).
+///
+/// Win32 открывает такое имя как устройство, а не файл в папке: путь действия
+/// с ним ушёл бы не туда, поэтому как звено реального пути оно недопустимо.
+fn is_reserved_win32_name(name: &str) -> bool {
+    let base = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+    match base.as_str() {
+        "CON" | "PRN" | "AUX" | "NUL" => true,
+        _ => {
+            let bytes = base.as_bytes();
+            bytes.len() == 4
+                && (base.starts_with("COM") || base.starts_with("LPT"))
+                && matches!(bytes[3], b'1'..=b'9')
+        }
+    }
 }
 
 /// Годится ли имя из индекса как звено реального пути.
@@ -90,14 +116,23 @@ fn is_drive_segment(name: &str) -> bool {
 /// пути: имя `..` или с обратным слэшом/двоеточием увело бы склейку из папки (и
 /// `remove_dir_all` по такому «пути» стёр бы чужой каталог). Поэтому такие имена
 /// реального пути не дают вовсе, а команды действий отвергают пустой путь.
-/// Пробелы по краям не обрезаются: «a.txt » — другое имя, чем «a.txt», и молча
-/// менять его нельзя.
+///
+/// Win32 нормализует имена перед открытием: отбрасывает хвостовую точку
+/// (`foo.` → `foo`) и запрещает `" * ? < > |`. Такое имя разрешилось бы в
+/// соседний файл, поэтому оно тоже не даёт реального пути. Кавычка вдобавок
+/// закрывала бы строку в аргументах explorer (`/select,"{path}"`) и позволяла
+/// бы подставить свои ключи. Пробелы по краям не обрезаются: «a.txt » — другое
+/// имя, чем «a.txt», и молча менять его нельзя.
 pub(crate) fn valid_path_segment(name: &str) -> bool {
     !name.is_empty()
         && name == name.trim()
         && name != "."
         && name != ".."
-        && !name.chars().any(|c| matches!(c, '\\' | '/' | ':'))
+        && !name.ends_with('.')
+        && !name.chars().any(|c| {
+            matches!(c, '\\' | '/' | ':' | '"' | '*' | '?' | '<' | '>' | '|') || c.is_control()
+        })
+        && !is_reserved_win32_name(name)
 }
 
 /// Сравнение имён для сортировки — по-русски, как в проводнике: регистр не
@@ -474,7 +509,10 @@ impl ScanIndex {
             return String::new();
         }
         if base.is_empty() {
-            return name.to_string();
+            // Базы нет («Все диски» или отвергнутый корень): у файла в корне
+            // реального пути нет. Относительный путь возвращать нельзя — он
+            // не должен выглядеть путём действия.
+            return String::new();
         }
         if !base.ends_with('\\') {
             base.push('\\');
@@ -2042,5 +2080,82 @@ mod tests {
         assert!((logical[0].w * logical[0].h - 0.9).abs() < 1e-9);
         assert_eq!(logical[1].name, "bin");
         assert_eq!(logical[1].size, 100);
+    }
+
+    /// Win32 отбрасывает хвостовую точку и запрещает `" * ? < > |`: такое имя
+    /// разрешилось бы в соседний файл, а действие ушло бы не туда. Резервные
+    /// имена устройств (`CON`, `PRN`, `COM1`…) тоже не годятся как звено пути.
+    #[test]
+    fn valid_path_segment_rejects_win32_normalized_names() {
+        for name in [
+            "foo.", "a\"b", "a*b", "a?b", "a<b", "a>b", "a|b", "a\tb", "a\nb",
+        ] {
+            assert!(
+                !valid_path_segment(name),
+                "имя {name:?} недопустимо: Win32 нормализует его в другое"
+            );
+        }
+        // Резервные имена устройств — целиком и с расширением, в любом регистре.
+        for name in ["CON", "con", "PRN", "aux", "NUL", "COM1", "lpt9", "CON.txt"] {
+            assert!(
+                !valid_path_segment(name),
+                "зарезервированное имя {name:?} недопустимо"
+            );
+        }
+        // Похожие, но законные имена не должны попадать под запрет.
+        for name in ["a.b", "CONSOLE", "COM10", "LPT0", "a b.txt", "файл.txt"] {
+            assert!(
+                valid_path_segment(name),
+                "обычное имя {name:?} должно быть допустимым"
+            );
+        }
+    }
+
+    /// Имена с хвостовой точкой и символами Win32 не дают реального пути — ни
+    /// для папки, ни для файла: иначе удаление/открытие уйдёт на соседний файл.
+    #[test]
+    fn real_path_of_rejects_win32_normalized_names() {
+        let mut index = ScanIndex::new("C:\\");
+        index.set_root_real_path("C:\\".to_string());
+        let root = index.root();
+        let parent = index.folder(root, "Temp");
+        let dotted = index.folder(parent, "foo.");
+        let quoted = index.folder(parent, "a\"b");
+        let star = index.folder(parent, "a*b");
+
+        assert_eq!(index.real_path_of(dotted, None), "");
+        assert_eq!(index.real_path_of(quoted, None), "");
+        assert_eq!(index.real_path_of(star, None), "");
+        assert_eq!(index.real_path_of(parent, Some("foo.")), "");
+        assert_eq!(index.real_path_of(parent, Some("a\"b")), "");
+        assert_eq!(index.real_path_of(parent, Some("a*b")), "");
+        // Санity: обычные имена путь по-прежнему получают.
+        assert_eq!(index.real_path_of(parent, Some("a.b")), "C:\\Temp\\a.b");
+    }
+
+    /// Корень с пробелами по краям отвергается, а не обрезается: trim() молча
+    /// увёл бы базу на соседнюю папку (`C:\Temp ` → `C:\Temp`), и действия
+    /// выполнялись бы не над той папкой, которую сканировали.
+    #[test]
+    fn root_path_with_surrounding_whitespace_is_rejected() {
+        let mut index = ScanIndex::new("Temp");
+        index.set_root_real_path("C:\\Temp ".to_string());
+        let root = index.root();
+        let file = index.folder(root, "a.txt");
+        assert_eq!(index.real_path_of(root, None), "");
+        assert_eq!(index.real_path_of(file, None), "");
+        assert_eq!(index.real_path_of(root, Some("a.txt")), "");
+
+        let mut newline = ScanIndex::new("Temp");
+        newline.set_root_real_path("C:\\Temp\n".to_string());
+        assert_eq!(newline.real_path_of(newline.root(), None), "");
+
+        // Корень без пробелов по краям работает как раньше.
+        let mut clean = ScanIndex::new("Temp");
+        clean.set_root_real_path("C:\\Temp".to_string());
+        assert_eq!(
+            clean.real_path_of(clean.root(), Some("a.txt")),
+            "C:\\Temp\\a.txt"
+        );
     }
 }
