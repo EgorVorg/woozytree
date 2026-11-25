@@ -180,6 +180,11 @@ pub fn run_scan(
 /// корне индекса собственную папку (например, «C:»), а его записи достраиваются
 /// уже в неё. Итоги складываются, прогресс — общий счётчик по всем томам.
 ///
+/// Нечитаемый том (пустой оптический привод, отключённый сетевой диск,
+/// залоченный BitLocker) не прерывает скан: он учитывается как пропущенный том
+/// (`skipped += 1`), остальные тома сканируются. Ошибка возвращается, только
+/// если не прочитан ни один том.
+///
 /// Имя корня индекса задаёт вызывающий (`ScanIndex::new`): для приложения это
 /// «Все диски» (см. `crate::root_name`).
 pub fn run_scan_all(
@@ -243,6 +248,10 @@ fn run_scan_all_with_interval(
     // продолжается с общей суммы, а не начинается с нуля.
     let mut done_files = 0u64;
     let mut done_folders = 0u64;
+    // Тома, которые прочитать не удалось, и тома, которые прочитаны: по ним
+    // решается, ошибка это или просто пропуск.
+    let mut failed_volumes: Vec<String> = Vec::new();
+    let mut scanned_volumes = 0u32;
 
     for (name, target) in roots {
         if cancel.load(Ordering::Relaxed) {
@@ -267,6 +276,7 @@ fn run_scan_all_with_interval(
 
         match volume {
             Ok(volume) => {
+                scanned_volumes += 1;
                 done_files = done_files.saturating_add(volume.files);
                 done_folders = done_folders.saturating_add(volume.folders);
                 totals.files = totals.files.saturating_add(volume.files);
@@ -275,13 +285,26 @@ fn run_scan_all_with_interval(
                 totals.size_logical = totals.size_logical.saturating_add(volume.size_logical);
                 totals.skipped = totals.skipped.saturating_add(volume.skipped);
             }
-            // Ошибка одного тома прерывает весь скан, как и у одиночной цели:
-            // молча пропустить диск значило бы показать неполные итоги как полные.
+            // Нечитаемый том — не приговор всему скану: пустой оптический привод,
+            // отключённый сетевой диск, залоченный BitLocker не должны стирать
+            // уже собранные данные остальных томов. Подпапка тома уже создана и
+            // остаётся пустой, а сам том учитывается как пропущенный (+1 к skipped).
             Err(err) => {
-                sink.done(Err(&err));
-                return Err(err);
+                failed_volumes.push(format!("{name} — {}", error_message(&err)));
+                totals.skipped = totals.skipped.saturating_add(1);
             }
         }
+    }
+
+    // Ошибка — только если не прочитан ни один том и при этом не было отмены:
+    // иначе сообщение «ни один том» было бы неправдой или перебивало «Остановлено».
+    if scanned_volumes == 0 && !failed_volumes.is_empty() && !cancel.load(Ordering::Relaxed) {
+        let err = ScanError::Io(format!(
+            "не удалось просканировать ни один том: {}",
+            failed_volumes.join("; ")
+        ));
+        sink.done(Err(&err));
+        return Err(err);
     }
 
     totals.cancelled = cancel.load(Ordering::Relaxed);
@@ -946,6 +969,106 @@ mod tests {
         fn done(&mut self, r: Result<&ScanTotals, &ScanError>) {
             self.inner.done(r);
         }
+    }
+
+    #[test]
+    fn unreadable_volume_skips_and_continues() {
+        // Один нечитаемый том (пустой привод, отключённый сетевой диск, BitLocker)
+        // не должен убивать скан остальных: он учитывается как пропущенный том.
+        let readable = test_dir();
+        std::fs::write(readable.path().join("b.bin"), [7u8; 32]).unwrap();
+        let missing = readable.path().join("нет-такой-папки");
+
+        let roots = vec![
+            ("A:".to_string(), ScanTarget::Folder(missing)),
+            (
+                "B:".to_string(),
+                ScanTarget::Folder(readable.path().to_path_buf()),
+            ),
+        ];
+        let mut index = ScanIndex::new("Все диски");
+        let cancel = AtomicBool::new(false);
+        let mut sink = RecordingSink::default();
+
+        let totals =
+            run_scan_all_with_interval(&mut index, &roots, &mut sink, &cancel, Duration::ZERO)
+                .expect("нечитаемый том не должен ронять весь скан «Все диски»");
+
+        assert!(
+            totals.skipped >= 1,
+            "нечитаемый том обязан попасть в пропуски: {totals:?}"
+        );
+        assert_eq!(
+            totals.files, 1,
+            "файлы читаемого тома обязаны быть в итогах"
+        );
+        let children = index.child_folders(index.root());
+        let by_name = |name: &str| {
+            children
+                .iter()
+                .find(|child| child.name == name)
+                .unwrap_or_else(|| panic!("в корне нет подпапки {name}: {children:?}"))
+                .clone()
+        };
+        assert_eq!(by_name("B:").file_count, 1, "данные «B:» просканированы");
+        assert_eq!(
+            by_name("A:").file_count,
+            0,
+            "у пропущенного тома подпапка остаётся пустой"
+        );
+        assert_eq!(
+            index.folder_totals(index.root()).file_count,
+            1,
+            "итоги — только по читаемым томам"
+        );
+        assert!(
+            sink.done.as_ref().is_some_and(|done| done.is_ok()),
+            "скан обязан завершиться успешно: {:?}",
+            sink.done
+        );
+    }
+
+    #[test]
+    fn all_volumes_failed_is_an_error() {
+        let dir = test_dir();
+        let roots = vec![
+            (
+                "A:".to_string(),
+                ScanTarget::Folder(dir.path().join("нет-1")),
+            ),
+            (
+                "B:".to_string(),
+                ScanTarget::Folder(dir.path().join("нет-2")),
+            ),
+        ];
+        let mut index = ScanIndex::new("Все диски");
+        let cancel = AtomicBool::new(false);
+        let mut sink = RecordingSink::default();
+
+        let result =
+            run_scan_all_with_interval(&mut index, &roots, &mut sink, &cancel, Duration::ZERO);
+
+        match result {
+            Err(ScanError::Io(message)) => {
+                assert!(
+                    message.contains("ни один том"),
+                    "сообщение обязано объяснять причину: {message}"
+                );
+                assert!(
+                    message.contains("A:"),
+                    "в ошибке должен быть том: {message}"
+                );
+                assert!(
+                    message.contains("B:"),
+                    "в ошибке должен быть том: {message}"
+                );
+            }
+            other => panic!("ожидалась ошибка «не прочитан ни один том», получено {other:?}"),
+        }
+        assert!(
+            sink.done.as_ref().is_some_and(|done| done.is_err()),
+            "окно обязано получить ошибку, а не пустые итоги"
+        );
     }
 
     #[test]

@@ -1219,6 +1219,57 @@ mod tests {
         assert!(parsed > 0, "испорчена только последняя запись");
     }
 
+    /// Том достраивается в подпапку `into` (ветка «Все диски» у NTFS-движка):
+    /// дети корневой записи №5 попадают в неё, а не в корень индекса.
+    #[test]
+    fn scan_ntfs_into_subfolder_on_fixture() {
+        let reader = VolumeReader::from_fixture(&fixture("sample.mft"), 1024)
+            .expect("фикстура sample.mft должна открываться");
+        let mut index = ScanIndex::new("Все диски");
+        let into = index.folder(index.root(), "C:");
+        let cancel = AtomicBool::new(false);
+
+        let totals = scan_ntfs_reader(&reader, &mut index, into, &cancel, &mut |_, _| {})
+            .expect("сканирование фикстуры в подпапку не должно падать");
+
+        // Итоги не зависят от того, куда достраивается дерево.
+        assert_eq!(totals.files, SAMPLE_FILE_COUNT, "файлы фикстуры");
+        assert_eq!(totals.folders, SAMPLE_FOLDER_COUNT, "папки фикстуры");
+
+        // Всё содержимое тома лежит под «C:», прямо в корне — пусто.
+        let target = index.folder_totals(into);
+        assert_eq!(
+            u64::from(target.file_count),
+            totals.files,
+            "все файлы тома обязаны попасть в его подпапку"
+        );
+        assert_eq!(
+            u64::from(target.folder_count),
+            totals.folders,
+            "все папки тома обязаны попасть в его подпапку"
+        );
+        assert_eq!(
+            index.file_count(index.root()),
+            0,
+            "прямо в корне индекса файлов быть не должно"
+        );
+
+        let children = index.child_folders(index.root());
+        assert_eq!(
+            children.len(),
+            1,
+            "корень содержит только подпапку тома: {children:?}"
+        );
+        assert_eq!(children[0].name, "C:");
+        assert_eq!(u64::from(children[0].file_count), totals.files);
+        assert_eq!(u64::from(children[0].folder_count), totals.folders);
+        assert_eq!(
+            index.folder_totals(index.root()).folder_count,
+            index.folder_totals(into).folder_count + 1,
+            "корень считает саму подпапку тома и всех её потомков"
+        );
+    }
+
     #[test]
     fn test_scan_ntfs_builds_index_with_valid_parents() {
         let reader = VolumeReader::from_fixture(&fixture("sample.mft"), 1024)
