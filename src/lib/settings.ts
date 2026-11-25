@@ -178,13 +178,10 @@ export function set_min_tile_mib(
   settings: DisplaySettings,
   mib: number,
 ): DisplaySettings {
-  // Округляем к точности поля (0.01 МиБ), чтобы введённое человеком значение
-  // возвращалось в поле ровно таким же. Всё, что меньше шага, — 0 (без порога).
-  const steps =
-    Number.isFinite(mib) && mib > 0 ? Math.floor(mib * 100) : 0;
-  const bytes =
-    steps <= 0
-      ? 0
-      : Math.min(Math.round((steps / 100) * MIB), Number.MAX_SAFE_INTEGER);
+  // Приводим введённые мегабайты к тому же квантователю, что и чтение: он
+  // округляет к шагу поля (0.01 МиБ), а не отбрасывает шаг. Math.floor терял
+  // последний шаг на двоичных дробях: «1.15» сохраняло 1.14 МиБ, «0.29» — 0.28.
+  // Всё, что меньше шага, — 0 (без порога).
+  const bytes = normalize_min_tile_bytes(Number.isFinite(mib) ? mib * MIB : 0);
   return update_settings(settings, { minTileBytes: bytes });
 }

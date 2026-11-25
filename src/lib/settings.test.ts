@@ -141,6 +141,22 @@ describe("settings", () => {
     expect(min_tile_mib(set_min_tile_mib(DEFAULT_SETTINGS, 1.234))).toBe(1.23);
   });
 
+  it("threshold_field_step_rounds_instead_of_truncating", () => {
+    // 1.15 * 100 — это 114.99999999999999 в двоичной дроби: Math.floor терял шаг
+    // и сохранял 1.14 МиБ. Поле показывает два знака, поэтому округляем к шагу.
+    expect(min_tile_mib(set_min_tile_mib(DEFAULT_SETTINGS, 1.15))).toBe(1.15);
+    expect(set_min_tile_mib(DEFAULT_SETTINGS, 1.15).minTileBytes).toBe(
+      Math.round(1.15 * MIB),
+    );
+    // 0.29 * 100 — 28.999999999999996: прежний floor давал 0.28.
+    expect(min_tile_mib(set_min_tile_mib(DEFAULT_SETTINGS, 0.29))).toBe(0.29);
+    expect(set_min_tile_mib(DEFAULT_SETTINGS, 0.29).minTileBytes).toBe(
+      Math.round(0.29 * MIB),
+    );
+    // Третий знак по-прежнему округляется к шагу поля.
+    expect(min_tile_mib(set_min_tile_mib(DEFAULT_SETTINGS, 1.234))).toBe(1.23);
+  });
+
   it("size_for_picks_value_by_mode", () => {
     expect(size_for("on_disk", 100, 900)).toBe(100);
     expect(size_for("logical", 100, 900)).toBe(900);

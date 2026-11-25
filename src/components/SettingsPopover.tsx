@@ -151,7 +151,7 @@ export default function SettingsPopover({
               type="number"
               inputMode="decimal"
               min={0}
-              step={0.1}
+              step={0.01}
               value={minTileText}
               onChange={(event) => setMinTileText(event.target.value)}
               onBlur={() => commitThreshold(minTileText)}

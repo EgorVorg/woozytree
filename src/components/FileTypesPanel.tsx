@@ -9,6 +9,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
 
+import { files_word } from "@/lib/actions";
 import {
   default_type_sort,
   extension_label,
@@ -479,7 +480,7 @@ export default function FileTypesPanel({
             </div>
             <div className="mt-0.5 text-muted-foreground">
               {hoveredRow
-                ? `${formatCount(hoveredRow.count)} файлов · клик — выбрать`
+                ? `${formatCount(hoveredRow.count)} ${files_word(hoveredRow.count)} · клик — выбрать`
                 : "клик — выбрать"}
             </div>
           </div>
@@ -593,7 +594,7 @@ export default function FileTypesPanel({
         <span className="tabular-nums">
           {scanning || typesQuery.isPending || typesQuery.error
             ? "Итого по типам: —"
-            : `Итого по типам: ${formatCount(totals.count)} файлов`}
+            : `Итого по типам: ${formatCount(totals.count)} ${files_word(totals.count)}`}
         </span>
         <span className="tabular-nums">
           {scanning
