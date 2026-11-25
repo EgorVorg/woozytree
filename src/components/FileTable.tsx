@@ -15,6 +15,9 @@ import { useInfiniteQuery } from "@tanstack/react-query";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useEffect, useMemo, useRef, useState } from "react";
 
+import FileActionsMenu, {
+  type FileActionTarget,
+} from "@/components/FileActionsMenu";
 import { is_file_sort } from "@/lib/files";
 import {
   formatCount,
@@ -23,7 +26,7 @@ import {
   formatSize,
 } from "@/lib/format";
 import { getFiles } from "@/lib/ipc";
-import type { FileRow, FileSort } from "@/lib/types";
+import type { DeleteReport, FileRow, FileSort } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 /**
@@ -132,6 +135,12 @@ export interface FileTableProps {
   scanning: boolean;
   /** Номер скана: входит в ключ кэша, чтобы новый скан не показывал старые файлы. */
   scanRun: number;
+  /** Файл удалён: родитель показывает плашку «данные устарели». */
+  onFileDeleted: (report: DeleteReport) => void;
+  /** Ошибка действия с файлом — текст для красной плашки. */
+  onActionError: (message: string) => void;
+  /** Нейтральное сообщение (путь скопирован). */
+  onNotice: (message: string) => void;
 }
 
 /**
@@ -142,11 +151,16 @@ export default function FileTable({
   folderId,
   scanning,
   scanRun,
+  onFileDeleted,
+  onActionError,
+  onNotice,
 }: FileTableProps) {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const [sorting, setSorting] = useState<SortingState>([
     { id: "size_on_disk", desc: true },
   ]);
+  // Файл под правым кликом: меню действий открывается им же.
+  const [menuTarget, setMenuTarget] = useState<FileActionTarget | null>(null);
 
   const first = sorting[0];
   const sort: FileSort = first && is_file_sort(first.id) ? first.id : "size_on_disk";
@@ -260,7 +274,8 @@ export default function FileTable({
       <header className="flex flex-wrap items-baseline justify-between gap-2 px-3 pt-3 pb-2">
         <h2 className="text-sm font-medium">Файлы</h2>
         <span className="text-[11px] text-muted-foreground">
-          клик по заголовку — сортировка · прокрутка вниз — догрузка
+          клик по заголовку — сортировка · прокрутка вниз — догрузка · правый
+          клик — действия
         </span>
       </header>
 
@@ -327,6 +342,16 @@ export default function FileTable({
                     key={row.id}
                     style={{ height: item.size }}
                     className="border-b border-border/50 hover:bg-muted/40"
+                    onContextMenu={(event) => {
+                      // Правый клик по строке: меню действий у курсора.
+                      event.preventDefault();
+                      setMenuTarget({
+                        folderId,
+                        fileName: row.original.name,
+                        x: event.clientX,
+                        y: event.clientY,
+                      });
+                    }}
                   >
                     {row.getAllCells().map((cell) => (
                       <td
@@ -384,6 +409,16 @@ export default function FileTable({
                         : "Это все файлы папки"}
         </span>
       </div>
+
+      <FileActionsMenu
+        target={menuTarget}
+        onOpenChange={(open) => {
+          if (!open) setMenuTarget(null);
+        }}
+        onDeleted={onFileDeleted}
+        onError={onActionError}
+        onNotice={onNotice}
+      />
     </section>
   );
 }

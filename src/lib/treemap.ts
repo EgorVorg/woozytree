@@ -165,6 +165,30 @@ export function crumbs_for_tile(
 }
 
 /**
+ * Папка индекса, в которой лежит плитка-файл.
+ *
+ * Действия с файлом (удаление, открытие, проводник, копирование пути) требуют
+ * `folder_id` + имя, а карта рисует вложенные плитки: файл может лежать не в
+ * открытой папке, а в одной из вложенных. Ближайший предок-папка с настоящим id
+ * и есть его папка; файл верхнего уровня — ребёнок открытой папки.
+ */
+export function folder_id_for_tile(
+  rects: TreemapRect[],
+  tile: TreemapRect,
+  currentFolderId: number,
+): number {
+  let index = rects.indexOf(tile);
+  if (index < 0) return currentFolderId;
+  let parent = parent_index(rects, index);
+  while (parent !== null) {
+    const candidate = rects[parent];
+    if (candidate.is_dir && candidate.id !== 0) return candidate.id;
+    parent = parent_index(rects, parent);
+  }
+  return currentFolderId;
+}
+
+/**
  * Имя корневой хлебной крошки по букве диска из `DriveInfo.letter`.
  *
  * `letter` приходит из Rust уже без обратного слэша, но с двоеточием («C:»),

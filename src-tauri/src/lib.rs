@@ -1,18 +1,21 @@
 //! Сборка приложения WoozyTree: команды Tauri и мост между сканером и окном.
 
+pub mod files;
 pub mod model;
 pub mod scan;
 pub mod treemap;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter, State};
 
+use files::ops;
 use model::{
-    CrumbDto, DriveInfo, FilePage, FileSort, FileTypeRow, FolderSummary, ScanError, ScanProgress,
-    ScanTotals, SearchPage, SearchQuery, TreemapRect, TypeSort,
+    CrumbDto, DeleteReport, DriveInfo, FilePage, FileSort, FileTypeRow, FolderSummary, ScanError,
+    ScanProgress, ScanTotals, SearchPage, SearchQuery, TreemapRect, TypeSort,
 };
 use scan::index::ScanIndex;
 use scan::{ScanService, ScanSink, ScanTarget, drive_root, run_scan};
@@ -147,6 +150,18 @@ fn root_name(target: &ScanTarget) -> String {
     }
 }
 
+/// Реальный путь корня сканирования — база для путей действий с файлами.
+///
+/// У диска это «C:\», у папки — её путь, у «Все диски» — пусто: там базой
+/// становится подпапка тома «X:» (см. `ScanIndex::real_path_of`).
+fn real_root_of(target: &ScanTarget) -> String {
+    match target {
+        ScanTarget::Drive(letter) => drive_root(letter),
+        ScanTarget::Folder(path) => path.to_string_lossy().into_owned(),
+        ScanTarget::AllDrives(_) => String::new(),
+    }
+}
+
 /// Итоги, которые можно сохранить для команды `get_scan_totals`.
 ///
 /// Частичный результат отменённого скана не выдаём за финальный: окно получает
@@ -176,11 +191,15 @@ fn start_scan(
     // Новый запуск: прошлый просим остановиться, чтобы два скана не спорили.
     let cancel = service.begin();
     let index_name = root_name(&target);
+    // Реальный корень знает только сервис: индекс хранит имена, а действиям с
+    // файлами нужны абсолютные пути («C:\», путь папки или пусто у «Все диски»).
+    let real_root = real_root_of(&target);
 
     std::thread::Builder::new()
         .name("woozytree-scan".to_string())
         .spawn(move || {
             let mut index = ScanIndex::new(&index_name);
+            index.set_root_real_path(real_root);
             let mut sink = TauriSink::new(app, Arc::clone(&service), Arc::clone(&cancel));
             let result = run_scan(&target, &mut index, &mut sink, &cancel);
             service.finish(&cancel, Arc::new(index), final_totals(&result));
@@ -413,6 +432,105 @@ fn get_types_treemap(
     Ok(index.types_treemap(folder_id, max_rects))
 }
 
+/// Проверить путь действия из окна: непустой, абсолютный, не корень диска.
+///
+/// Корень запрещён отдельно: безвозвратное удаление папки — это
+/// `remove_dir_all`, поэтому «C:\» в запросе означал бы потерю всей системы.
+/// Окно присылает только пути файлов из индекса, так что для него это
+/// ограничение недостижимо, но команда не должна верить окну на слово.
+fn action_path(path: &str) -> Result<PathBuf, String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return Err("Не указан путь файла.".to_string());
+    }
+    let path = PathBuf::from(trimmed);
+    if !path.is_absolute() {
+        return Err(format!("Путь должен быть абсолютным: {trimmed}"));
+    }
+    if path.parent().is_none() {
+        return Err(format!(
+            "Нельзя выполнить действие с корнем диска: {trimmed}"
+        ));
+    }
+    Ok(path)
+}
+
+/// Путь действия, который сейчас существует: открывать и показывать нечего,
+/// если файл уже удалён или переименован.
+fn existing_action_path(path: &str) -> Result<PathBuf, String> {
+    let path = action_path(path)?;
+    if std::fs::symlink_metadata(&path).is_err() {
+        return Err(format!("Файл не найден: {}", path.display()));
+    }
+    Ok(path)
+}
+
+/// Текст ошибки действия без общего префикса: сообщения `files::ops` уже
+/// готовы для окна («Файл не найден: …», «Нет доступа: …»).
+fn action_error_text(err: &ScanError) -> String {
+    match err {
+        ScanError::VolumeAccess(message) | ScanError::Io(message) | ScanError::Parse(message) => {
+            message.clone()
+        }
+    }
+}
+
+/// Реальный абсолютный путь файла в папке индекса — для действий в окне.
+///
+/// Индекс хранит только имена, а удалению и открытию нужен путь. Имя
+/// проверяется на разделители: иначе через него можно было бы выпросить путь
+/// за пределами папки (`..\`), а команда должна верить только индексу.
+#[tauri::command(async)]
+fn get_file_path(
+    state: State<'_, AppState>,
+    folder_id: u32,
+    file_name: String,
+) -> Result<String, String> {
+    let index = state
+        .service
+        .index()
+        .ok_or_else(|| "Индекс ещё не готов: сначала завершите сканирование.".to_string())?;
+
+    check_folder_id(&index, folder_id)?;
+
+    let name = file_name.trim();
+    if name.is_empty() || name == "." || name == ".." {
+        return Err(format!("Недопустимое имя файла: «{file_name}»"));
+    }
+    if name.contains('\\') || name.contains('/') || name.contains(':') {
+        return Err(format!("Имя файла не должно содержать путь: «{file_name}»"));
+    }
+
+    Ok(index.real_path_of(folder_id, Some(name)))
+}
+
+/// Удалить пути: в корзину (`permanent == false`) или безвозвратно.
+///
+/// Команда асинхронная: `remove_dir_all` большого дерева или обращение к
+/// корзине может занять заметное время, а главный поток окна ждать не должен.
+#[tauri::command(async)]
+fn delete_paths(paths: Vec<String>, permanent: bool) -> Result<DeleteReport, String> {
+    let mut checked = Vec::with_capacity(paths.len());
+    for path in &paths {
+        checked.push(action_path(path)?);
+    }
+    Ok(ops::delete_paths(&checked, permanent))
+}
+
+/// Открыть файл приложением по умолчанию.
+#[tauri::command(async)]
+fn open_path(path: String) -> Result<(), String> {
+    let path = existing_action_path(&path)?;
+    ops::open_path(&path).map_err(|err| action_error_text(&err))
+}
+
+/// Показать файл в проводнике с выделением.
+#[tauri::command(async)]
+fn reveal_in_explorer(path: String) -> Result<(), String> {
+    let path = existing_action_path(&path)?;
+    ops::reveal_in_explorer(&path).map_err(|err| action_error_text(&err))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -432,7 +550,11 @@ pub fn run() {
             search_files,
             get_path_crumbs,
             get_file_types,
-            get_types_treemap
+            get_types_treemap,
+            get_file_path,
+            delete_paths,
+            open_path,
+            reveal_in_explorer
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -542,5 +664,58 @@ mod tests {
         let folder: ScanTarget =
             serde_json::from_str(r#"{"folder":"C:\\Temp"}"#).expect("папка из окна");
         assert!(matches!(folder, ScanTarget::Folder(path) if path.ends_with("Temp")));
+    }
+
+    #[test]
+    fn real_root_of_maps_scan_target() {
+        // Диск — «C:\», папка — её путь, «Все диски» — пусто (база — подпапка тома).
+        assert_eq!(real_root_of(&ScanTarget::Drive("C:".to_string())), "C:\\");
+        assert_eq!(
+            real_root_of(&ScanTarget::Folder(PathBuf::from("C:\\Temp\\Тест"))),
+            "C:\\Temp\\Тест"
+        );
+        assert_eq!(
+            real_root_of(&ScanTarget::AllDrives(vec!["C:".to_string()])),
+            ""
+        );
+    }
+
+    #[test]
+    fn action_path_rejects_relative_and_drive_root() {
+        assert!(
+            action_path("C:\\Temp\\woozzytree-delete-test\\a.txt").is_ok(),
+            "абсолютный путь файла допустим"
+        );
+        assert!(
+            action_path("относительный\\файл.txt").is_err(),
+            "относительный путь отвергается"
+        );
+        assert!(action_path("").is_err(), "пустой путь отвергается");
+        assert!(
+            action_path("C:\\").is_err(),
+            "корень диска нельзя удалять или открывать как файл"
+        );
+        assert!(
+            action_path("D:/").is_err(),
+            "корень диска с другим слэшем тоже"
+        );
+    }
+
+    #[test]
+    fn existing_action_path_reports_missing_file() {
+        let dir = crate::files::test_dir();
+        let existing = dir.path().join("есть.bin");
+        std::fs::write(&existing, b"data").expect("файл создаётся");
+        let existing_text = existing.to_string_lossy().into_owned();
+        assert!(existing_action_path(&existing_text).is_ok());
+
+        let missing = dir.path().join("нет.bin");
+        let error = existing_action_path(&missing.to_string_lossy())
+            .expect_err("несуществующий путь должен отвергаться");
+        assert!(error.contains("Файл не найден"), "{error}");
+        assert!(
+            error.contains("нет.bin"),
+            "в ошибке должен быть путь: {error}"
+        );
     }
 }

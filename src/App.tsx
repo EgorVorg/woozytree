@@ -10,6 +10,8 @@ import Tabs, { type AppTab } from "@/components/Tabs";
 import Toolbar from "@/components/Toolbar";
 import TopFolders from "@/components/TopFolders";
 import Treemap from "@/components/Treemap";
+import { Button } from "@/components/ui/button";
+import { files_word } from "@/lib/actions";
 import type { TreeRoot } from "@/lib/files";
 import {
   cancelScan,
@@ -24,6 +26,7 @@ import {
 import { scanPercent } from "@/lib/progress";
 import { root_crumb_name } from "@/lib/treemap";
 import type {
+  DeleteReport,
   DriveInfo,
   FolderSummary,
   ScanChoice,
@@ -138,6 +141,17 @@ function App() {
   const [tab, setTab] = useState<AppTab>("map");
   // Номер запуска сканирования: смена ключа сбрасывает карту к новому скану.
   const [scanRun, setScanRun] = useState(0);
+  // Диск изменился после удаления: индекс показывает уже не то, что на диске.
+  // Патчить индекс не пытаемся — честно предлагаем пересканировать цель.
+  const [stale, setStale] = useState(false);
+  // Нейтральное сообщение о действии с файлом (например, путь скопирован).
+  const [notice, setNotice] = useState<string | null>(null);
+
+  /** Удаление состоялось: данные устарели, предлагаем пересканировать. */
+  const handleFileDeleted = useCallback((report: DeleteReport) => {
+    setStale(true);
+    setNotice(`Удалено: ${report.deleted} ${files_word(report.deleted)}.`);
+  }, []);
 
   const handleUp = useCallback(() => {
     setPath((current) =>
@@ -259,6 +273,7 @@ function App() {
       setCancelled(false);
       setScanning(false);
       setStopping(false);
+      setStale(false);
     });
 
     return () => {
@@ -306,6 +321,9 @@ function App() {
     setCancelled(false);
     setScanning(true);
     setStopping(false);
+    // Новый скан — данные снова актуальны, сообщения прошлых действий не к месту.
+    setStale(false);
+    setNotice(null);
     // База процентов — занятое место всего охвата; дальше она не меняется, даже
     // если пользователь переключит селектор после остановки скана.
     setScanUsed(scanBaseBytes(choice, drives));
@@ -323,6 +341,7 @@ function App() {
       setPath([]);
       setScanning(false);
       setStopping(false);
+      setStale(false);
     });
   };
 
@@ -374,12 +393,38 @@ function App() {
             onRefreshDrives={handleRefreshDrives}
           />
 
+          {stale ? (
+            <div
+              role="status"
+              className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-amber-500/50 bg-amber-500/10 px-4 py-3 text-sm"
+            >
+              <span>Данные устарели — изменился диск</span>
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={scanning || choice === null}
+                onClick={handleScan}
+              >
+                Пересканировать
+              </Button>
+            </div>
+          ) : null}
+
           {error ? (
             <div
               role="alert"
               className="rounded-lg border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive"
             >
               {error}
+            </div>
+          ) : null}
+
+          {notice ? (
+            <div
+              role="status"
+              className="rounded-lg border border-border bg-muted/40 px-4 py-2 text-xs text-muted-foreground"
+            >
+              {notice}
             </div>
           ) : null}
 
@@ -405,6 +450,9 @@ function App() {
                     onNavigate={handleMapNavigate}
                     scanning={scanning}
                     cancelled={cancelled}
+                    onFileDeleted={handleFileDeleted}
+                    onActionError={setError}
+                    onNotice={setNotice}
                   />
                   <div className="grid min-w-0 grid-cols-1 gap-4 lg:grid-cols-[minmax(240px,320px)_minmax(0,1fr)]">
                     <FolderTree
@@ -418,6 +466,9 @@ function App() {
                       folderId={folderId}
                       scanning={scanning}
                       scanRun={scanRun}
+                      onFileDeleted={handleFileDeleted}
+                      onActionError={setError}
+                      onNotice={setNotice}
                     />
                   </div>
                 </div>

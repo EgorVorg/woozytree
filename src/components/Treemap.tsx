@@ -10,17 +10,21 @@
 // сканирования папка перезапрашивается командой.
 import { useEffect, useMemo, useRef, useState } from "react";
 
+import FileActionsMenu, {
+  type FileActionTarget,
+} from "@/components/FileActionsMenu";
 import { formatCount, formatPercent, formatSize } from "@/lib/format";
 import { getTreemap, onTreemap } from "@/lib/ipc";
 import {
   analyze_rects,
   crumbs_for_tile,
+  folder_id_for_tile,
   hit_test,
   is_other,
   type Crumb,
   type TreemapTile,
 } from "@/lib/treemap";
-import type { TreemapRect } from "@/lib/types";
+import type { DeleteReport, TreemapRect } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 /** Бюджет раскладки: столько же, сколько у живой карты корня в Rust. */
@@ -55,6 +59,12 @@ export interface TreemapProps {
   scanning?: boolean;
   /** Скан остановлен: карта показывает частичный срез и помечается плашкой. */
   cancelled?: boolean;
+  /** Файл удалён: родитель показывает плашку «данные устарели». */
+  onFileDeleted: (report: DeleteReport) => void;
+  /** Ошибка действия с файлом — текст для красной плашки. */
+  onActionError: (message: string) => void;
+  /** Нейтральное сообщение (путь скопирован). */
+  onNotice: (message: string) => void;
 }
 
 interface CanvasSize {
@@ -360,6 +370,9 @@ export default function Treemap({
   onNavigate,
   scanning = false,
   cancelled = false,
+  onFileDeleted,
+  onActionError,
+  onNotice,
 }: TreemapProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [size, setSize] = useState<CanvasSize>({ width: 0, height: 0 });
@@ -370,6 +383,8 @@ export default function Treemap({
   const [hover, setHover] = useState<HoverState | null>(null);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const [selectedFile, setSelectedFile] = useState<SelectedFile | null>(null);
+  // Файл, для которого открыто контекстное меню действий.
+  const [menuTarget, setMenuTarget] = useState<FileActionTarget | null>(null);
 
   // Последний живой срез корня и текущая папка — для подписки без переподписок.
   const liveRef = useRef<TreemapRect[] | null>(null);
@@ -454,6 +469,7 @@ export default function Treemap({
     let alive = true;
     setSelectedKey(null);
     setSelectedFile(null);
+    setMenuTarget(null);
 
     // Корень во время скана (и после него) показывает последний живой срез.
     if (folderId === 0 && liveRef.current) {
@@ -548,6 +564,7 @@ export default function Treemap({
       if (crumbs.length > 0) {
         setSelectedKey(null);
         setSelectedFile(null);
+        setMenuTarget(null);
         onNavigate(crumbs);
       }
       return;
@@ -559,6 +576,7 @@ export default function Treemap({
     if (!rect) {
       setSelectedKey(null);
       setSelectedFile(null);
+      setMenuTarget(null);
       return;
     }
     if (rect.is_dir && rect.id !== 0) {
@@ -566,6 +584,7 @@ export default function Treemap({
       if (crumbs.length > 0) {
         setSelectedKey(null);
         setSelectedFile(null);
+        setMenuTarget(null);
         onNavigate(crumbs);
       }
       return;
@@ -576,6 +595,32 @@ export default function Treemap({
     }
     setSelectedKey(tileKey(rect));
     setSelectedFile({ name: rect.name, size: rect.size });
+  };
+
+  /**
+   * Правый клик по плитке-файлу: выбрать её и открыть меню действий.
+   *
+   * Папку карта открывает обычным кликом, поэтому меню появляется только у
+   * файлов; «прочее» — сводная плитка, действия к ней неприменимы.
+   */
+  const handleContextMenu = (event: React.MouseEvent<HTMLCanvasElement>) => {
+    const bounds = event.currentTarget.getBoundingClientRect();
+    if (bounds.width <= 0 || bounds.height <= 0) return;
+    const nx = (event.clientX - bounds.left) / bounds.width;
+    const ny = (event.clientY - bounds.top) / bounds.height;
+    const rect = hit_test(rectsRef.current, nx, ny);
+    if (!rect || rect.is_dir || is_other(rect)) return;
+    event.preventDefault();
+    setSelectedKey(tileKey(rect));
+    setSelectedFile({ name: rect.name, size: rect.size });
+    setMenuTarget({
+      // Карта рисует вложенные плитки: файл мог прийти из подпапки, а не из
+      // открытой папки — действия должны получить именно его папку.
+      folderId: folder_id_for_tile(rectsRef.current, rect, folderId),
+      fileName: rect.name,
+      x: event.clientX,
+      y: event.clientY,
+    });
   };
 
   const cursor =
@@ -617,7 +662,8 @@ export default function Treemap({
         <h2 className="text-sm font-medium">Карта занятости</h2>
         <span className="text-xs text-muted-foreground">
           {rects.length > 0 ? `${formatCount(tiles.length)} плиток · ` : ""}
-          клик по папке или ярлыку — войти · Alt+↑ — вверх
+          клик по папке или ярлыку — войти · правый клик по файлу — действия ·
+          Alt+↑ — вверх
         </span>
       </header>
 
@@ -635,6 +681,7 @@ export default function Treemap({
           onPointerMove={handlePointerMove}
           onPointerLeave={() => setHover(null)}
           onClick={handleClick}
+          onContextMenu={handleContextMenu}
         />
 
         {cancelled ? (
@@ -687,7 +734,7 @@ export default function Treemap({
           </span>
           <span className="tabular-nums">{formatSize(selectedFile.size)}</span>
           <span className="text-muted-foreground/70">
-            (действия с файлами — в следующем плане)
+            правый клик по плитке — действия с файлом
           </span>
         </p>
       ) : (
@@ -697,6 +744,16 @@ export default function Treemap({
           папки.
         </p>
       )}
+
+      <FileActionsMenu
+        target={menuTarget}
+        onOpenChange={(open) => {
+          if (!open) setMenuTarget(null);
+        }}
+        onDeleted={onFileDeleted}
+        onError={onActionError}
+        onNotice={onNotice}
+      />
     </section>
   );
 }

@@ -51,6 +51,35 @@ fn zero_totals() -> FolderTotals {
     }
 }
 
+/// Нормализовать реальный путь корня сканирования.
+///
+/// `\\?\C:\Temp` → `C:\Temp`: verbatim-префикс понимает Win32, но не проводник
+/// и не пользователь, которому путь показывают. Хвостовой слэш у папки лишний
+/// (склейка с именем добавляет разделитель сама), а у корня диска («C:\») он —
+/// часть пути, поэтому короткие пути не трогаем.
+fn normalize_root_path(raw: &str) -> String {
+    let mut text = raw.trim().to_string();
+    if let Some(rest) = text.strip_prefix("\\\\?\\") {
+        // «\\?\UNC\server\share» — это сетевой путь «\\server\share».
+        text = match rest.strip_prefix("UNC\\") {
+            Some(unc) => format!("\\\\{unc}"),
+            None => rest.to_string(),
+        };
+    }
+    if text.len() > 3 {
+        while text.ends_with('\\') || text.ends_with('/') {
+            text.pop();
+        }
+    }
+    text
+}
+
+/// Имя подпапки тома в корне «Все диски»: «C:» (буква и двоеточие).
+fn is_drive_segment(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+}
+
 /// Сравнение имён для сортировки — по-русски, как в проводнике: регистр не
 /// различается (включая кириллицу), «ё» стоит наравне с «е». Порядок символов —
 /// по коду Unicode: латиница раньше кириллицы, а после снятия регистра строчные
@@ -321,6 +350,9 @@ pub struct ScanIndex {
     seen_files: HashMap<FileKey, ()>,
     // Плоский список файлов: одно имя на диске — одна запись.
     files: Vec<FileRecord>,
+    // Реальный путь корня сканирования: из него строятся пути действий с
+    // файлами (удаление, открытие, проводник). Пустой у «Все диски».
+    root_real_path: String,
 }
 
 impl ScanIndex {
@@ -337,6 +369,7 @@ impl ScanIndex {
             folders_by_name: HashMap::new(),
             seen_files: HashMap::new(),
             files: Vec::new(),
+            root_real_path: String::new(),
         }
     }
 
@@ -375,6 +408,54 @@ impl ScanIndex {
             path.push_str(&name);
         }
         path
+    }
+
+    /// Реальный путь корня сканирования — база для путей действий с файлами.
+    ///
+    /// Вызывающий сервис кладёт сюда «C:\» для диска, путь выбранной папки для
+    /// папки и пустую строку для «Все диски» (там база — подпапка тома «X:»).
+    pub fn set_root_real_path(&mut self, s: String) {
+        self.root_real_path = normalize_root_path(&s);
+    }
+
+    /// Реальный (абсолютный) путь папки или файла в ней — для удаления,
+    /// открытия и проводника.
+    ///
+    /// `path_of` даёт путь от корня индекса («C:\Users» или «Users» у папки) —
+    /// для действий он не годится: индекс хранит только имена. Здесь к пути
+    /// корня добавляется относительный подпуть, а у «Все диски» базой становится
+    /// подпапка тома: «C:» → «C:\», дальше обычная склейка. Имя файла
+    /// добавляется последним звеном; путь всегда без `\\?\` — так его понимают
+    /// проводник и `ShellExecuteW`.
+    pub fn real_path_of(&self, folder: FolderId, file_name: Option<&str>) -> String {
+        let mut base = self.root_real_path.clone();
+        // Корень индекса уже учтён в root_real_path: его имя — не звено пути.
+        for (_, name) in self.ancestors(folder).into_iter().skip(1) {
+            if base.is_empty() {
+                // «Все диски»: первый сегмент — том, база «C:\».
+                base = if is_drive_segment(&name) {
+                    format!("{name}\\")
+                } else {
+                    name
+                };
+            } else {
+                if !base.ends_with('\\') {
+                    base.push('\\');
+                }
+                base.push_str(&name);
+            }
+        }
+        let Some(name) = file_name else {
+            return base;
+        };
+        if base.is_empty() {
+            return name.to_string();
+        }
+        if !base.ends_with('\\') {
+            base.push('\\');
+        }
+        base.push_str(name);
+        base
     }
 
     /// Создать папку или вернуть уже существующую с тем же именем у того же родителя.
@@ -1420,6 +1501,83 @@ mod tests {
             "WoozyTree-Тест\\вложенная\\глубже"
         );
         assert_eq!(folder_index.path_of(folder_root), "WoozyTree-Тест");
+    }
+
+    /// Реальные пути для действий: корень диска — база, дальше относительный
+    /// подпуть индекса. Файл прямо в корне диска не получает двойного слэша.
+    #[test]
+    fn real_path_of_drive_mode_uses_drive_root() {
+        let mut index = ScanIndex::new("C:\\");
+        index.set_root_real_path("C:\\".to_string());
+        let root = index.root();
+        let users = index.folder(root, "Users");
+        let georg = index.folder(users, "georg");
+
+        assert_eq!(index.real_path_of(root, None), "C:\\");
+        assert_eq!(index.real_path_of(users, None), "C:\\Users");
+        assert_eq!(index.real_path_of(georg, None), "C:\\Users\\georg");
+        assert_eq!(
+            index.real_path_of(georg, Some("отчёт.txt")),
+            "C:\\Users\\georg\\отчёт.txt"
+        );
+        assert_eq!(
+            index.real_path_of(root, Some("pagefile.sys")),
+            "C:\\pagefile.sys"
+        );
+    }
+
+    /// Режим «папка»: база — выбранная папка (без хвостового слэша и без
+    /// verbatim-префикса `\\?\`, который ломает проводник и ShellExecuteW).
+    #[test]
+    fn real_path_of_folder_mode_uses_selected_folder() {
+        let mut index = ScanIndex::new("WoozyTree-Тест");
+        index.set_root_real_path("C:\\Temp\\WoozyTree-Тест".to_string());
+        let root = index.root();
+        let nested = index.folder(root, "вложенная");
+        let deep = index.folder(nested, "глубже");
+
+        assert_eq!(index.real_path_of(root, None), "C:\\Temp\\WoozyTree-Тест");
+        assert_eq!(
+            index.real_path_of(deep, None),
+            "C:\\Temp\\WoozyTree-Тест\\вложенная\\глубже"
+        );
+        assert_eq!(
+            index.real_path_of(deep, Some("файл.bin")),
+            "C:\\Temp\\WoozyTree-Тест\\вложенная\\глубже\\файл.bin"
+        );
+
+        let mut normalized = ScanIndex::new("Temp");
+        normalized.set_root_real_path("\\\\?\\C:\\Temp\\".to_string());
+        assert_eq!(
+            normalized.real_path_of(normalized.root(), None),
+            "C:\\Temp",
+            "verbatim-префикс и хвостовой слэш не должны попадать в путь действия"
+        );
+    }
+
+    /// «Все диски»: общего реального пути нет, а подпапка тома «X:» становится
+    /// базой «X:\» для себя и всех своих детей.
+    #[test]
+    fn real_path_of_all_drives_uses_volume_subfolder_as_base() {
+        let mut index = ScanIndex::new("Все диски");
+        index.set_root_real_path(String::new());
+        let root = index.root();
+        let c = index.folder(root, "C:");
+        let users = index.folder(c, "Users");
+        let d = index.folder(root, "D:");
+
+        assert_eq!(
+            index.real_path_of(root, None),
+            "",
+            "у общего корня «Все диски» реального пути нет"
+        );
+        assert_eq!(index.real_path_of(c, None), "C:\\");
+        assert_eq!(index.real_path_of(users, None), "C:\\Users");
+        assert_eq!(
+            index.real_path_of(users, Some("файл.bin")),
+            "C:\\Users\\файл.bin"
+        );
+        assert_eq!(index.real_path_of(d, None), "D:\\");
     }
 
     /// Агрегация по расширениям: `.txt`/`.TXT` — одна группа, `.rs` — вторая,

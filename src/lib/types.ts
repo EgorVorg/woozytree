@@ -74,6 +74,17 @@ export interface FilePage {
   total: number;
 }
 
+/**
+ * Итог операции удаления (`delete_paths`).
+ *
+ * `deleted` — сколько путей удалено; `errors` — понятные ошибки по путям,
+ * которые удалить не вышло (остальные при этом всё равно удаляются).
+ */
+export interface DeleteReport {
+  deleted: number;
+  errors: string[];
+}
+
 /** Колонки, по которым ядро умеет сортировать таблицу файлов. */
 export type FileSort = "name" | "size_on_disk" | "size_logical" | "modified";
 

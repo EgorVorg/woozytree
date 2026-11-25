@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import {
   analyze_rects,
   crumbs_for_tile,
+  folder_id_for_tile,
   hit_test,
   is_other,
   root_crumb_name,
@@ -235,6 +236,64 @@ describe("crumbs_for_tile", () => {
         { id: 7, name: "Users" },
       ]),
     ).toEqual([ROOT, { id: 7, name: "Users" }]);
+  });
+});
+
+describe("folder_id_for_tile", () => {
+  // Вид открытой папки: Users (id 7), внутри Music (id 9), внутри неё файл.
+  const users = tile({
+    id: 7,
+    name: "Users",
+    size: 1000,
+    is_dir: true,
+    x: 0.5,
+    y: 0,
+    w: 0.5,
+    h: 1,
+  });
+  const music = tile({
+    id: 9,
+    name: "Music",
+    size: 600,
+    is_dir: true,
+    x: 0.5,
+    y: 0.05,
+    w: 0.45,
+    h: 0.5,
+  });
+  const track = tile({
+    name: "track.mp3",
+    size: 10,
+    x: 0.55,
+    y: 0.1,
+    w: 0.1,
+    h: 0.1,
+  });
+  const topFile = tile({
+    name: "readme.txt",
+    size: 5,
+    x: 0,
+    y: 0,
+    w: 0.1,
+    h: 0.1,
+  });
+  const rects = [users, music, track, topFile];
+
+  it("folder_id_for_tile_uses_nested_parent_folder", () => {
+    // Файл нарисован внутри Music, а не в открытой папке: действия должны
+    // получить id Music, иначе путь файла будет неверным.
+    expect(folder_id_for_tile(rects, track, 0)).toBe(9);
+  });
+
+  it("folder_id_for_tile_top_level_file_belongs_to_open_folder", () => {
+    expect(folder_id_for_tile(rects, topFile, 0)).toBe(0);
+    expect(folder_id_for_tile(rects, topFile, 42)).toBe(42);
+  });
+
+  it("folder_id_for_tile_unknown_tile_falls_back_to_open_folder", () => {
+    const stranger = tile({ name: "чужой.bin", x: 0.9, y: 0.9, w: 0.05, h: 0.05 });
+
+    expect(folder_id_for_tile(rects, stranger, 5)).toBe(5);
   });
 });
 

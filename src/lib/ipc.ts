@@ -5,6 +5,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 
 import type {
   Crumb,
+  DeleteReport,
   DriveInfo,
   FilePage,
   FileSort,
@@ -146,4 +147,41 @@ export function onDone(cb: (totals: ScanTotals) => void): Promise<UnlistenFn> {
 
 export function onError(cb: (message: string) => void): Promise<UnlistenFn> {
   return listen<string>("scan://error", (event) => cb(event.payload));
+}
+
+/**
+ * Реальный абсолютный путь файла в папке индекса.
+ *
+ * Индекс хранит только имена, а действиям с файлами (удаление, открытие,
+ * проводник, копирование пути) нужен путь на диске. Ядро строит его от
+ * реального корня сканирования.
+ */
+export function getFilePath(
+  folderId: number,
+  fileName: string,
+): Promise<string> {
+  return invoke<string>("get_file_path", { folderId, fileName });
+}
+
+/**
+ * Удалить пути: в корзину (`permanent === false`) или безвозвратно.
+ *
+ * Ошибка по одному пути не прерывает удаление остальных — она приходит в
+ * `report.errors`. Корзина — системная, восстановить файл можно оттуда.
+ */
+export function deletePaths(
+  paths: string[],
+  permanent: boolean,
+): Promise<DeleteReport> {
+  return invoke<DeleteReport>("delete_paths", { paths, permanent });
+}
+
+/** Открыть файл приложением по умолчанию (`ShellExecuteW`, «open»). */
+export function openPath(path: string): Promise<void> {
+  return invoke("open_path", { path });
+}
+
+/** Показать файл в проводнике с выделением (`explorer.exe /select,<path>`). */
+export function revealInExplorer(path: string): Promise<void> {
+  return invoke("reveal_in_explorer", { path });
 }
